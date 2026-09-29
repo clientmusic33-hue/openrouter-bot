@@ -19,4 +19,4 @@ COPY --from=build /openrouter-bot/openrouter-bot ./
 # Creating directory for logs
 RUN mkdir logs
 
-ENTRYPOINT ["/openrouter-bot/openrouter-bot"]
+ENTRYPOINT ["/bin/sh", "-c", "cp /etc/secrets/.env /openrouter-bot/.env && exec /openrouter-bot/openrouter-bot"]
