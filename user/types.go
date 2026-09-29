@@ -14,10 +14,14 @@ type UsageTracker struct {
 	SystemPrompt    string
 	LastMessageTime time.Time
 	CurrentStream   *openai.ChatCompletionStream
-	Usage           *UserUsage
-	History         History
-	UsageMu         sync.Mutex `json:"-"` // Мьютекс для синхронизации доступа к Usage
-	FileMu          sync.Mutex `json:"-"` // Мьютекс для синхронизации доступа к файлу
+
+	// Prevent multiple simultaneous AI streams for the same user.
+	ChatMu sync.Mutex `json:"-"`
+
+	Usage    *UserUsage
+	History  History
+	UsageMu  sync.Mutex `json:"-"`
+	FileMu   sync.Mutex `json:"-"`
 }
 
 type Message struct {
@@ -39,7 +43,7 @@ type Cost struct {
 	Day        float64 `json:"day"`
 	Month      float64 `json:"month"`
 	AllTime    float64 `json:"all_time"`
-	LastUpdate string  `json:"last_update"`
+	LastUpdate string    `json:"last_update"`
 }
 
 type UsageHist struct {
@@ -56,7 +60,7 @@ type GenerationData struct {
 	Streamed               bool    `json:"streamed"`
 	GenerationTime         int     `json:"generation_time"`
 	CreatedAt              string  `json:"created_at"`
-	TokensPrompt           int     `json:"tokens_prompt"`
+	TokensPrompt           int     `tokens_prompt`
 	TokensCompletion       int     `json:"tokens_completion"`
 	NativeTokensPrompt     int     `json:"native_tokens_prompt"`
 	NativeTokensCompletion int     `json:"native_tokens_completion"`
