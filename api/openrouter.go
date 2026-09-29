@@ -69,14 +69,17 @@ func GetFreeModels() (string, error) {
 }
 
 func HandleChatGPTStreamResponse(
-	bot *tgbotapi.BotAPI,
-	client *openai.Client,
-	message *tgbotapi.Message,
-	config *config.Config,
-	user *user.UsageTracker,
+    bot *tgbotapi.BotAPI,
+    client *openai.Client,
+    message *tgbotapi.Message,
+    config *config.Config,
+    user *user.UsageTracker,
 ) string {
 
-	ctx := context.Background()
+    user.ChatMu.Lock()
+    defer user.ChatMu.Unlock()
+
+    ctx := context.Background()
 
 	user.CheckHistory(
 		config.MaxHistorySize,
