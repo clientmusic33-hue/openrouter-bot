@@ -69,17 +69,21 @@ func GetFreeModels() (string, error) {
 }
 
 func HandleChatGPTStreamResponse(
-    bot *tgbotapi.BotAPI,
-    client *openai.Client,
-    message *tgbotapi.Message,
-    config *config.Config,
-    user *user.UsageTracker,
+	bot *tgbotapi.BotAPI,
+	client *openai.Client,
+	message *tgbotapi.Message,
+	config *config.Config,
+	user *user.UsageTracker,
 ) string {
 
-    user.ChatMu.Lock()
-    defer user.ChatMu.Unlock()
+	// ---------------------------------------------------------
+	// ONE ACTIVE GENERATION PER USER
+	// ---------------------------------------------------------
 
-    ctx := context.Background()
+	user.ChatMu.Lock()
+	defer user.ChatMu.Unlock()
+
+	ctx := context.Background()
 
 	user.CheckHistory(
 		config.MaxHistorySize,
@@ -87,6 +91,10 @@ func HandleChatGPTStreamResponse(
 	)
 
 	user.LastMessageTime = time.Now()
+
+	// ---------------------------------------------------------
+	// LOAD TRANSLATIONS
+	// ---------------------------------------------------------
 
 	err := lang.LoadTranslations("./lang/")
 	if err != nil {
@@ -106,7 +114,7 @@ func HandleChatGPTStreamResponse(
 	errorMessage := lang.Translate("errorText", conf.Lang)
 
 	// ---------------------------------------------------------
-	// SEND INITIAL LOADING MESSAGE
+	// SEND INITIAL MESSAGE
 	// ---------------------------------------------------------
 
 	processingMsg := tgbotapi.NewMessage(
@@ -116,7 +124,10 @@ func HandleChatGPTStreamResponse(
 
 	sentMsg, err := bot.Send(processingMsg)
 	if err != nil {
-		log.Printf("Failed to send processing message: %v", err)
+		log.Printf(
+			"Failed to send processing message: %v",
+			err,
+		)
 		return ""
 	}
 
@@ -130,7 +141,13 @@ func HandleChatGPTStreamResponse(
 
 	go func() {
 
-		dots := []string{"", ".", "..", "..."}
+		dots := []string{
+			"",
+			".",
+			"..",
+			"...",
+		}
+
 		i := 0
 
 		ticker := time.NewTicker(
@@ -161,6 +178,7 @@ func HandleChatGPTStreamResponse(
 				)
 
 				if _, err := bot.Send(editMsg); err != nil {
+
 					log.Printf(
 						"Failed to update loading message: %v",
 						err,
@@ -173,7 +191,7 @@ func HandleChatGPTStreamResponse(
 	}()
 
 	// ---------------------------------------------------------
-	// BUILD CONVERSATION HISTORY
+	// BUILD CONVERSATION
 	// ---------------------------------------------------------
 
 	messages := []openai.ChatCompletionMessage{
@@ -195,7 +213,7 @@ func HandleChatGPTStreamResponse(
 	}
 
 	// ---------------------------------------------------------
-	// ADD CURRENT USER MESSAGE
+	// CURRENT MESSAGE
 	// ---------------------------------------------------------
 
 	if config.Vision == "true" {
@@ -278,6 +296,7 @@ func HandleChatGPTStreamResponse(
 		)
 
 		if _, editErr := bot.Send(errorMsg); editErr != nil {
+
 			log.Printf(
 				"Failed to send error message: %v",
 				editErr,
@@ -298,19 +317,17 @@ func HandleChatGPTStreamResponse(
 	}
 
 	// ---------------------------------------------------------
-	// STREAMING VARIABLES
+	// STREAMING
 	// ---------------------------------------------------------
 
 	var messageText string
 
 	responseID := ""
 
-	// Telegram should NOT be edited for every token.
-	// OpenRouter still streams immediately.
+	// OpenRouter receives chunks immediately.
+	// Telegram is updated every 700ms.
 	lastEdit := time.Now()
 
-	// 700ms gives fast visual streaming without
-	// hammering Telegram's API.
 	const editInterval = 700 * time.Millisecond
 
 	log.Printf(
@@ -319,14 +336,17 @@ func HandleChatGPTStreamResponse(
 	)
 
 	// ---------------------------------------------------------
-	// RECEIVE STREAM
+	// STREAM LOOP
 	// ---------------------------------------------------------
 
 	for {
 
 		response, err := stream.Recv()
 
-		// Save response ID
+		// -----------------------------------------------------
+		// RESPONSE ID
+		// -----------------------------------------------------
+
 		if responseID == "" &&
 			response.ID != "" {
 
@@ -350,7 +370,7 @@ func HandleChatGPTStreamResponse(
 				message.Text,
 			)
 
-			// Save assistant response
+			// Save AI response
 			user.AddMessage(
 				openai.ChatMessageRoleAssistant,
 				messageText,
@@ -375,6 +395,11 @@ func HandleChatGPTStreamResponse(
 						err,
 					)
 				}
+			} else {
+
+				log.Printf(
+					"Final response was empty",
+				)
 			}
 
 			user.CurrentStream = nil
@@ -417,7 +442,7 @@ func HandleChatGPTStreamResponse(
 		}
 
 		// -----------------------------------------------------
-		// IGNORE EMPTY RESPONSES
+		// EMPTY CHOICES
 		// -----------------------------------------------------
 
 		if len(response.Choices) == 0 {
@@ -425,18 +450,23 @@ func HandleChatGPTStreamResponse(
 		}
 
 		// -----------------------------------------------------
-		// ADD STREAMED CONTENT TO BUFFER
+		// ADD STREAM CONTENT
 		// -----------------------------------------------------
 
-		messageText +=
+		content :=
 			response.Choices[0].Delta.Content
 
+		if content != "" {
+			messageText += content
+		}
+
+		// Don't edit empty messages
 		if strings.TrimSpace(messageText) == "" {
 			continue
 		}
 
 		// -----------------------------------------------------
-		// THROTTLED TELEGRAM UPDATE
+		// TELEGRAM STREAM THROTTLE
 		// -----------------------------------------------------
 
 		if time.Since(lastEdit) >= editInterval {
@@ -465,6 +495,10 @@ func HandleChatGPTStreamResponse(
 		}
 	}
 }
+
+// -------------------------------------------------------------
+// VISION MESSAGE
+// -------------------------------------------------------------
 
 func addVisionMessage(
 	bot *tgbotapi.BotAPI,
@@ -501,7 +535,8 @@ func addVisionMessage(
 		}
 
 		// Telegram file URL
-		fileURL := file.Link(bot.Token)
+		fileURL :=
+			file.Link(bot.Token)
 
 		log.Printf(
 			"Photo URL: %s",
@@ -509,12 +544,14 @@ func addVisionMessage(
 		)
 
 		if message.Text == "" {
-			message.Text = config.VisionPrompt
+			message.Text =
+				config.VisionPrompt
 		}
 
 		return openai.ChatCompletionMessage{
 
-			Role: openai.ChatMessageRoleUser,
+			Role:
+				openai.ChatMessageRoleUser,
 
 			MultiContent:
 				[]openai.ChatMessagePart{
@@ -545,11 +582,13 @@ func addVisionMessage(
 					},
 				},
 		}
-
 	}
 
 	return openai.ChatCompletionMessage{
-		Role:    openai.ChatMessageRoleUser,
-		Content: message.Text,
+		Role:
+			openai.ChatMessageRoleUser,
+
+		Content:
+			message.Text,
 	}
 }
