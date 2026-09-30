@@ -14,6 +14,8 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/spf13/viper"
+
+	"openrouter-bot/provider"
 )
 
 // TelegramMaxMessageLength is the hard limit Telegram enforces on a single
@@ -83,6 +85,15 @@ type Config struct {
 	// RateLimitPerMinute caps the number of AI requests a single user may
 	// start per minute. Zero disables rate limiting.
 	RateLimitPerMinute int
+
+	// Providers is the failover chain, best first. When empty it is
+	// synthesised from BASE_URL/MODEL/API_KEY plus GEMINI_API_KEY.
+	Providers []provider.Config
+
+	// PublicMode removes every usage restriction: unlimited budget for all
+	// roles, no rate limiting and answers to every group message. It exists
+	// because those three settings always have to be changed together.
+	PublicMode bool
 }
 
 // ModelParameters holds the sampling parameters sent to the model.
@@ -147,6 +158,9 @@ func Load() (*Config, error) {
 		StreamIdleTimeout:     time.Duration(viper.GetInt("STREAM_IDLE_TIMEOUT_SECONDS")) * time.Second,
 		MaxConcurrentRequests: viper.GetInt("MAX_CONCURRENT_REQUESTS"),
 		RateLimitPerMinute:    viper.GetInt("RATE_LIMIT_PER_MINUTE"),
+
+		Providers:  loadProviders(),
+		PublicMode: viper.GetBool("PUBLIC_MODE"),
 	}
 
 	if config.Model.ModelName == "" {
@@ -228,6 +242,21 @@ func (c *Config) Validate() error {
 		c.StatsMinRole = "ADMIN"
 	}
 
+	if c.PublicMode {
+		// A negative budget means unlimited in HaveAccess.
+		c.UserBudget = -1
+		c.GuestBudget = -1
+		c.RateLimitPerMinute = 0
+		c.GroupChatMode = GroupModeAll
+
+		log.Printf(
+			"PUBLIC MODE ENABLED: budgets are unlimited, rate limiting is off " +
+				"and the bot answers every group message. Anyone who finds the " +
+				"bot can spend your provider credits - set a hard limit on the " +
+				"provider side.",
+		)
+	}
+
 	return nil
 }
 
@@ -241,6 +270,14 @@ func (c *Config) Clone() *Config {
 	copied := *c
 	copied.AdminChatIDs = append([]int64(nil), c.AdminChatIDs...)
 	copied.AllowedUserChatIDs = append([]int64(nil), c.AllowedUserChatIDs...)
+
+	if c.Providers != nil {
+		copied.Providers = make([]provider.Config, len(c.Providers))
+		for i, p := range c.Providers {
+			copied.Providers[i] = p
+			copied.Providers[i].Models = append([]string(nil), p.Models...)
+		}
+	}
 
 	return &copied
 }
@@ -303,6 +340,58 @@ func languageName(code string) string {
 	default:
 		return strings.ToUpper(strings.TrimSpace(code))
 	}
+}
+
+// loadProviders reads the provider chain from config.yaml and resolves each
+// API key from the environment named by api_key_env.
+func loadProviders() []provider.Config {
+	var list []provider.Config
+
+	if err := viper.UnmarshalKey("providers", &list); err != nil {
+		log.Printf("Could not parse providers from config: %v", err)
+		return nil
+	}
+
+	resolved := make([]provider.Config, 0, len(list))
+
+	for _, entry := range list {
+		entry.Name = strings.TrimSpace(entry.Name)
+		if entry.Name == "" {
+			continue
+		}
+		if entry.APIKeyEnv != "" {
+			entry.APIKey = os.Getenv(entry.APIKeyEnv)
+		}
+		resolved = append(resolved, entry)
+	}
+
+	if len(resolved) == 0 {
+		return nil
+	}
+
+	return resolved
+}
+
+// FallbackProviders builds a chain from the flat environment variables, used
+// when config.yaml does not define a providers list.
+func FallbackProviders(c *Config) []provider.Config {
+	list := []provider.Config{{
+		Name:    "openrouter",
+		BaseURL: c.OpenAIBaseURL,
+		APIKey:  c.OpenAIApiKey,
+		Models:  []string{c.Model.ModelName},
+	}}
+
+	if c.GeminiAPIKey != "" {
+		list = append(list, provider.Config{
+			Name:    "gemini",
+			BaseURL: "https://generativelanguage.googleapis.com/v1beta/openai/",
+			APIKey:  c.GeminiAPIKey,
+			Models:  []string{"gemini-2.5-flash", "gemini-2.5-flash-lite"},
+		})
+	}
+
+	return list
 }
 
 func getStrAsIntList(name string) []int64 {

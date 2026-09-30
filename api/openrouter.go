@@ -1,5 +1,5 @@
-// Package api talks to OpenRouter (or any OpenAI-compatible endpoint) and
-// renders streamed completions into Telegram messages.
+// Package api talks to OpenAI-compatible providers and renders streamed
+// completions into Telegram messages.
 package api
 
 import (
@@ -16,6 +16,7 @@ import (
 
 	"openrouter-bot/config"
 	"openrouter-bot/lang"
+	"openrouter-bot/provider"
 	"openrouter-bot/user"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -28,6 +29,9 @@ const editInterval = 350 * time.Millisecond
 
 // maxChunks caps how many Telegram messages a single answer may occupy.
 const maxChunks = 20
+
+// maxChunksDefault is used when SplitMessage is called without a cap.
+const maxChunksDefault = 20
 
 // modelsTimeout bounds the /models lookup.
 const modelsTimeout = 20 * time.Second
@@ -53,20 +57,19 @@ type APIResponse struct {
 
 // GetFreeModels returns a Markdown list of models that are free for both
 // prompt and completion tokens.
-func GetFreeModels(cfg *config.Config) (string, error) {
-	if cfg == nil {
-		return "", errors.New("no configuration provided")
+func GetFreeModels(baseURL string, apiKey string) (string, error) {
+	base := strings.TrimRight(baseURL, "/")
+	if base == "" {
+		return "", errors.New("no provider base url configured")
 	}
-
-	base := strings.TrimRight(cfg.OpenAIBaseURL, "/")
 
 	req, err := http.NewRequest(http.MethodGet, base+"/models", nil)
 	if err != nil {
 		return "", fmt.Errorf("error building models request: %w", err)
 	}
 	// The endpoint is public, but sending the key avoids stricter rate limits.
-	if cfg.OpenAIApiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+cfg.OpenAIApiKey)
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 
 	client := &http.Client{Timeout: modelsTimeout}
@@ -122,24 +125,37 @@ func isZeroPrice(price string) bool {
 // -----------------------------------------------------------------------------
 
 // HandleChatGPTStreamResponse streams a completion into Telegram, editing the
-// placeholder message as tokens arrive. It returns the OpenRouter generation
-// id, which the caller uses to fetch the real cost.
+// placeholder message as tokens arrive.
+//
+// It walks the provider chain: if a model fails the next model is tried, and
+// if a provider fails the next provider is tried - both at stream creation
+// and mid-stream.
+//
+// It returns the OpenRouter generation id (empty for other providers), the
+// name of the provider that served the answer, and an error.
 func HandleChatGPTStreamResponse(
 	parentCtx context.Context,
 	bot *tgbotapi.BotAPI,
-	client *openai.Client,
-	geminiClient *openai.Client,
+	chain *provider.Chain,
 	message *tgbotapi.Message,
 	cfg *config.Config,
 	tracker *user.UsageTracker,
-) (string, error) {
+) (string, string, error) {
 	if cfg == nil {
-		return "", errors.New("no configuration provided")
+		return "", "", errors.New("no configuration provided")
+	}
+	if chain == nil {
+		return "", "", errors.New("no provider chain configured")
 	}
 
 	// One active generation per user. The lock is held for the whole request.
 	tracker.ChatMu.Lock()
 	defer tracker.ChatMu.Unlock()
+
+	candidates := chain.Candidates()
+	if len(candidates) == 0 {
+		return "", "", errors.New("no models available in the provider chain")
+	}
 
 	loadMessage := lang.Translate("loadText", cfg.Lang)
 	errorMessage := lang.Translate("errorText", cfg.Lang)
@@ -151,7 +167,7 @@ func HandleChatGPTStreamResponse(
 	processingMsg := tgbotapi.NewMessage(message.Chat.ID, loadMessage)
 	sentMsg, err := bot.Send(processingMsg)
 	if err != nil {
-		return "", fmt.Errorf("failed to send processing message: %w", err)
+		return "", "", fmt.Errorf("failed to send processing message: %w", err)
 	}
 	lastMessageID := sentMsg.MessageID
 
@@ -195,7 +211,6 @@ func HandleChatGPTStreamResponse(
 	messages = append(messages, currentMessage)
 
 	req := openai.ChatCompletionRequest{
-		Model:            cfg.Model.ModelName,
 		FrequencyPenalty: float32(cfg.Model.FrequencyPenalty),
 		PresencePenalty:  float32(cfg.Model.PresencePenalty),
 		Temperature:      float32(cfg.Model.Temperature),
@@ -222,46 +237,50 @@ func HandleChatGPTStreamResponse(
 	idleTimer := time.AfterFunc(cfg.StreamIdleTimeout, cancel)
 	defer idleTimer.Stop()
 
-	stream, err := client.CreateChatCompletionStream(ctx, req)
-	usingGemini := false
+	// ---------------------------------------------------------------------
+	// OPEN THE STREAM, WALKING THE CHAIN
+	// ---------------------------------------------------------------------
 
-	if err != nil {
-		log.Printf("OpenRouter stream creation error: %v", err)
+	idx := 0
 
-		if geminiClient != nil && shouldFallback(err) {
-			log.Printf("⚡ OpenRouter unavailable. Switching to Gemini.")
+	var stream *openai.ChatCompletionStream
+	var current provider.Candidate
+	var streamErr error
 
-			stream, err = createGeminiStream(ctx, geminiClient, messages)
-			if err == nil {
-				usingGemini = true
-				log.Printf("⚡ Gemini fallback stream started.")
-			} else {
-				log.Printf("Gemini fallback failed: %v", err)
-			}
+	for ; idx < len(candidates); idx++ {
+		candidate := candidates[idx]
+
+		stream, streamErr = candidate.Stream(ctx, req)
+		if streamErr == nil {
+			current = candidate
+			chain.RecordSuccess(candidate.Provider)
+			break
 		}
+
+		chain.RecordFailure(candidate.Provider, streamErr)
+		log.Printf(
+			"Stream creation failed | provider=%s model=%s error=%v",
+			candidate.Provider, candidate.Model, streamErr,
+		)
 	}
 
-	// ---------------------------------------------------------------------
-	// BOTH FAILED
-	// ---------------------------------------------------------------------
-
-	if err != nil {
+	if stream == nil {
 		stopLoading(stopAnimation)
 		animationDone.Wait()
 
-		log.Printf("All AI providers failed: %v", err)
+		log.Printf("Every provider in the chain failed: %v", streamErr)
 
 		editMsg := tgbotapi.NewEditMessageText(message.Chat.ID, lastMessageID, errorMessage)
 		if _, editErr := bot.Send(editMsg); editErr != nil {
 			log.Printf("Failed to send error message: %v", editErr)
 		}
 
-		return "", err
+		return "", "", streamErr
 	}
 
-	// Close whichever stream is current when we return: the Gemini fallback
-	// replaces the original, so a plain `defer stream.Close()` would close the
-	// already-closed OpenRouter stream and leak the Gemini one.
+	// Close whichever stream is current when we return: a mid-stream failover
+	// replaces it, so a plain `defer stream.Close()` would close the wrong one
+	// and leak the replacement.
 	currentStream := stream
 	defer func() {
 		if currentStream != nil {
@@ -277,7 +296,10 @@ func HandleChatGPTStreamResponse(
 	// "Processing request..." edit cannot overwrite the first tokens.
 	animationDone.Wait()
 
-	log.Printf("⚡ Stream started | provider=%s | user=%s", providerName(usingGemini), tracker.UserName)
+	log.Printf(
+		"⚡ Stream started | provider=%s | model=%s | user=%s",
+		current.Provider, current.Model, tracker.UserName,
+	)
 
 	sink := newMessageSink(bot, message.Chat.ID, lastMessageID)
 
@@ -306,15 +328,17 @@ func HandleChatGPTStreamResponse(
 
 		if errors.Is(recvErr, io.EOF) {
 			log.Printf(
-				"Stream finished | provider=%s | response=%s",
-				providerName(usingGemini), responseID,
+				"Stream finished | provider=%s | model=%s | response=%s",
+				current.Provider, current.Model, responseID,
 			)
+
+			chain.RecordSuccess(current.Provider)
 
 			tracker.AddMessage(openai.ChatMessageRoleUser, userText)
 			tracker.AddMessage(openai.ChatMessageRoleAssistant, messageText)
 			sink.Finish(messageText)
 
-			return responseID, nil
+			return responseID, current.Provider, nil
 		}
 
 		// ---------------------------------------------------------------
@@ -332,35 +356,40 @@ func HandleChatGPTStreamResponse(
 					sink.Finish(messageText)
 				}
 
-				return responseID, nil
+				return responseID, current.Provider, nil
 			}
 
 			log.Printf(
-				"Stream error | provider=%s | error=%v",
-				providerName(usingGemini), recvErr,
+				"Stream error | provider=%s | model=%s | error=%v",
+				current.Provider, current.Model, recvErr,
 			)
 
-			// ---------------------------------------------------------
-			// FALLBACK TO GEMINI
-			// ---------------------------------------------------------
+			chain.RecordFailure(current.Provider, recvErr)
 
-			if !usingGemini && geminiClient != nil && shouldFallback(recvErr) {
-				log.Printf("⚡ OpenRouter stream failed. Retrying with Gemini.")
+			// ---------------------------------------------------------
+			// FAILOVER TO THE NEXT MODEL / PROVIDER
+			// ---------------------------------------------------------
+			//
+			// Any partial text is kept, so the user sees a continuous
+			// answer rather than losing what already arrived.
 
+			if next, nextCandidate, nextErr := openNext(
+				ctx, chain, candidates, idx+1, req,
+			); nextErr == nil {
 				_ = currentStream.Close()
 
-				geminiStream, geminiErr := createGeminiStream(ctx, geminiClient, messages)
-				if geminiErr == nil {
-					currentStream = geminiStream
-					usingGemini = true
-					tracker.SetStream(currentStream, cancel)
+				currentStream = next
+				current = nextCandidate
+				idx = indexOf(candidates, nextCandidate)
 
-					log.Printf("⚡ Gemini retry stream started.")
+				tracker.SetStream(currentStream, cancel)
 
-					continue
-				}
+				log.Printf(
+					"⚡ Failover to provider=%s model=%s",
+					current.Provider, current.Model,
+				)
 
-				log.Printf("Gemini retry failed: %v", geminiErr)
+				continue
 			}
 
 			// ---------------------------------------------------------
@@ -372,7 +401,7 @@ func HandleChatGPTStreamResponse(
 				tracker.AddMessage(openai.ChatMessageRoleAssistant, messageText)
 				sink.Finish(messageText)
 
-				return responseID, nil
+				return responseID, current.Provider, nil
 			}
 
 			editMsg := tgbotapi.NewEditMessageText(message.Chat.ID, lastMessageID, errorMessage)
@@ -380,7 +409,7 @@ func HandleChatGPTStreamResponse(
 				log.Printf("Failed to send stream error: %v", editErr)
 			}
 
-			return responseID, recvErr
+			return responseID, current.Provider, recvErr
 		}
 
 		// ---------------------------------------------------------------
@@ -412,6 +441,46 @@ func HandleChatGPTStreamResponse(
 	}
 }
 
+// openNext tries every candidate from start onwards and returns the first
+// stream that opens.
+func openNext(
+	ctx context.Context,
+	chain *provider.Chain,
+	candidates []provider.Candidate,
+	start int,
+	req openai.ChatCompletionRequest,
+) (*openai.ChatCompletionStream, provider.Candidate, error) {
+	for i := start; i < len(candidates); i++ {
+		candidate := candidates[i]
+
+		stream, err := candidate.Stream(ctx, req)
+		if err == nil {
+			chain.RecordSuccess(candidate.Provider)
+
+			return stream, candidate, nil
+		}
+
+		chain.RecordFailure(candidate.Provider, err)
+		log.Printf(
+			"Failover attempt failed | provider=%s model=%s error=%v",
+			candidate.Provider, candidate.Model, err,
+		)
+	}
+
+	return nil, provider.Candidate{}, errors.New("no further candidates")
+}
+
+// indexOf returns the position of a candidate in the list.
+func indexOf(candidates []provider.Candidate, target provider.Candidate) int {
+	for i, candidate := range candidates {
+		if candidate.Provider == target.Provider && candidate.Model == target.Model {
+			return i
+		}
+	}
+
+	return 0
+}
+
 // -----------------------------------------------------------------------------
 // USER MESSAGE
 // -----------------------------------------------------------------------------
@@ -433,84 +502,6 @@ func buildUserMessage(
 		Role:    openai.ChatMessageRoleUser,
 		Content: text,
 	}, text
-}
-
-// -----------------------------------------------------------------------------
-// GEMINI STREAM
-// -----------------------------------------------------------------------------
-
-func createGeminiStream(
-	parentCtx context.Context,
-	client *openai.Client,
-	messages []openai.ChatCompletionMessage,
-) (*openai.ChatCompletionStream, error) {
-	req := openai.ChatCompletionRequest{
-		Model:       "gemini-2.5-flash",
-		Messages:    messages,
-		Stream:      true,
-		MaxTokens:   1000,
-		Temperature: 0.7,
-		TopP:        0.8,
-	}
-
-	return client.CreateChatCompletionStream(parentCtx, req)
-}
-
-// -----------------------------------------------------------------------------
-// FALLBACK POLICY
-// -----------------------------------------------------------------------------
-
-// shouldFallback reports whether an error is worth retrying on the backup
-// provider. A 400 caused by a bad request is not; a rate limit or a server
-// side failure is.
-func shouldFallback(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	if isProviderRateLimit(err) {
-		return true
-	}
-
-	text := strings.ToLower(err.Error())
-
-	for _, marker := range []string{
-		"500", "502", "503", "504",
-		"internal server error",
-		"bad gateway",
-		"service unavailable",
-		"gateway timeout",
-		"context deadline exceeded",
-		"connection reset",
-		"eof",
-	} {
-		if strings.Contains(text, marker) {
-			return true
-		}
-	}
-
-	return false
-}
-
-func providerName(gemini bool) string {
-	if gemini {
-		return "Gemini"
-	}
-
-	return "OpenRouter"
-}
-
-func isProviderRateLimit(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	errText := strings.ToLower(err.Error())
-
-	return strings.Contains(errText, "429") ||
-		strings.Contains(errText, "too many requests") ||
-		strings.Contains(errText, "rate limit") ||
-		strings.Contains(errText, "rate_limit")
 }
 
 // -----------------------------------------------------------------------------
@@ -728,8 +719,6 @@ func SplitMessage(text string, limit int, maxChunks int) []string {
 
 	return chunks
 }
-
-const maxChunksDefault = 20
 
 // -----------------------------------------------------------------------------
 // VISION MESSAGE

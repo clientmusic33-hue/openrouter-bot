@@ -14,6 +14,7 @@ import (
 
 	"openrouter-bot/config"
 	"openrouter-bot/internal/atomicfile"
+	"openrouter-bot/provider"
 )
 
 // NewUsageTracker creates a new UsageTracker.
@@ -49,6 +50,7 @@ func newUserUsage(userName string) *UserUsage {
 		UserName: userName,
 		UsageHistory: UsageHist{
 			ChatCost: make(map[string]float64),
+			Requests: make(map[string]int),
 		},
 	}
 }
@@ -242,6 +244,9 @@ func (ut *UsageTracker) loadUsage() error {
 	if usage.UsageHistory.ChatCost == nil {
 		usage.UsageHistory.ChatCost = make(map[string]float64)
 	}
+	if usage.UsageHistory.Requests == nil {
+		usage.UsageHistory.Requests = make(map[string]int)
+	}
 
 	ut.UsageMu.Lock()
 	ut.Usage = &usage
@@ -266,6 +271,9 @@ func (ut *UsageTracker) AddCost(cost float64) {
 	}
 	if ut.Usage.UsageHistory.ChatCost == nil {
 		ut.Usage.UsageHistory.ChatCost = make(map[string]float64)
+	}
+	if ut.Usage.UsageHistory.Requests == nil {
+		ut.Usage.UsageHistory.Requests = make(map[string]int)
 	}
 	ut.Usage.UsageHistory.ChatCost[time.Now().Format("2006-01-02")] += cost
 	ut.UsageMu.Unlock()
@@ -331,6 +339,97 @@ func calculateTotalCost(chatCost map[string]float64) float64 {
 	}
 
 	return total
+}
+
+// -----------------------------------------------------------------------------
+// USAGE PROFILE
+// -----------------------------------------------------------------------------
+
+// RecordRequest notes that the user started a request and folds the prompt
+// length into the running average. Cost is tracked separately because a
+// request can fail before it is billed.
+func (ut *UsageTracker) RecordRequest(promptChars int) {
+	ut.UsageMu.Lock()
+
+	if ut.Usage == nil {
+		ut.Usage = newUserUsage(ut.UserName)
+	}
+	if ut.Usage.UsageHistory.Requests == nil {
+		ut.Usage.UsageHistory.Requests = make(map[string]int)
+	}
+
+	ut.Usage.UsageHistory.Requests[time.Now().Format("2006-01-02")]++
+
+	if promptChars > 0 {
+		count := ut.Usage.PromptSamples
+		ut.Usage.AvgPromptChars =
+			(ut.Usage.AvgPromptChars*float64(count) + float64(promptChars)) / float64(count+1)
+		ut.Usage.PromptSamples = count + 1
+	}
+
+	ut.UsageMu.Unlock()
+
+	// Persisting on every request would be wasteful, so the counters are
+	// written when cost is added and at shutdown. Failures here are not
+	// critical.
+	_ = ut.saveUsage()
+}
+
+// MarkVision records that the user sends images, which makes vision support a
+// hard requirement in recommendations.
+func (ut *UsageTracker) MarkVision() {
+	ut.UsageMu.Lock()
+	if ut.Usage != nil {
+		ut.Usage.UsedVision = true
+	}
+	ut.UsageMu.Unlock()
+}
+
+// UsageProfile summarises how this user talks to the bot.
+func (ut *UsageTracker) UsageProfile() provider.UsageProfile {
+	ut.UsageMu.Lock()
+
+	profile := provider.UsageProfile{}
+
+	if ut.Usage != nil {
+		profile.AvgPromptChars = ut.Usage.AvgPromptChars
+		profile.UsesVision = ut.Usage.UsedVision
+
+		total, days := 0, 0
+		for _, count := range ut.Usage.UsageHistory.Requests {
+			total += count
+			days++
+		}
+		if days > 0 {
+			profile.RequestsPerDay = float64(total) / float64(days)
+		}
+
+		// Recent days matter more than all-time history.
+		if days > 7 {
+			recent := 0
+			for i := 0; i < 7; i++ {
+				day := time.Now().AddDate(0, 0, -i).Format("2006-01-02")
+				recent += ut.Usage.UsageHistory.Requests[day]
+			}
+			profile.RequestsPerDay = float64(recent) / 7
+		}
+	}
+
+	ut.UsageMu.Unlock()
+
+	// History size and the biggest single message decide the context need.
+	history := ut.GetMessages()
+	profile.HistoryMessages = len(history)
+
+	peak := 0
+	for _, message := range history {
+		if len(message.Content) > peak {
+			peak = len(message.Content)
+		}
+	}
+	profile.PeakHistoryChars = peak
+
+	return profile
 }
 
 // -----------------------------------------------------------------------------

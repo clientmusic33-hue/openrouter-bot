@@ -68,7 +68,6 @@ func LoadTranslations(langDir string) error {
 	mu.Unlock()
 
 	codes := Languages()
-	sort.Strings(codes)
 	log.Printf("Loaded %d translation file(s) from %s: %v", len(codes), langDir, codes)
 
 	return nil
@@ -85,6 +84,13 @@ func Languages() []string {
 	mu.RLock()
 	defer mu.RUnlock()
 
+	return languagesLocked()
+}
+
+// languagesLocked reads the language codes without locking. Callers must hold
+// mu for reading. It exists because sync.RWMutex is not reentrant: taking a
+// second read lock while a writer is waiting deadlocks the process.
+func languagesLocked() []string {
 	codes := make([]string, 0, len(translations))
 	for code := range translations {
 		codes = append(codes, code)
@@ -127,6 +133,8 @@ func Has(key string, language string) bool {
 }
 
 // candidates returns the languages to try, in priority order.
+//
+// It must only be called while mu is held for reading.
 func candidates(language string) []string {
 	requested := Normalize(language)
 
@@ -137,7 +145,7 @@ func candidates(language string) []string {
 	if requested != DefaultLanguage {
 		order = append(order, DefaultLanguage)
 	}
-	for _, code := range Languages() {
+	for _, code := range languagesLocked() {
 		if code != requested && code != DefaultLanguage {
 			order = append(order, code)
 		}

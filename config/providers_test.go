@@ -1,0 +1,190 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/spf13/viper"
+)
+
+// TestLoadProvidersFromYAML is the check that matters for the provider chain:
+// viper lower-cases every key, so the struct tags in provider.Config have to
+// match the snake_case keys in config.yaml. If they drift, the chain silently
+// falls back to the flat environment variables.
+func TestLoadProvidersFromYAML(t *testing.T) {
+	dir := t.TempDir()
+
+	yaml := `
+type: openrouter
+model: some/model
+base_url: https://example.invalid/v1
+
+providers:
+  - name: openrouter
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: API_KEY
+    models:
+      - deepseek/deepseek-r1:free
+      - openrouter/free
+  - name: groq
+    base_url: https://api.groq.com/openai/v1
+    api_key_env: GROQ_API_KEY
+    models:
+      - llama-3.3-70b-versatile
+`
+
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	t.Setenv("API_KEY", "or-secret")
+	t.Setenv("GROQ_API_KEY", "groq-secret")
+
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+
+	viper.SetConfigFile(path)
+	viper.AutomaticEnv()
+
+	if err := viper.ReadInConfig(); err != nil {
+		t.Fatalf("ReadInConfig: %v", err)
+	}
+
+	providers := loadProviders()
+	if len(providers) != 2 {
+		t.Fatalf("loadProviders() returned %d entries, want 2: %#v", len(providers), providers)
+	}
+
+	if providers[0].Name != "openrouter" {
+		t.Errorf("providers[0].Name = %q", providers[0].Name)
+	}
+	if providers[0].BaseURL != "https://openrouter.ai/api/v1" {
+		t.Errorf("providers[0].BaseURL = %q", providers[0].BaseURL)
+	}
+	if providers[0].APIKey != "or-secret" {
+		t.Errorf("providers[0].APIKey = %q, want it resolved from API_KEY", providers[0].APIKey)
+	}
+	if len(providers[0].Models) != 2 {
+		t.Errorf("providers[0].Models = %v", providers[0].Models)
+	}
+
+	if providers[1].Name != "groq" || providers[1].APIKey != "groq-secret" {
+		t.Errorf("providers[1] = %#v", providers[1])
+	}
+	if len(providers[1].Models) != 1 || providers[1].Models[0] != "llama-3.3-70b-versatile" {
+		t.Errorf("providers[1].Models = %v", providers[1].Models)
+	}
+}
+
+func TestLoadProvidersMissingKeyStaysListed(t *testing.T) {
+	dir := t.TempDir()
+
+	yaml := `
+providers:
+  - name: groq
+    base_url: https://api.groq.com/openai/v1
+    api_key_env: GROQ_API_KEY_THAT_IS_NOT_SET
+    models:
+      - llama-3.3-70b-versatile
+`
+
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+
+	viper.SetConfigFile(path)
+	viper.AutomaticEnv()
+
+	if err := viper.ReadInConfig(); err != nil {
+		t.Fatalf("ReadInConfig: %v", err)
+	}
+
+	providers := loadProviders()
+	if len(providers) != 1 {
+		t.Fatalf("want the provider listed even without a key, got %d", len(providers))
+	}
+	if providers[0].APIKey != "" {
+		t.Errorf("APIKey = %q, want empty", providers[0].APIKey)
+	}
+}
+
+func TestLoadProvidersAbsent(t *testing.T) {
+	dir := t.TempDir()
+
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("model: x\n"), 0o644); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+
+	viper.SetConfigFile(path)
+	viper.AutomaticEnv()
+
+	if err := viper.ReadInConfig(); err != nil {
+		t.Fatalf("ReadInConfig: %v", err)
+	}
+
+	if providers := loadProviders(); providers != nil {
+		t.Errorf("loadProviders() = %#v, want nil so the flat fallback is used", providers)
+	}
+}
+
+func TestFallbackProviders(t *testing.T) {
+	conf := &Config{
+		OpenAIBaseURL: "https://openrouter.ai/api/v1",
+		OpenAIApiKey:  "or-key",
+		Model:         ModelParameters{ModelName: "some/model"},
+	}
+
+	providers := FallbackProviders(conf)
+	if len(providers) != 1 {
+		t.Fatalf("want only the primary provider without GEMINI_API_KEY, got %d", len(providers))
+	}
+	if providers[0].Name != "openrouter" || providers[0].APIKey != "or-key" {
+		t.Errorf("providers[0] = %#v", providers[0])
+	}
+
+	conf.GeminiAPIKey = "gemini-key"
+	providers = FallbackProviders(conf)
+	if len(providers) != 2 {
+		t.Fatalf("want the Gemini fallback included, got %d", len(providers))
+	}
+	if providers[1].Name != "gemini" || providers[1].APIKey != "gemini-key" {
+		t.Errorf("providers[1] = %#v", providers[1])
+	}
+}
+
+// TestPublicModeOpensEverything pins the behaviour of the single switch.
+func TestPublicModeOpensEverything(t *testing.T) {
+	c := &Config{
+		BudgetPeriod:       "monthly",
+		UserBudget:         1,
+		GuestBudget:        0,
+		RateLimitPerMinute: 10,
+		GroupChatMode:      GroupModeMention,
+		PublicMode:         true,
+	}
+
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+
+	if c.UserBudget >= 0 || c.GuestBudget >= 0 {
+		t.Errorf("public mode must make budgets unlimited (negative), got user=%v guest=%v",
+			c.UserBudget, c.GuestBudget)
+	}
+	if c.RateLimitPerMinute != 0 {
+		t.Errorf("RateLimitPerMinute = %d, want 0", c.RateLimitPerMinute)
+	}
+	if c.GroupChatMode != GroupModeAll {
+		t.Errorf("GroupChatMode = %q, want %q", c.GroupChatMode, GroupModeAll)
+	}
+}

@@ -21,11 +21,11 @@ import (
 	"openrouter-bot/config"
 	"openrouter-bot/grouptranslate"
 	"openrouter-bot/lang"
+	"openrouter-bot/provider"
 	"openrouter-bot/translator"
 	"openrouter-bot/user"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"github.com/sashabaranov/go-openai"
 )
 
 const (
@@ -86,21 +86,27 @@ func main() {
 	updates := bot.GetUpdatesChan(u)
 
 	// ---------------------------------------------------------------------
-	// AI CLIENTS
+	// PROVIDER CHAIN
 	// ---------------------------------------------------------------------
 
-	clientOptions := openai.DefaultConfig(conf.OpenAIApiKey)
-	clientOptions.BaseURL = conf.OpenAIBaseURL
-	client := openai.NewClientWithConfig(clientOptions)
+	providers := conf.Providers
+	if len(providers) == 0 {
+		// No providers: chain in config.yaml, so fall back to the flat
+		// environment variables.
+		providers = config.FallbackProviders(conf)
+	}
 
-	var geminiClient *openai.Client
-	if conf.GeminiAPIKey != "" {
-		geminiOptions := openai.DefaultConfig(conf.GeminiAPIKey)
-		geminiOptions.BaseURL = "https://generativelanguage.googleapis.com/v1beta/openai/"
-		geminiClient = openai.NewClientWithConfig(geminiOptions)
-		log.Println("Gemini fallback enabled")
-	} else {
-		log.Println("GEMINI_API_KEY not set - Gemini fallback disabled")
+	chain, err := provider.NewChain(providers)
+	if err != nil {
+		log.Fatalf("Failed to build provider chain: %v", err)
+	}
+
+	for _, status := range chain.Status() {
+		if status.Configured {
+			log.Printf("Provider %s ready: %d model(s)", status.Name, len(status.Models))
+		} else {
+			log.Printf("Provider %s configured without an API key, requests to it will fail", status.Name)
+		}
 	}
 
 	// ---------------------------------------------------------------------
@@ -111,8 +117,7 @@ func main() {
 		ctx:          ctx,
 		bot:          bot,
 		manager:      manager,
-		client:       client,
-		geminiClient: geminiClient,
+		chain:        chain,
 		users:        user.NewUserManager("logs"),
 		translations: grouptranslate.NewManager("data/translations.json"),
 		semaphore:    make(chan struct{}, conf.MaxConcurrentRequests),
@@ -169,11 +174,12 @@ func main() {
 // -----------------------------------------------------------------------------
 
 type app struct {
-	ctx          context.Context
-	bot          *tgbotapi.BotAPI
-	manager      *config.Manager
-	client       *openai.Client
-	geminiClient *openai.Client
+	ctx     context.Context
+	bot     *tgbotapi.BotAPI
+	manager *config.Manager
+
+	// chain is the ordered list of AI providers tried on every request.
+	chain *provider.Chain
 
 	users        *user.Manager
 	translations *grouptranslate.Manager
@@ -298,11 +304,15 @@ func (a *app) handleChat(message *tgbotapi.Message, conf *config.Config, tracker
 		message.Text,
 	)
 
-	responseID, err := api.HandleChatGPTStreamResponse(
+	tracker.RecordRequest(len(messageText(message)))
+	if len(message.Photo) > 0 {
+		tracker.MarkVision()
+	}
+
+	responseID, servedBy, err := api.HandleChatGPTStreamResponse(
 		a.ctx,
 		a.bot,
-		a.client,
-		a.geminiClient,
+		a.chain,
 		message,
 		conf,
 		tracker,
@@ -311,7 +321,8 @@ func (a *app) handleChat(message *tgbotapi.Message, conf *config.Config, tracker
 		log.Printf("AI request failed for user %s: %v", tracker.UserID, err)
 	}
 
-	if conf.Model.Type == "openrouter" {
+	// Cost statistics are an OpenRouter specific endpoint.
+	if servedBy == "openrouter" && conf.Model.Type == "openrouter" {
 		if err := tracker.GetUsageFromApi(responseID, conf); err != nil {
 			log.Printf("Failed to fetch usage for user %s: %v", tracker.UserID, err)
 		}
@@ -373,7 +384,7 @@ func (a *app) startTranslation(message *tgbotapi.Message, target string, conf *c
 
 		log.Printf("Starting automatic translation: chat=%d message=%d target=%q", chatID, messageID, target)
 
-		translated, err := translator.Translate(ctx, a.client, text, target, conf.Model.ModelName)
+		translated, err := translator.Translate(ctx, a.chain.ActiveClient(), text, target, a.chain.Model())
 		if err != nil {
 			log.Printf("Automatic translation FAILED: chat=%d message=%d error=%v", chatID, messageID, err)
 			return
@@ -412,7 +423,7 @@ func (a *app) handleCommand(message *tgbotapi.Message, conf *config.Config, trac
 		sendMessage(a.bot, chatID, lang.Translate("commands.help", conf.Lang), "HTML")
 
 	case "get_models":
-		models, err := api.GetFreeModels(conf)
+		models, err := api.GetFreeModels(a.chain.ActiveBaseURL(), a.chain.ActiveAPIKey())
 		if err != nil {
 			log.Printf("Error getting models: %v", err)
 			sendMessage(a.bot, chatID, "❌ Failed to get available models. Please try again later.", "")
@@ -424,8 +435,20 @@ func (a *app) handleCommand(message *tgbotapi.Message, conf *config.Config, trac
 			tgbotapi.ModeMarkdown,
 		)
 
-	case "set_model":
+	case "set_model", "model":
 		a.handleSetModel(message, conf)
+
+	case "providers":
+		a.handleProviders(message, conf)
+
+	case "provider":
+		a.handleProvider(message, conf)
+
+	case "models":
+		a.handleModels(message, conf)
+
+	case "recommend":
+		a.handleRecommend(message, conf, tracker)
 
 	case "reset":
 		a.handleReset(message, conf, tracker)
@@ -464,7 +487,7 @@ func (a *app) handleSetModel(message *tgbotapi.Message, conf *config.Config) {
 
 	switch {
 	case strings.EqualFold(args, "default"):
-		model := a.manager.ResetModel()
+		model := a.chain.ResetModel()
 		sendMessage(a.bot, message.Chat.ID,
 			lang.Translate("commands.setModel", conf.Lang)+" `"+model+"`",
 			tgbotapi.ModeMarkdown,
@@ -483,7 +506,10 @@ func (a *app) handleSetModel(message *tgbotapi.Message, conf *config.Config) {
 		)
 
 	default:
-		a.manager.SetModel(args)
+		if err := a.chain.SetModel(args); err != nil {
+			sendMessage(a.bot, message.Chat.ID, "❌ "+escapeHTML(err.Error()), "")
+			return
+		}
 		log.Printf("Model changed to %s in chat %d", args, message.Chat.ID)
 		sendMessage(a.bot, message.Chat.ID,
 			lang.Translate("commands.setModel", conf.Lang)+" `"+args+"`",
@@ -560,7 +586,7 @@ func (a *app) handleTranslateReply(message *tgbotapi.Message, conf *config.Confi
 	ctx, cancel := context.WithTimeout(a.ctx, translationTimout)
 	defer cancel()
 
-	translated, err := translator.Translate(ctx, a.client, sourceText, targetLanguage, conf.Model.ModelName)
+	translated, err := translator.Translate(ctx, a.chain.ActiveClient(), sourceText, targetLanguage, a.chain.Model())
 	if err != nil {
 		log.Printf("Translation error: %v", err)
 		sendMessage(a.bot, message.Chat.ID, "❌ Translation failed. Please try again.", "")
@@ -659,6 +685,10 @@ func (a *app) setCommands(conf *config.Config) {
 		{Command: "help", Description: lang.Translate("description.help", conf.Lang)},
 		{Command: "get_models", Description: lang.Translate("description.getModels", conf.Lang)},
 		{Command: "set_model", Description: lang.Translate("description.setModel", conf.Lang)},
+		{Command: "providers", Description: "List AI providers and their health"},
+		{Command: "provider", Description: "Switch the active AI provider"},
+		{Command: "models", Description: "List models of a provider"},
+		{Command: "recommend", Description: "Recommend a model based on your usage"},
 		{Command: "reset", Description: lang.Translate("description.reset", conf.Lang)},
 		{Command: "stats", Description: lang.Translate("description.stats", conf.Lang)},
 		{Command: "stop", Description: lang.Translate("description.stop", conf.Lang)},
@@ -670,6 +700,186 @@ func (a *app) setCommands(conf *config.Config) {
 	if _, err := a.bot.Request(tgbotapi.NewSetMyCommands(commands...)); err != nil {
 		log.Printf("Warning: failed to set bot commands: %v", err)
 	}
+}
+
+// -----------------------------------------------------------------------------
+// PROVIDER AND MODEL COMMANDS
+// -----------------------------------------------------------------------------
+
+// handleProviders shows the failover chain and its health.
+func (a *app) handleProviders(message *tgbotapi.Message, conf *config.Config) {
+	status := a.chain.Status()
+
+	var builder strings.Builder
+
+	builder.WriteString("🌐 <b>AI providers</b>\n\n")
+
+	for i, info := range status {
+		marker := "  "
+		if info.Active {
+			marker = "▶ "
+		}
+
+		state := "🟢"
+		switch {
+		case !info.Configured:
+			state = "🔑" // missing API key
+		case info.Cooldown > 0:
+			state = "⏳"
+		case info.Failures > 0:
+			state = "🟡"
+		}
+
+		builder.WriteString(fmt.Sprintf(
+			"<code>%d</code> %s %s <b>%s</b> · %d model(s)\n",
+			i+1, marker, state, escapeHTML(info.Name), len(info.Models),
+		))
+
+		detail := fmt.Sprintf(
+			"     current: <code>%s</code>",
+			escapeHTML(a.chain.Model()),
+		)
+		if info.Cooldown > 0 {
+			detail += fmt.Sprintf(" · cooling down %s", info.Cooldown)
+		}
+		if info.Failures > 0 {
+			detail += fmt.Sprintf(" · %d failure(s)", info.Failures)
+		}
+		if !info.Configured {
+			detail += " · no API key"
+		}
+		if info.Active {
+			builder.WriteString(detail + "\n")
+		}
+	}
+
+	builder.WriteString(fmt.Sprintf(
+		"\nCurrent model: <code>%s</code>\n",
+		escapeHTML(a.chain.Model()),
+	))
+	builder.WriteString("\nSwitch with <code>/provider 2</code>, list models with <code>/models</code>.")
+
+	sendMessage(a.bot, message.Chat.ID, builder.String(), "HTML")
+}
+
+// handleProvider switches the preferred provider by number or name.
+func (a *app) handleProvider(message *tgbotapi.Message, conf *config.Config) {
+	args := strings.TrimSpace(message.CommandArguments())
+	if args == "" {
+		a.handleProviders(message, conf)
+		return
+	}
+
+	names := a.chain.Names()
+
+	target := args
+	if index, err := strconv.Atoi(args); err == nil && index >= 1 && index <= len(names) {
+		target = names[index-1]
+	}
+
+	name, err := a.chain.SetActive(target)
+	if err != nil {
+		sendMessage(a.bot, message.Chat.ID,
+			fmt.Sprintf("❌ %s\n\nAvailable: %s", escapeHTML(err.Error()), escapeHTML(strings.Join(names, ", "))),
+			"HTML",
+		)
+		return
+	}
+
+	sendMessage(a.bot, message.Chat.ID, fmt.Sprintf(
+		"🌐 Provider switched to <b>%s</b>\n\nModel: <code>%s</code>",
+		escapeHTML(name), escapeHTML(a.chain.Model()),
+	), "HTML")
+}
+
+// handleModels lists the models of a provider with their capabilities.
+func (a *app) handleModels(message *tgbotapi.Message, conf *config.Config) {
+	args := strings.TrimSpace(message.CommandArguments())
+
+	providerName := a.chain.ActiveName()
+	if args != "" {
+		names := a.chain.Names()
+		if index, err := strconv.Atoi(args); err == nil && index >= 1 && index <= len(names) {
+			providerName = names[index-1]
+		} else {
+			providerName = args
+		}
+	}
+
+	models, ok := a.chain.ModelsOf(providerName)
+	if !ok {
+		sendMessage(a.bot, message.Chat.ID, fmt.Sprintf(
+			"❌ Unknown provider %q.\n\nAvailable: %s",
+			escapeHTML(args), escapeHTML(strings.Join(a.chain.Names(), ", ")),
+		), "HTML")
+		return
+	}
+
+	current := a.chain.Model()
+
+	var builder strings.Builder
+	builder.WriteString(fmt.Sprintf("🧠 <b>Models on %s</b>\n\n", escapeHTML(providerName)))
+
+	for i, model := range models {
+		marker := "  "
+		if model == current {
+			marker = "▶ "
+		}
+
+		line := fmt.Sprintf("<code>%d</code> %s <code>%s</code>", i+1, marker, escapeHTML(model))
+		if description := provider.DescribeModel(model); description != "" {
+			line += " — " + escapeHTML(description)
+		}
+		builder.WriteString(line + "\n")
+	}
+
+	builder.WriteString("\nSelect with <code>/model 2</code> or <code>/set_model &lt;name&gt;</code>.")
+
+	sendMessage(a.bot, message.Chat.ID, builder.String(), "HTML")
+}
+
+// handleRecommend suggests a model based on how the user actually uses the bot.
+func (a *app) handleRecommend(message *tgbotapi.Message, conf *config.Config, tracker *user.UsageTracker) {
+	profile := tracker.UsageProfile()
+
+	// Penalise backends that are currently failing.
+	for _, info := range a.chain.Status() {
+		profile.FailedRecently += info.Failures
+	}
+
+	recommendation, err := a.chain.Recommend(profile)
+	if err != nil {
+		sendMessage(a.bot, message.Chat.ID, "❌ No models available to recommend.", "")
+		return
+	}
+
+	historyNote := "no history yet"
+	if profile.HistoryMessages > 0 {
+		historyNote = fmt.Sprintf("%d messages in memory", profile.HistoryMessages)
+	}
+
+	visionNote := "no"
+	if profile.UsesVision {
+		visionNote = "yes"
+	}
+
+	text := fmt.Sprintf(
+		"🔮 <b>Recommended model</b>\n\n"+
+			"<code>%s</code> on <b>%s</b>\n\n"+
+			"Why: %s\n\n"+
+			"Your usage: ~%.0f requests/day · avg prompt %.0f chars · %s · images: %s\n\n"+
+			"Apply with <code>/model %s</code>",
+		escapeHTML(recommendation.Model),
+		escapeHTML(recommendation.Provider),
+		escapeHTML(recommendation.Reason),
+		profile.RequestsPerDay,
+		profile.AvgPromptChars,
+		historyNote,
+		visionNote,
+		escapeHTML(recommendation.Model),
+	)
+
+	sendMessage(a.bot, message.Chat.ID, text, "HTML")
 }
 
 // -----------------------------------------------------------------------------

@@ -85,8 +85,13 @@ The binary reads `./config.yaml` and `./lang/` from the working directory, so ru
 | `/start` | Welcome message and help |
 | `/help` | Show the command list |
 | `/get_models` | List models that are free for prompt **and** completion |
-| `/set_model <name>` | Change the model |
+| `/set_model <name>` | Change the model (alias: `/model`) |
 | `/set_model default` | Restore the configured model |
+| `/providers` | Show the provider chain and its health |
+| `/provider <n\|name>` | Switch the active provider |
+| `/models [provider]` | List a provider's models with capabilities |
+| `/model <n\|name>` | Select a model by number or id |
+| `/recommend` | Suggest a model based on how you use the bot |
 | `/reset` | Clear the conversation history |
 | `/reset <prompt>` | Clear history and set a new system prompt |
 | `/reset system` | Clear history and restore the default system prompt |
@@ -97,6 +102,51 @@ The binary reads `./config.yaml` and `./lang/` from the working directory, so ru
 | `/about` | About this bot |
 
 ---
+
+## Provider chain (automatic failover)
+
+The bot does not depend on a single backend. Requests walk an ordered list of
+providers, and on **any** failure the next model is tried, then the next
+provider — at stream creation *and* mid-stream. Partial output is kept, so a
+user never loses what already arrived.
+
+Providers are defined in `config.yaml`:
+
+```yaml
+providers:
+  - name: openrouter
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: API_KEY
+    models:
+      - deepseek/deepseek-r1:free
+      - openrouter/free
+
+  - name: groq
+    base_url: https://api.groq.com/openai/v1
+    api_key_env: GROQ_API_KEY
+    models:
+      - llama-3.3-70b-versatile
+      - openai/gpt-oss-120b
+      - llama-3.1-8b-instant
+
+  - name: ollama          # local, never rate limited
+    base_url: http://localhost:11434/v1
+    models:
+      - llama3.2:3b
+```
+
+- `api_key_env` names the environment variable holding the key, so no secret
+  ever goes in the file.
+- A provider without a key stays in the list and is reported by `/providers`
+  as having no key, rather than being dropped silently.
+- A provider that fails 3 times in a row drops to the back of the chain for
+  60 seconds, so healthy providers are tried first without manual intervention.
+- Any OpenAI-compatible endpoint works. Remove the block entirely to fall back
+  to the flat `BASE_URL` / `MODEL` / `API_KEY` variables.
+
+`/recommend` scores every available model against your actual usage — requests
+per day, average prompt length, conversation size, whether you send images —
+and explains its choice.
 
 ## Group behaviour
 
@@ -135,9 +185,26 @@ Every value can be set as a real environment variable **or** in `.env`. `config.
 | `STATS_MIN_ROLE` | `ADMIN` | `ADMIN`, `USER` or `GUEST` |
 | `RATE_LIMIT_PER_MINUTE` | `10` | Max requests per user per minute. `0` disables it |
 | `MAX_CONCURRENT_REQUESTS` | `8` | Max AI requests in flight at once |
+| `PUBLIC_MODE` | `false` | `true` removes all limits: unlimited budget for every role, no rate limiting, answers every group message |
+
+### Provider keys
+
+| Variable | Provider |
+|---|---|
+| `API_KEY` | OpenRouter |
+| `GROQ_API_KEY` | Groq |
+| `GEMINI_API_KEY` | Google Gemini |
+| `CEREBRAS_API_KEY` | Cerebras |
+| `NVIDIA_API_KEY` | NVIDIA NIM |
+
+Extra providers also need a matching entry in the `providers:` block of
+`config.yaml`.
 
 > [!WARNING]
-> Set `GUEST_BUDGET=0` (the default) unless you intend to run a public bot. With a non-zero guest budget, anyone who finds your bot can spend against your OpenRouter key.
+> Set `GUEST_BUDGET=0` (the default) unless you intend to run a public bot.
+> `PUBLIC_MODE=true` removes every limit for everyone — anyone who finds your
+> bot can spend your provider credits. Set a hard spending cap on the provider
+> side as well. With a non-zero guest budget, anyone who finds your bot can spend against your OpenRouter key.
 
 ### Model and responses
 

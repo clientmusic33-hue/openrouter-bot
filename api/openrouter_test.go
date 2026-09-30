@@ -3,8 +3,6 @@ package api
 import (
 	"strings"
 	"testing"
-
-	"github.com/sashabaranov/go-openai"
 )
 
 func TestSplitMessageKeepsShortText(t *testing.T) {
@@ -100,29 +98,5 @@ func TestIsFreeModel(t *testing.T) {
 		if got := isFreeModel(tc.model); got != tc.want {
 			t.Errorf("%s: isFreeModel() = %v, want %v", tc.name, got, tc.want)
 		}
-	}
-}
-
-func TestShouldFallback(t *testing.T) {
-	if !shouldFallback(&openai.APIError{HTTPStatusCode: 429}) {
-		t.Error("a 429 should trigger the fallback")
-	}
-	if !shouldFallback(&openai.APIError{HTTPStatusCode: 503}) {
-		t.Error("a 503 should trigger the fallback")
-	}
-	if !shouldFallback(&openai.APIError{HTTPStatusCode: 500}) {
-		t.Error("a 500 should trigger the fallback")
-	}
-	if shouldFallback(nil) {
-		t.Error("a nil error should not trigger the fallback")
-	}
-}
-
-func TestProviderName(t *testing.T) {
-	if got := providerName(false); got != "OpenRouter" {
-		t.Errorf("providerName(false) = %q", got)
-	}
-	if got := providerName(true); got != "Gemini" {
-		t.Errorf("providerName(true) = %q", got)
 	}
 }

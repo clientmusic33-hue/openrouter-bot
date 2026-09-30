@@ -44,6 +44,11 @@ lang: EN
 # Minimum role to show stats (ADMIN, USER, GUEST)
 stats_min_role: ADMIN
 
+# PUBLIC_MODE removes every usage restriction at once: unlimited budget for
+# all roles, no rate limiting, and answers to every group message.
+# Anyone who finds the bot can then spend your provider credits.
+# public_mode: true
+
 # How the bot behaves in group chats:
 #   mention - answer only when mentioned or replied to
 #   all     - answer every group message
@@ -68,6 +73,59 @@ stream_idle_timeout_seconds: 120
 
 max_history_size: 10
 max_history_time: 60
+
+# ---------------------------------------------------------------------------
+# Provider chain
+# ---------------------------------------------------------------------------
+#
+# Requests walk this list top to bottom. When a model fails the next model of
+# the same provider is tried; when a provider fails the next provider is
+# tried - both at stream creation and mid-stream.
+#
+# api_key_env names the environment variable holding the key. A provider whose
+# key is unset is still listed by /providers (marked as having no key) but
+# will fail until you set it.
+#
+# Remove this block entirely to fall back to the flat BASE_URL/MODEL/API_KEY
+# variables plus GEMINI_API_KEY.
+
+providers:
+  - name: openrouter
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: API_KEY
+    models:
+      - deepseek/deepseek-r1:free
+      - openrouter/free
+
+  - name: groq
+    base_url: https://api.groq.com/openai/v1
+    api_key_env: GROQ_API_KEY
+    models:
+      - llama-3.3-70b-versatile
+      - openai/gpt-oss-120b
+      - llama-3.1-8b-instant
+
+  - name: gemini
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai/
+    api_key_env: GEMINI_API_KEY
+    models:
+      - gemini-2.5-flash
+      - gemini-2.5-flash-lite
+
+  # Optional: uncomment and set CEREBRAS_API_KEY.
+  #- name: cerebras
+  #  base_url: https://api.cerebras.ai/v1
+  #  api_key_env: CEREBRAS_API_KEY
+  #  models:
+  #    - gpt-oss-120b
+  #    - llama-3.3-70b
+
+  # Local Ollama: no API key needed, never rate limited. Shows as "no API key"
+  # in /providers, which is expected for a local endpoint.
+  - name: ollama
+    base_url: http://localhost:11434/v1
+    models:
+      - llama3.2:3b
 
 # ---------------------------------------------------------------------------
 # Prompts and vision

@@ -69,6 +69,12 @@ type History struct {
 type UserUsage struct {
 	UserName     string    `json:"user_name"`
 	UsageHistory UsageHist `json:"usage_history"`
+
+	// Running statistics used by /recommend. Kept as running values so no
+	// history of message contents has to be stored.
+	AvgPromptChars float64 `json:"avg_prompt_chars"`
+	PromptSamples  int64   `json:"prompt_samples"`
+	UsedVision     bool    `json:"used_vision"`
 }
 
 type Cost struct {
@@ -80,6 +86,7 @@ type Cost struct {
 
 type UsageHist struct {
 	ChatCost map[string]float64 `json:"chat_cost"`
+	Requests map[string]int     `json:"requests"`
 }
 
 type GenerationResponse struct {
