@@ -11,6 +11,7 @@ import (
 
 	"openrouter-bot/api"
 	"openrouter-bot/config"
+	"openrouter-bot/grouptranslate"
 	"openrouter-bot/lang"
 	"openrouter-bot/translator"
 	"openrouter-bot/user"
@@ -21,7 +22,6 @@ import (
 
 func main() {
 	// Render Web Service health server.
-	// Render provides the PORT environment variable.
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "10000"
@@ -81,6 +81,11 @@ func main() {
 
 	updates := bot.GetUpdatesChan(u)
 
+	// Initialize group translation manager.
+	translationManager := grouptranslate.NewManager(
+		"data/translations.json",
+	)
+
 	// Set Telegram bot commands.
 	commands := []tgbotapi.BotCommand{
 		{
@@ -119,6 +124,10 @@ func main() {
 			Command:     "tr",
 			Description: "Translate a replied message",
 		},
+		{
+			Command:     "translate",
+			Description: "Manage group auto translation",
+		},
 	}
 
 	_, err = bot.Request(tgbotapi.NewSetMyCommands(commands...))
@@ -146,7 +155,14 @@ func main() {
 			conf,
 		)
 
-		// Handle commands.
+		// Ignore messages sent by bots.
+		if update.Message.From != nil && update.Message.From.IsBot {
+			continue
+		}
+
+		// ---------------------------------------------------------
+		// COMMANDS
+		// ---------------------------------------------------------
 		if update.Message.IsCommand() {
 			switch update.Message.Command() {
 
@@ -451,6 +467,194 @@ func main() {
 					log.Println("Failed to send translation:", err)
 				}
 
+			// /translate
+			case "translate":
+				// Auto translation only makes sense in groups.
+				if update.Message.Chat.Type != "group" &&
+					update.Message.Chat.Type != "supergroup" {
+
+					msg := tgbotapi.NewMessage(
+						update.Message.Chat.ID,
+						"❌ This command can only be used in a group.",
+					)
+
+					if _, err := bot.Send(msg); err != nil {
+						log.Println("Failed to send /translate error:", err)
+					}
+
+					continue
+				}
+
+				// Only administrators can change group settings.
+				member, err := bot.GetChatMember(
+					tgbotapi.ChatConfigWithUser{
+						ChatID: update.Message.Chat.ID,
+						UserID: update.Message.From.ID,
+					},
+				)
+
+				if err != nil {
+					log.Printf("Failed to check admin status: %v", err)
+
+					msg := tgbotapi.NewMessage(
+						update.Message.Chat.ID,
+						"❌ I couldn't verify your group permissions.",
+					)
+
+					bot.Send(msg)
+					continue
+				}
+
+				if member.Status != "administrator" &&
+					member.Status != "creator" {
+
+					msg := tgbotapi.NewMessage(
+						update.Message.Chat.ID,
+						"🔒 Only group administrators can change translation settings.",
+					)
+
+					bot.Send(msg)
+					continue
+				}
+
+				args := strings.TrimSpace(
+					update.Message.CommandArguments(),
+				)
+
+				argsLower := strings.ToLower(args)
+
+				switch argsLower {
+
+				case "on":
+					err := translationManager.SetEnabled(
+						update.Message.Chat.ID,
+						true,
+					)
+
+					if err != nil {
+						log.Printf("Failed to enable translation: %v", err)
+
+						bot.Send(tgbotapi.NewMessage(
+							update.Message.Chat.ID,
+							"❌ Failed to save translation settings.",
+						))
+
+						continue
+					}
+
+					settings := translationManager.Get(
+						update.Message.Chat.ID,
+					)
+
+					msg := tgbotapi.NewMessage(
+						update.Message.Chat.ID,
+						fmt.Sprintf(
+							"🌐 <b>Auto Translation Enabled</b>\n\nTarget language: <b>%s</b>\n\nNew group messages will now be translated automatically.",
+							settings.TargetLanguage,
+						),
+					)
+
+					msg.ParseMode = "HTML"
+					bot.Send(msg)
+
+				case "off":
+					err := translationManager.SetEnabled(
+						update.Message.Chat.ID,
+						false,
+					)
+
+					if err != nil {
+						log.Printf("Failed to disable translation: %v", err)
+
+						bot.Send(tgbotapi.NewMessage(
+							update.Message.Chat.ID,
+							"❌ Failed to save translation settings.",
+						))
+
+						continue
+					}
+
+					bot.Send(tgbotapi.NewMessage(
+						update.Message.Chat.ID,
+						"🌐 Auto translation disabled.",
+					))
+
+				case "status":
+					settings := translationManager.Get(
+						update.Message.Chat.ID,
+					)
+
+					status := "🔴 Disabled"
+
+					if settings.Enabled {
+						status = "🟢 Enabled"
+					}
+
+					msg := tgbotapi.NewMessage(
+						update.Message.Chat.ID,
+						fmt.Sprintf(
+							"🌐 <b>Translation Status</b>\n\nStatus: %s\nLanguage: <b>%s</b>\nMode: Automatic",
+							status,
+							settings.TargetLanguage,
+						),
+					)
+
+					msg.ParseMode = "HTML"
+					bot.Send(msg)
+
+				default:
+					if args == "" {
+						msg := tgbotapi.NewMessage(
+							update.Message.Chat.ID,
+							"🌐 <b>Group Translation</b>\n\n"+
+								"/translate on — Enable\n"+
+								"/translate off — Disable\n"+
+								"/translate hi — Hindi\n"+
+								"/translate en — English\n"+
+								"/translate status — Show settings",
+						)
+
+						msg.ParseMode = "HTML"
+						bot.Send(msg)
+						continue
+					}
+
+					err := translationManager.SetLanguage(
+						update.Message.Chat.ID,
+						args,
+					)
+
+					if err != nil {
+						log.Printf("Failed to set translation language: %v", err)
+
+						bot.Send(tgbotapi.NewMessage(
+							update.Message.Chat.ID,
+							"❌ Failed to save translation language.",
+						))
+
+						continue
+					}
+
+					settings := translationManager.Get(
+						update.Message.Chat.ID,
+					)
+
+					msg := tgbotapi.NewMessage(
+						update.Message.Chat.ID,
+						fmt.Sprintf(
+							"🌐 Target language changed to <b>%s</b>.\n\nAuto translation: %s",
+							settings.TargetLanguage,
+							map[bool]string{
+								true:  "🟢 Enabled",
+								false: "🔴 Disabled",
+							}[settings.Enabled],
+						),
+					)
+
+					msg.ParseMode = "HTML"
+					bot.Send(msg)
+				}
+
 			// /about
 			case "about":
 				msg := tgbotapi.NewMessage(
@@ -498,44 +702,114 @@ func main() {
 				}
 			}
 
-		} else {
-			// Handle normal messages concurrently.
-			go func(userStats *user.UsageTracker) {
+			continue
+		}
 
-				if userStats.HaveAccess(conf) {
+		// ---------------------------------------------------------
+		// AUTOMATIC GROUP TRANSLATION
+		// ---------------------------------------------------------
 
-					responseID :=
-						api.HandleChatGPTStreamResponse(
-							bot,
-							client,
-							update.Message,
-							conf,
-							userStats,
-						)
+		if update.Message.Chat.Type == "group" ||
+			update.Message.Chat.Type == "supergroup" {
 
-					if conf.Model.Type == "openrouter" {
-						userStats.GetUsageFromApi(
-							responseID,
-							conf,
-						)
-					}
+			settings := translationManager.Get(
+				update.Message.Chat.ID,
+			)
 
-				} else {
+			if settings.Enabled &&
+				strings.TrimSpace(update.Message.Text) != "" {
 
-					msg := tgbotapi.NewMessage(
-						update.Message.Chat.ID,
-						lang.Translate(
-							"budget_out",
-							conf.Lang,
-						),
+				sourceText := strings.TrimSpace(
+					update.Message.Text,
+				)
+
+				targetLanguage := settings.TargetLanguage
+
+				go func(
+					chatID int64,
+					text string,
+					target string,
+				) {
+					translatedText, err := translator.Translate(
+						context.Background(),
+						client,
+						text,
+						target,
+						conf.Model.ModelName,
 					)
 
-					if _, err := bot.Send(msg); err != nil {
-						log.Println(err)
+					if err != nil {
+						log.Printf(
+							"Automatic translation error: %v",
+							err,
+						)
+						return
 					}
+
+					msg := tgbotapi.NewMessage(
+						chatID,
+						"🌐 <b>"+target+"</b>\n\n"+translatedText,
+					)
+
+					msg.ParseMode = "HTML"
+
+					if _, err := bot.Send(msg); err != nil {
+						log.Printf(
+							"Failed to send automatic translation: %v",
+							err,
+						)
+					}
+				}(
+					update.Message.Chat.ID,
+					sourceText,
+					targetLanguage,
+				)
+
+				// Don't send the same group message to the normal AI
+				// chat handler when automatic translation is enabled.
+				continue
+			}
+		}
+
+		// ---------------------------------------------------------
+		// NORMAL AI CHAT
+		// ---------------------------------------------------------
+
+		go func(userStats *user.UsageTracker) {
+
+			if userStats.HaveAccess(conf) {
+
+				responseID :=
+					api.HandleChatGPTStreamResponse(
+						bot,
+						client,
+						update.Message,
+						conf,
+						userStats,
+					)
+
+				if conf.Model.Type == "openrouter" {
+					userStats.GetUsageFromApi(
+						responseID,
+						conf,
+					)
 				}
 
-			}(userStats)
-		}
+			} else {
+
+				msg := tgbotapi.NewMessage(
+					update.Message.Chat.ID,
+					lang.Translate(
+						"budget_out",
+						conf.Lang,
+					),
+				)
+
+				if _, err := bot.Send(msg); err != nil {
+					log.Println(err)
+				}
+			}
+
+		}(userStats)
 	}
 }
