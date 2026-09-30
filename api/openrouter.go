@@ -24,7 +24,7 @@ type Model struct {
 	Description string `json:"description"`
 	Pricing     struct {
 		Prompt string `json:"prompt"`
-	} `json:"pricing"`
+	}
 }
 
 type APIResponse struct {
@@ -69,11 +69,10 @@ func GetFreeModels() (string, error) {
 
 	var apiResponse APIResponse
 
-	err = json.Unmarshal(
+	if err := json.Unmarshal(
 		body,
 		&apiResponse,
-	)
-	if err != nil {
+	); err != nil {
 		return "", fmt.Errorf(
 			"error parse json: %v",
 			err,
@@ -118,7 +117,16 @@ func HandleChatGPTStreamResponse(
 	user.ChatMu.Lock()
 	defer user.ChatMu.Unlock()
 
-	ctx := context.Background()
+	// ---------------------------------------------------------
+	// REQUEST CONTEXT
+	// ---------------------------------------------------------
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		120*time.Second,
+	)
+
+	defer cancel()
 
 	user.CheckHistory(
 		config.MaxHistorySize,
@@ -131,8 +139,7 @@ func HandleChatGPTStreamResponse(
 	// LOAD TRANSLATIONS
 	// ---------------------------------------------------------
 
-	err := lang.LoadTranslations("./lang/")
-	if err != nil {
+	if err := lang.LoadTranslations("./lang/"); err != nil {
 
 		log.Printf(
 			"Error loading translations: %v",
@@ -145,6 +152,7 @@ func HandleChatGPTStreamResponse(
 	manager, err := configs.NewManager(
 		"./config.yaml",
 	)
+
 	if err != nil {
 
 		log.Printf(
@@ -200,7 +208,7 @@ func HandleChatGPTStreamResponse(
 	// ---------------------------------------------------------
 
 	stopAnimation :=
-		make(chan bool)
+		make(chan bool, 1)
 
 	go func() {
 
@@ -215,7 +223,7 @@ func HandleChatGPTStreamResponse(
 
 		ticker :=
 			time.NewTicker(
-				1500 * time.Millisecond,
+				1200 * time.Millisecond,
 			)
 
 		defer ticker.Stop()
@@ -230,11 +238,7 @@ func HandleChatGPTStreamResponse(
 			case <-ticker.C:
 
 				text :=
-					fmt.Sprintf(
-						"%s%s",
-						loadMessage,
-						dots[i],
-					)
+					loadMessage + dots[i]
 
 				editMsg :=
 					tgbotapi.NewEditMessageText(
@@ -243,17 +247,16 @@ func HandleChatGPTStreamResponse(
 						text,
 					)
 
-				if _, err := bot.Send(editMsg); err != nil {
+				if _, err :=
+					bot.Send(editMsg); err != nil {
 
-					// Ignore Telegram "message is not modified"
-					// because it is harmless.
 					if !strings.Contains(
 						err.Error(),
 						"message is not modified",
 					) {
 
 						log.Printf(
-							"Failed to update loading message: %v",
+							"Loading edit error: %v",
 							err,
 						)
 					}
@@ -298,7 +301,7 @@ func HandleChatGPTStreamResponse(
 	}
 
 	// ---------------------------------------------------------
-	// CURRENT MESSAGE
+	// CURRENT USER MESSAGE
 	// ---------------------------------------------------------
 
 	if config.Vision == "true" {
@@ -369,7 +372,7 @@ func HandleChatGPTStreamResponse(
 		}
 
 	// ---------------------------------------------------------
-	// CREATE OPENROUTER STREAM
+	// TRY OPENROUTER
 	// ---------------------------------------------------------
 
 	stream, err :=
@@ -378,114 +381,58 @@ func HandleChatGPTStreamResponse(
 			req,
 		)
 
+	usingGemini := false
+
 	// ---------------------------------------------------------
-	// GEMINI FALLBACK
+	// OPENROUTER INITIAL FAILURE
 	// ---------------------------------------------------------
 
 	if err != nil {
 
 		log.Printf(
-			"OpenRouter ChatCompletionStream error: %v",
+			"OpenRouter stream creation error: %v",
 			err,
 		)
 
-		// -----------------------------------------------------
-		// DETECT OPENROUTER RATE LIMIT
-		// -----------------------------------------------------
-
-		if strings.Contains(
-			err.Error(),
-			"429",
-		) &&
-			geminiClient != nil {
+		if geminiClient != nil &&
+			isProviderRateLimit(err) {
 
 			log.Printf(
-				"OpenRouter rate limit detected. Switching to Gemini.",
-			)
-
-			// -------------------------------------------------
-			// GEMINI TIMEOUT
-			// -------------------------------------------------
-
-			geminiCtx, cancel :=
-				context.WithTimeout(
-					ctx,
-					60*time.Second,
-				)
-
-			defer cancel()
-
-			// -------------------------------------------------
-			// CLEAN GEMINI REQUEST
-			// -------------------------------------------------
-			//
-			// Do NOT send OpenRouter-specific parameters.
-			//
-
-			geminiReq :=
-				openai.ChatCompletionRequest{
-
-					Model:
-						"gemini-2.5-flash",
-
-					Messages:
-						messages,
-
-					Stream:
-						true,
-
-					// Smaller response = faster generation.
-					MaxTokens:
-						1000,
-
-					Temperature:
-						0.7,
-
-					TopP:
-						0.8,
-				}
-
-			log.Printf(
-				"Starting Gemini fallback...",
+				"⚡ OpenRouter unavailable. Switching to Gemini.",
 			)
 
 			stream, err =
-				geminiClient.
-					CreateChatCompletionStream(
-						geminiCtx,
-						geminiReq,
-					)
-
-			if err != nil {
-
-				log.Printf(
-					"Gemini fallback error: %v",
-					err,
+				createGeminiStream(
+					ctx,
+					geminiClient,
+					messages,
 				)
 
-			} else {
+			if err == nil {
+
+				usingGemini = true
 
 				log.Printf(
-					"Gemini fallback stream started successfully.",
+					"⚡ Gemini fallback stream started.",
 				)
 			}
 		}
 	}
 
 	// ---------------------------------------------------------
-	// BOTH PROVIDERS FAILED
+	// BOTH FAILED
 	// ---------------------------------------------------------
 
 	if err != nil {
 
-		select {
+		stopLoading(stopAnimation)
 
-		case stopAnimation <- true:
+		log.Printf(
+			"All AI providers failed: %v",
+			err,
+		)
 
-		default:
-		}
-
-		errorMsg :=
+		editMsg :=
 			tgbotapi.NewEditMessageText(
 				message.Chat.ID,
 				lastMessageID,
@@ -493,7 +440,7 @@ func HandleChatGPTStreamResponse(
 			)
 
 		if _, editErr :=
-			bot.Send(errorMsg); editErr != nil {
+			bot.Send(editMsg); editErr != nil {
 
 			log.Printf(
 				"Failed to send error message: %v",
@@ -504,40 +451,33 @@ func HandleChatGPTStreamResponse(
 		return ""
 	}
 
-	// ---------------------------------------------------------
-	// STREAM CLEANUP
-	// ---------------------------------------------------------
-
 	defer stream.Close()
 
 	user.CurrentStream =
 		stream
 
-	// Stop loading animation.
-	select {
-
-	case stopAnimation <- true:
-
-	default:
-	}
+	stopLoading(stopAnimation)
 
 	// ---------------------------------------------------------
-	// STREAMING
+	// STREAM VARIABLES
 	// ---------------------------------------------------------
 
 	var messageText string
 
 	responseID := ""
 
-	// Faster Telegram updates.
 	lastEdit :=
 		time.Now()
 
+	// Telegram API calls are relatively expensive.
+	// 350ms gives a fast perceived response without
+	// hammering Telegram.
 	const editInterval =
-		400 * time.Millisecond
+		350 * time.Millisecond
 
 	log.Printf(
-		"User: %s Stream response.",
+		"⚡ Stream started | provider=%s | user=%s",
+		providerName(usingGemini),
 		user.UserName,
 	)
 
@@ -547,7 +487,7 @@ func HandleChatGPTStreamResponse(
 
 	for {
 
-		response, err :=
+		response, recvErr :=
 			stream.Recv()
 
 		// -----------------------------------------------------
@@ -562,73 +502,46 @@ func HandleChatGPTStreamResponse(
 		}
 
 		// -----------------------------------------------------
-		// STREAM FINISHED
+		// NORMAL STREAM END
 		// -----------------------------------------------------
 
 		if errors.Is(
-			err,
+			recvErr,
 			io.EOF,
 		) {
 
 			log.Printf(
-				"Stream finished, response ID: %s",
+				"Stream finished | provider=%s | response=%s",
+				providerName(usingGemini),
 				responseID,
 			)
 
-			// -------------------------------------------------
-			// SAVE USER MESSAGE
-			// -------------------------------------------------
+			user.CurrentStream =
+				nil
 
+			// Save conversation.
 			user.AddMessage(
 				openai.ChatMessageRoleUser,
 				message.Text,
 			)
-
-			// -------------------------------------------------
-			// SAVE AI RESPONSE
-			// -------------------------------------------------
 
 			user.AddMessage(
 				openai.ChatMessageRoleAssistant,
 				messageText,
 			)
 
-			// -------------------------------------------------
-			// FINAL TELEGRAM UPDATE
-			// -------------------------------------------------
-
+			// Final response.
 			if strings.TrimSpace(
 				messageText,
 			) != "" {
 
-				editMsg :=
-					tgbotapi.NewEditMessageText(
-						message.Chat.ID,
-						lastMessageID,
-						messageText,
-					)
-
-				editMsg.ParseMode =
-					tgbotapi.ModeMarkdown
-
-				if _, err :=
-					bot.Send(editMsg); err != nil {
-
-					log.Printf(
-						"Failed to edit final message: %v",
-						err,
-					)
-				}
-
-			} else {
-
-				log.Printf(
-					"Final response was empty",
+				editFinalMessage(
+					bot,
+					message.Chat.ID,
+					lastMessageID,
+					messageText,
 				)
 			}
-
-			user.CurrentStream =
-				nil
 
 			return responseID
 		}
@@ -637,35 +550,104 @@ func HandleChatGPTStreamResponse(
 		// STREAM ERROR
 		// -----------------------------------------------------
 
-		if err != nil {
+		if recvErr != nil {
 
 			log.Printf(
-				"Stream error: %v",
-				err,
+				"Stream error | provider=%s | error=%v",
+				providerName(usingGemini),
+				recvErr,
 			)
+
+			// -------------------------------------------------
+			// FALLBACK TO GEMINI
+			// -------------------------------------------------
+
+			if !usingGemini &&
+				geminiClient != nil {
+
+				log.Printf(
+					"⚡ OpenRouter stream failed. Retrying with Gemini.",
+				)
+
+				// Close broken OpenRouter stream.
+				stream.Close()
+
+				geminiStream, geminiErr :=
+					createGeminiStream(
+						ctx,
+						geminiClient,
+						messages,
+					)
+
+				if geminiErr == nil {
+
+					stream =
+						geminiStream
+
+					usingGemini =
+						true
+
+					user.CurrentStream =
+						stream
+
+					log.Printf(
+						"⚡ Gemini retry stream started.",
+					)
+
+					// Continue streaming.
+					continue
+				}
+
+				log.Printf(
+					"Gemini retry failed: %v",
+					geminiErr,
+				)
+			}
 
 			user.CurrentStream =
 				nil
 
+			// If we already received content,
+			// keep that content instead of replacing
+			// it with an error.
 			if strings.TrimSpace(
 				messageText,
-			) == "" {
+			) != "" {
 
-				errorMsg :=
-					tgbotapi.NewEditMessageText(
-						message.Chat.ID,
-						lastMessageID,
-						errorMessage,
-					)
+				editFinalMessage(
+					bot,
+					message.Chat.ID,
+					lastMessageID,
+					messageText,
+				)
 
-				if _, editErr :=
-					bot.Send(errorMsg); editErr != nil {
+				user.AddMessage(
+					openai.ChatMessageRoleUser,
+					message.Text,
+				)
 
-					log.Printf(
-						"Failed to send stream error: %v",
-						editErr,
-					)
-				}
+				user.AddMessage(
+					openai.ChatMessageRoleAssistant,
+					messageText,
+				)
+
+				return responseID
+			}
+
+			editMsg :=
+				tgbotapi.NewEditMessageText(
+					message.Chat.ID,
+					lastMessageID,
+					errorMessage,
+				)
+
+			if _, editErr :=
+				bot.Send(editMsg); editErr != nil {
+
+				log.Printf(
+					"Failed to send stream error: %v",
+					editErr,
+				)
 			}
 
 			return responseID
@@ -680,66 +662,296 @@ func HandleChatGPTStreamResponse(
 		}
 
 		// -----------------------------------------------------
-		// ADD STREAM CONTENT
+		// GET TOKEN
 		// -----------------------------------------------------
 
 		content :=
 			response.Choices[0].
 				Delta.Content
 
-		if content != "" {
-
-			messageText +=
-				content
-		}
-
-		// Don't edit empty messages.
-		if strings.TrimSpace(
-			messageText,
-		) == "" {
-
+		if content == "" {
 			continue
 		}
 
+		messageText +=
+			content
+
 		// -----------------------------------------------------
-		// TELEGRAM STREAM UPDATE
+		// FIRST TOKEN
+		// -----------------------------------------------------
+
+		// Send the first visible token immediately.
+		//
+		// This is important for perceived ChatGPT-like
+		// responsiveness.
+
+		if strings.TrimSpace(
+			messageText,
+		) != "" {
+
+			if lastEdit.IsZero() ||
+				len(messageText) <= len(content) {
+
+				editStreamingMessage(
+					bot,
+					message.Chat.ID,
+					lastMessageID,
+					messageText,
+				)
+
+				lastEdit =
+					time.Now()
+
+				continue
+			}
+		}
+
+		// -----------------------------------------------------
+		// NORMAL STREAMING UPDATE
 		// -----------------------------------------------------
 
 		if time.Since(
 			lastEdit,
 		) >= editInterval {
 
-			editMsg :=
-				tgbotapi.NewEditMessageText(
-					message.Chat.ID,
-					lastMessageID,
-					messageText,
-				)
-
-			editMsg.ParseMode =
-				tgbotapi.ModeMarkdown
-
-			if _, err :=
-				bot.Send(editMsg); err != nil {
-
-				// Telegram can reject an edit if the
-				// generated text has not changed.
-				if !strings.Contains(
-					err.Error(),
-					"message is not modified",
-				) {
-
-					log.Printf(
-						"Failed to edit streaming message: %v",
-						err,
-					)
-				}
-
-			} else {
+			if editStreamingMessage(
+				bot,
+				message.Chat.ID,
+				lastMessageID,
+				messageText,
+			) {
 
 				lastEdit =
 					time.Now()
 			}
+		}
+	}
+}
+
+// -------------------------------------------------------------
+// GEMINI STREAM
+// -------------------------------------------------------------
+
+func createGeminiStream(
+	parentCtx context.Context,
+	client *openai.Client,
+	messages []openai.ChatCompletionMessage,
+) (*openai.ChatCompletionStream, error) {
+
+	// Shorter timeout specifically for Gemini fallback.
+	ctx, cancel :=
+		context.WithTimeout(
+			parentCtx,
+			60*time.Second,
+		)
+
+	// The stream owns the HTTP request, so we cannot
+	// immediately cancel this context.
+	//
+	// The timeout will automatically terminate the
+	// request after 60 seconds.
+	_ = cancel
+
+	req :=
+		openai.ChatCompletionRequest{
+
+			Model:
+				"gemini-2.5-flash",
+
+			Messages:
+				messages,
+
+			Stream:
+				true,
+
+			// Keep fallback responses reasonably short.
+			MaxTokens:
+				1000,
+
+			Temperature:
+				0.7,
+
+			TopP:
+				0.8,
+		}
+
+	return client.CreateChatCompletionStream(
+		ctx,
+		req,
+	)
+}
+
+// -------------------------------------------------------------
+// PROVIDER NAME
+// -------------------------------------------------------------
+
+func providerName(
+	gemini bool,
+) string {
+
+	if gemini {
+		return "Gemini"
+	}
+
+	return "OpenRouter"
+}
+
+// -------------------------------------------------------------
+// RATE LIMIT DETECTION
+// -------------------------------------------------------------
+
+func isProviderRateLimit(
+	err error,
+) bool {
+
+	if err == nil {
+		return false
+	}
+
+	errText :=
+		strings.ToLower(
+			err.Error(),
+		)
+
+	return strings.Contains(
+		errText,
+		"429",
+	) ||
+		strings.Contains(
+			errText,
+			"too many requests",
+		) ||
+		strings.Contains(
+			errText,
+			"rate limit",
+		) ||
+		strings.Contains(
+			errText,
+			"rate_limit",
+		)
+}
+
+// -------------------------------------------------------------
+// STOP LOADING ANIMATION
+// -------------------------------------------------------------
+
+func stopLoading(
+	stopAnimation chan bool,
+) {
+
+	select {
+
+	case stopAnimation <- true:
+
+	default:
+	}
+}
+
+// -------------------------------------------------------------
+// FAST STREAMING EDIT
+// -------------------------------------------------------------
+
+func editStreamingMessage(
+	bot *tgbotapi.BotAPI,
+	chatID int64,
+	messageID int,
+	text string,
+) bool {
+
+	if strings.TrimSpace(text) == "" {
+		return false
+	}
+
+	// IMPORTANT:
+	//
+	// Do NOT use Markdown while streaming.
+	//
+	// AI responses often contain incomplete Markdown
+	// such as:
+	//
+	// **hello
+	//
+	// which can cause Telegram parse errors.
+	//
+	// Plain text makes streaming much more reliable.
+
+	editMsg :=
+		tgbotapi.NewEditMessageText(
+			chatID,
+			messageID,
+			text,
+		)
+
+	if _, err :=
+		bot.Send(editMsg); err != nil {
+
+		if strings.Contains(
+			err.Error(),
+			"message is not modified",
+		) {
+			return false
+		}
+
+		log.Printf(
+			"Streaming Telegram edit error: %v",
+			err,
+		)
+
+		return false
+	}
+
+	return true
+}
+
+// -------------------------------------------------------------
+// FINAL MESSAGE
+// -------------------------------------------------------------
+
+func editFinalMessage(
+	bot *tgbotapi.BotAPI,
+	chatID int64,
+	messageID int,
+	text string,
+) {
+
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+
+	editMsg :=
+		tgbotapi.NewEditMessageText(
+			chatID,
+			messageID,
+			text,
+		)
+
+	// Use Markdown only for the final message.
+	editMsg.ParseMode =
+		tgbotapi.ModeMarkdown
+
+	if _, err :=
+		bot.Send(editMsg); err != nil {
+
+		// If Markdown parsing fails, send plain text.
+		log.Printf(
+			"Markdown final edit failed: %v",
+			err,
+		)
+
+		plainMsg :=
+			tgbotapi.NewEditMessageText(
+				chatID,
+				messageID,
+				text,
+			)
+
+		if _, plainErr :=
+			bot.Send(plainMsg); plainErr != nil {
+
+			log.Printf(
+				"Plain final edit failed: %v",
+				plainErr,
+			)
 		}
 	}
 }
@@ -757,7 +969,7 @@ func addVisionMessage(
 	if len(message.Photo) > 0 {
 
 		// -----------------------------------------------------
-		// USE LARGEST PHOTO
+		// LARGEST PHOTO
 		// -----------------------------------------------------
 
 		photoSize :=
@@ -769,7 +981,7 @@ func addVisionMessage(
 			photoSize.FileID
 
 		// -----------------------------------------------------
-		// DOWNLOAD PHOTO INFORMATION
+		// TELEGRAM FILE
 		// -----------------------------------------------------
 
 		file, err :=
@@ -795,17 +1007,10 @@ func addVisionMessage(
 			}
 		}
 
-		// -----------------------------------------------------
-		// TELEGRAM FILE URL
-		// -----------------------------------------------------
-
 		fileURL :=
-			file.Link(bot.Token)
-
-		log.Printf(
-			"Photo URL: %s",
-			fileURL,
-		)
+			file.Link(
+				bot.Token,
+			)
 
 		// -----------------------------------------------------
 		// VISION PROMPT
@@ -870,7 +1075,7 @@ func addVisionMessage(
 	}
 
 	// ---------------------------------------------------------
-	// NORMAL TEXT MESSAGE
+	// NORMAL TEXT
 	// ---------------------------------------------------------
 
 	return openai.ChatCompletionMessage{
