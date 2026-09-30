@@ -8,6 +8,7 @@ import (
 	"openrouter-bot/config"
 	"openrouter-bot/lang"
 	"openrouter-bot/user"
+	"openrouter-bot/translator"
 	"os"
 	"strconv"
 	"strings"
