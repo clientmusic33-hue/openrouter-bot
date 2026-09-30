@@ -71,6 +71,7 @@ func GetFreeModels() (string, error) {
 func HandleChatGPTStreamResponse(
 	bot *tgbotapi.BotAPI,
 	client *openai.Client,
+	geminiClient *openai.Client,
 	message *tgbotapi.Message,
 	config *config.Config,
 	user *user.UsageTracker,
