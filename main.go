@@ -118,37 +118,71 @@ func main() {
 		},
 		{
 			Command:     "about",
-// OpenRouter/OpenAI client.
-clientOptions := openai.DefaultConfig(conf.OpenAIApiKey)
-clientOptions.BaseURL = conf.OpenAIBaseURL
-client := openai.NewClientWithConfig(clientOptions)
+			Description: "About this bot",
+		},
+		{
+			Command:     "tr",
+			Description: "Translate a replied message",
+		},
+		{
+			Command:     "translate",
+			Description: "Manage group auto translation",
+		},
+	}
 
-// Gemini fallback client.
-geminiAPIKey := os.Getenv("GEMINI_API_KEY")
+	_, err = bot.Request(tgbotapi.NewSetMyCommands(commands...))
+	if err != nil {
+		log.Fatalf("Failed to set bot commands: %v", err)
+	}
 
-var geminiClient *openai.Client
+	// ---------------------------------------------------------
+	// OPENROUTER CLIENT
+	// ---------------------------------------------------------
 
-if geminiAPIKey != "" {
-	geminiOptions := openai.DefaultConfig(geminiAPIKey)
-	geminiOptions.BaseURL = "https://generativelanguage.googleapis.com/v1beta/openai/"
-	geminiClient = openai.NewClientWithConfig(geminiOptions)
+	clientOptions := openai.DefaultConfig(conf.OpenAIApiKey)
+	clientOptions.BaseURL = conf.OpenAIBaseURL
+	client := openai.NewClientWithConfig(clientOptions)
 
-	log.Println("Gemini fallback enabled")
-} else {
-	log.Println("GEMINI_API_KEY not set - Gemini fallback disabled")
-}
+	// ---------------------------------------------------------
+	// GEMINI FALLBACK CLIENT
+	// ---------------------------------------------------------
 
-	// User manager.
+	geminiAPIKey := os.Getenv("GEMINI_API_KEY")
+
+	var geminiClient *openai.Client
+
+	if geminiAPIKey != "" {
+		geminiOptions := openai.DefaultConfig(geminiAPIKey)
+
+		geminiOptions.BaseURL =
+			"https://generativelanguage.googleapis.com/v1beta/openai/"
+
+		geminiClient = openai.NewClientWithConfig(geminiOptions)
+
+		log.Println("Gemini fallback enabled")
+	} else {
+		log.Println("GEMINI_API_KEY not set - Gemini fallback disabled")
+	}
+
+	// ---------------------------------------------------------
+	// USER MANAGER
+	// ---------------------------------------------------------
+
 	userManager := user.NewUserManager("logs")
 
-	// Process Telegram updates.
+	// ---------------------------------------------------------
+	// PROCESS TELEGRAM UPDATES
+	// ---------------------------------------------------------
+
 	for update := range updates {
+
 		if update.Message == nil {
 			continue
 		}
 
 		// Ignore messages sent by bots.
-		if update.Message.From != nil && update.Message.From.IsBot {
+		if update.Message.From != nil &&
+			update.Message.From.IsBot {
 			continue
 		}
 
@@ -160,11 +194,20 @@ if geminiAPIKey != "" {
 		senderUsername := ""
 
 		if update.Message.From != nil {
-			senderID = update.Message.From.ID
-			senderUsername = update.Message.From.UserName
+
+			senderID =
+				update.Message.From.ID
+
+			senderUsername =
+				update.Message.From.UserName
+
 		} else if update.Message.SenderChat != nil {
-			senderID = update.Message.SenderChat.ID
-			senderUsername = update.Message.SenderChat.UserName
+
+			senderID =
+				update.Message.SenderChat.ID
+
+			senderUsername =
+				update.Message.SenderChat.UserName
 		}
 
 		log.Printf(
@@ -187,14 +230,25 @@ if geminiAPIKey != "" {
 		// ---------------------------------------------------------
 
 		if update.Message.IsCommand() {
+
 			switch update.Message.Command() {
 
 			// /start
 			case "start":
+
 				msgText :=
-					lang.Translate("commands.start", conf.Lang) +
-						lang.Translate("commands.help", conf.Lang) +
-						lang.Translate("commands.start_end", conf.Lang)
+					lang.Translate(
+						"commands.start",
+						conf.Lang,
+					) +
+						lang.Translate(
+							"commands.help",
+							conf.Lang,
+						) +
+						lang.Translate(
+							"commands.start_end",
+							conf.Lang,
+						)
 
 				msg := tgbotapi.NewMessage(
 					update.Message.Chat.ID,
@@ -204,28 +258,43 @@ if geminiAPIKey != "" {
 				msg.ParseMode = "HTML"
 
 				if _, err := bot.Send(msg); err != nil {
-					log.Println("Failed to send /start:", err)
+					log.Println(
+						"Failed to send /start:",
+						err,
+					)
 				}
 
 			// /help
 			case "help":
+
 				msg := tgbotapi.NewMessage(
 					update.Message.Chat.ID,
-					lang.Translate("commands.help", conf.Lang),
+					lang.Translate(
+						"commands.help",
+						conf.Lang,
+					),
 				)
 
 				msg.ParseMode = "HTML"
 
 				if _, err := bot.Send(msg); err != nil {
-					log.Println("Failed to send /help:", err)
+					log.Println(
+						"Failed to send /help:",
+						err,
+					)
 				}
 
 			// /get_models
 			case "get_models":
+
 				models, err := api.GetFreeModels()
 
 				if err != nil {
-					log.Printf("Error getting models: %v", err)
+
+					log.Printf(
+						"Error getting models: %v",
+						err,
+					)
 
 					msg := tgbotapi.NewMessage(
 						update.Message.Chat.ID,
@@ -233,79 +302,113 @@ if geminiAPIKey != "" {
 					)
 
 					if _, err := bot.Send(msg); err != nil {
-						log.Println("Failed to send models error:", err)
+						log.Println(
+							"Failed to send models error:",
+							err,
+						)
 					}
 
 					continue
 				}
 
-				text := lang.Translate(
-					"commands.getModels",
-					conf.Lang,
-				) + models
+				text :=
+					lang.Translate(
+						"commands.getModels",
+						conf.Lang,
+					) +
+						models
 
 				msg := tgbotapi.NewMessage(
 					update.Message.Chat.ID,
 					text,
 				)
 
-				msg.ParseMode = tgbotapi.ModeMarkdown
+				msg.ParseMode =
+					tgbotapi.ModeMarkdown
 
 				if _, err := bot.Send(msg); err != nil {
-					log.Println("Failed to send models:", err)
+					log.Println(
+						"Failed to send models:",
+						err,
+					)
 				}
 
 			// /set_model
 			case "set_model":
-				args := update.Message.CommandArguments()
-				argsArr := strings.Fields(args)
+
+				args :=
+					update.Message.CommandArguments()
+
+				argsArr :=
+					strings.Fields(args)
 
 				msg := tgbotapi.NewMessage(
 					update.Message.Chat.ID,
 					conf.Model.ModelName,
 				)
 
-				msg.ParseMode = tgbotapi.ModeMarkdown
+				msg.ParseMode =
+					tgbotapi.ModeMarkdown
 
 				switch {
+
 				case args == "default":
-					conf.Model.ModelName = conf.Model.ModelNameDefault
+
+					conf.Model.ModelName =
+						conf.Model.ModelNameDefault
 
 					msg.Text =
-						lang.Translate("commands.setModel", conf.Lang) +
+						lang.Translate(
+							"commands.setModel",
+							conf.Lang,
+						) +
 							" `" +
 							conf.Model.ModelName +
 							"`"
 
 				case args == "":
-					msg.Text = lang.Translate(
-						"commands.noArgsModel",
-						conf.Lang,
-					)
-
-				case len(argsArr) > 1:
-					msg.Text = lang.Translate(
-						"commands.noSpaceModel",
-						conf.Lang,
-					)
-
-				default:
-					conf.Model.ModelName = argsArr[0]
 
 					msg.Text =
-						lang.Translate("commands.setModel", conf.Lang) +
+						lang.Translate(
+							"commands.noArgsModel",
+							conf.Lang,
+						)
+
+				case len(argsArr) > 1:
+
+					msg.Text =
+						lang.Translate(
+							"commands.noSpaceModel",
+							conf.Lang,
+						)
+
+				default:
+
+					conf.Model.ModelName =
+						argsArr[0]
+
+					msg.Text =
+						lang.Translate(
+							"commands.setModel",
+							conf.Lang,
+						) +
 							" `" +
 							conf.Model.ModelName +
 							"`"
 				}
 
 				if _, err := bot.Send(msg); err != nil {
-					log.Println("Failed to send /set_model:", err)
+					log.Println(
+						"Failed to send /set_model:",
+						err,
+					)
 				}
 
 			// /reset
 			case "reset":
-				args := update.Message.CommandArguments()
+
+				args :=
+					update.Message.CommandArguments()
 
 				msg := tgbotapi.NewMessage(
 					update.Message.Chat.ID,
@@ -313,15 +416,20 @@ if geminiAPIKey != "" {
 				)
 
 				if args == "system" {
-					userStats.SystemPrompt = conf.SystemPrompt
 
-					msg.Text = lang.Translate(
-						"commands.reset_system",
-						conf.Lang,
-					)
+					userStats.SystemPrompt =
+						conf.SystemPrompt
+
+					msg.Text =
+						lang.Translate(
+							"commands.reset_system",
+							conf.Lang,
+						)
 
 				} else if args != "" {
-					userStats.SystemPrompt = args
+
+					userStats.SystemPrompt =
+						args
 
 					msg.Text =
 						lang.Translate(
@@ -332,79 +440,97 @@ if geminiAPIKey != "" {
 							"."
 
 				} else {
+
 					userStats.ClearHistory()
 
-					msg.Text = lang.Translate(
-						"commands.reset",
-						conf.Lang,
-					)
+					msg.Text =
+						lang.Translate(
+							"commands.reset",
+							conf.Lang,
+						)
 				}
 
 				if _, err := bot.Send(msg); err != nil {
-					log.Println("Failed to send /reset:", err)
+					log.Println(
+						"Failed to send /reset:",
+						err,
+					)
 				}
 
 			// /stats
 			case "stats":
+
 				userStats.CheckHistory(
 					conf.MaxHistorySize,
 					conf.MaxHistoryTime,
 				)
 
-				countedUsage := strconv.FormatFloat(
-					userStats.GetCurrentCost(conf.BudgetPeriod),
-					'f',
-					6,
-					64,
-				)
+				countedUsage :=
+					strconv.FormatFloat(
+						userStats.GetCurrentCost(
+							conf.BudgetPeriod,
+						),
+						'f',
+						6,
+						64,
+					)
 
-				todayUsage := strconv.FormatFloat(
-					userStats.GetCurrentCost("daily"),
-					'f',
-					6,
-					64,
-				)
+				todayUsage :=
+					strconv.FormatFloat(
+						userStats.GetCurrentCost("daily"),
+						'f',
+						6,
+						64,
+					)
 
-				monthUsage := strconv.FormatFloat(
-					userStats.GetCurrentCost("monthly"),
-					'f',
-					6,
-					64,
-				)
+				monthUsage :=
+					strconv.FormatFloat(
+						userStats.GetCurrentCost("monthly"),
+						'f',
+						6,
+						64,
+					)
 
-				totalUsage := strconv.FormatFloat(
-					userStats.GetCurrentCost("total"),
-					'f',
-					6,
-					64,
-				)
+				totalUsage :=
+					strconv.FormatFloat(
+						userStats.GetCurrentCost("total"),
+						'f',
+						6,
+						64,
+					)
 
-				messagesCount := strconv.Itoa(
-					len(userStats.GetMessages()),
-				)
+				messagesCount :=
+					strconv.Itoa(
+						len(userStats.GetMessages()),
+					)
 
 				var statsMessage string
 
 				if userStats.CanViewStats(conf) {
-					statsMessage = fmt.Sprintf(
-						lang.Translate(
-							"commands.stats",
-							conf.Lang,
-						),
-						countedUsage,
-						todayUsage,
-						monthUsage,
-						totalUsage,
-						messagesCount,
-					)
+
+					statsMessage =
+						fmt.Sprintf(
+							lang.Translate(
+								"commands.stats",
+								conf.Lang,
+							),
+							countedUsage,
+							todayUsage,
+							monthUsage,
+							totalUsage,
+							messagesCount,
+						)
+
 				} else {
-					statsMessage = fmt.Sprintf(
-						lang.Translate(
-							"commands.stats_min",
-							conf.Lang,
-						),
-						messagesCount,
-					)
+
+					statsMessage =
+						fmt.Sprintf(
+							lang.Translate(
+								"commands.stats_min",
+								conf.Lang,
+							),
+							messagesCount,
+						)
 				}
 
 				msg := tgbotapi.NewMessage(
@@ -415,57 +541,76 @@ if geminiAPIKey != "" {
 				msg.ParseMode = "HTML"
 
 				if _, err := bot.Send(msg); err != nil {
-					log.Println("Failed to send /stats:", err)
+					log.Println(
+						"Failed to send /stats:",
+						err,
+					)
 				}
 
 			// /tr
 			case "tr":
+
 				if update.Message.ReplyToMessage == nil {
+
 					msg := tgbotapi.NewMessage(
 						update.Message.Chat.ID,
 						"❌ Reply to a message and use:\n\n/tr hi\n/tr en\n/tr ru",
 					)
 
 					if _, err := bot.Send(msg); err != nil {
-						log.Println("Failed to send /tr help:", err)
+						log.Println(
+							"Failed to send /tr help:",
+							err,
+						)
 					}
 
 					continue
 				}
 
-				targetLanguage := strings.TrimSpace(
-					update.Message.CommandArguments(),
-				)
+				targetLanguage :=
+					strings.TrimSpace(
+						update.Message.CommandArguments(),
+					)
 
 				if targetLanguage == "" {
 					targetLanguage = "English"
 				}
 
-				sourceText := update.Message.ReplyToMessage.Text
+				sourceText :=
+					update.Message.ReplyToMessage.Text
 
 				if strings.TrimSpace(sourceText) == "" {
+
 					msg := tgbotapi.NewMessage(
 						update.Message.Chat.ID,
 						"❌ The replied message doesn't contain text.",
 					)
 
 					if _, err := bot.Send(msg); err != nil {
-						log.Println("Failed to send /tr error:", err)
+						log.Println(
+							"Failed to send /tr error:",
+							err,
+						)
 					}
 
 					continue
 				}
 
-				translatedText, err := translator.Translate(
-					context.Background(),
-					client,
-					sourceText,
-					targetLanguage,
-					conf.Model.ModelName,
-				)
+				translatedText, err :=
+					translator.Translate(
+						context.Background(),
+						client,
+						sourceText,
+						targetLanguage,
+						conf.Model.ModelName,
+					)
 
 				if err != nil {
-					log.Printf("Translation error: %v", err)
+
+					log.Printf(
+						"Translation error: %v",
+						err,
+					)
 
 					msg := tgbotapi.NewMessage(
 						update.Message.Chat.ID,
@@ -473,7 +618,10 @@ if geminiAPIKey != "" {
 					)
 
 					if _, err := bot.Send(msg); err != nil {
-						log.Println("Failed to send translation error:", err)
+						log.Println(
+							"Failed to send translation error:",
+							err,
+						)
 					}
 
 					continue
@@ -481,18 +629,22 @@ if geminiAPIKey != "" {
 
 				msg := tgbotapi.NewMessage(
 					update.Message.Chat.ID,
-					"🌐 <b>Translation</b>\n\n"+translatedText,
+					"🌐 <b>Translation</b>\n\n"+
+						translatedText,
 				)
 
 				msg.ParseMode = "HTML"
 
 				if _, err := bot.Send(msg); err != nil {
-					log.Println("Failed to send translation:", err)
+					log.Println(
+						"Failed to send translation:",
+						err,
+					)
 				}
 
 			// /translate
 			case "translate":
-				// Auto translation only makes sense in groups.
+
 				if update.Message.Chat.Type != "group" &&
 					update.Message.Chat.Type != "supergroup" {
 
@@ -502,40 +654,54 @@ if geminiAPIKey != "" {
 					)
 
 					if _, err := bot.Send(msg); err != nil {
-						log.Println("Failed to send /translate error:", err)
+						log.Println(
+							"Failed to send /translate error:",
+							err,
+						)
 					}
 
 					continue
 				}
 
-				args := strings.TrimSpace(
-					update.Message.CommandArguments(),
-				)
+				args :=
+					strings.TrimSpace(
+						update.Message.CommandArguments(),
+					)
 
-				argsLower := strings.ToLower(args)
+				argsLower :=
+					strings.ToLower(args)
 
 				switch argsLower {
 
 				case "on":
-					err := translationManager.SetEnabled(
-						update.Message.Chat.ID,
-						true,
-					)
+
+					err :=
+						translationManager.SetEnabled(
+							update.Message.Chat.ID,
+							true,
+						)
 
 					if err != nil {
-						log.Printf("Failed to enable translation: %v", err)
 
-						bot.Send(tgbotapi.NewMessage(
-							update.Message.Chat.ID,
-							"❌ Failed to save translation settings.",
-						))
+						log.Printf(
+							"Failed to enable translation: %v",
+							err,
+						)
+
+						bot.Send(
+							tgbotapi.NewMessage(
+								update.Message.Chat.ID,
+								"❌ Failed to save translation settings.",
+							),
+						)
 
 						continue
 					}
 
-					settings := translationManager.Get(
-						update.Message.Chat.ID,
-					)
+					settings :=
+						translationManager.Get(
+							update.Message.Chat.ID,
+						)
 
 					msg := tgbotapi.NewMessage(
 						update.Message.Chat.ID,
@@ -550,37 +716,53 @@ if geminiAPIKey != "" {
 					msg.ParseMode = "HTML"
 
 					if _, err := bot.Send(msg); err != nil {
-						log.Println("Failed to send translation status:", err)
+						log.Println(
+							"Failed to send translation status:",
+							err,
+						)
 					}
 
 				case "off":
-					err := translationManager.SetEnabled(
-						update.Message.Chat.ID,
-						false,
-					)
+
+					err :=
+						translationManager.SetEnabled(
+							update.Message.Chat.ID,
+							false,
+						)
 
 					if err != nil {
-						log.Printf("Failed to disable translation: %v", err)
 
-						bot.Send(tgbotapi.NewMessage(
-							update.Message.Chat.ID,
-							"❌ Failed to save translation settings.",
-						))
+						log.Printf(
+							"Failed to disable translation: %v",
+							err,
+						)
+
+						bot.Send(
+							tgbotapi.NewMessage(
+								update.Message.Chat.ID,
+								"❌ Failed to save translation settings.",
+							),
+						)
 
 						continue
 					}
 
-					bot.Send(tgbotapi.NewMessage(
-						update.Message.Chat.ID,
-						"🌐 Auto translation disabled.",
-					))
-
-				case "status":
-					settings := translationManager.Get(
-						update.Message.Chat.ID,
+					bot.Send(
+						tgbotapi.NewMessage(
+							update.Message.Chat.ID,
+							"🌐 Auto translation disabled.",
+						),
 					)
 
-					status := "🔴 Disabled"
+				case "status":
+
+					settings :=
+						translationManager.Get(
+							update.Message.Chat.ID,
+						)
+
+					status :=
+						"🔴 Disabled"
 
 					if settings.Enabled {
 						status = "🟢 Enabled"
@@ -601,11 +783,16 @@ if geminiAPIKey != "" {
 					msg.ParseMode = "HTML"
 
 					if _, err := bot.Send(msg); err != nil {
-						log.Println("Failed to send translation status:", err)
+						log.Println(
+							"Failed to send translation status:",
+							err,
+						)
 					}
 
 				default:
+
 					if args == "" {
+
 						msg := tgbotapi.NewMessage(
 							update.Message.Chat.ID,
 							"🌐 <b>Group Translation</b>\n\n"+
@@ -619,55 +806,67 @@ if geminiAPIKey != "" {
 						msg.ParseMode = "HTML"
 
 						if _, err := bot.Send(msg); err != nil {
-							log.Println("Failed to send translation help:", err)
+							log.Println(
+								"Failed to send translation help:",
+								err,
+							)
 						}
 
 						continue
 					}
 
 					// Set the target language.
-					err := translationManager.SetLanguage(
-						update.Message.Chat.ID,
-						args,
-					)
+					err :=
+						translationManager.SetLanguage(
+							update.Message.Chat.ID,
+							args,
+						)
 
 					if err != nil {
+
 						log.Printf(
 							"Failed to set translation language: %v",
 							err,
 						)
 
-						bot.Send(tgbotapi.NewMessage(
-							update.Message.Chat.ID,
-							"❌ Failed to save translation language.",
-						))
+						bot.Send(
+							tgbotapi.NewMessage(
+								update.Message.Chat.ID,
+								"❌ Failed to save translation language.",
+							),
+						)
 
 						continue
 					}
 
 					// Automatically enable translation.
-					err = translationManager.SetEnabled(
-						update.Message.Chat.ID,
-						true,
-					)
+					err =
+						translationManager.SetEnabled(
+							update.Message.Chat.ID,
+							true,
+						)
 
 					if err != nil {
+
 						log.Printf(
 							"Failed to enable translation: %v",
 							err,
 						)
 
-						bot.Send(tgbotapi.NewMessage(
-							update.Message.Chat.ID,
-							"❌ Language was saved, but translation could not be enabled.",
-						))
+						bot.Send(
+							tgbotapi.NewMessage(
+								update.Message.Chat.ID,
+								"❌ Language was saved, but translation could not be enabled.",
+							),
+						)
 
 						continue
 					}
 
-					settings := translationManager.Get(
-						update.Message.Chat.ID,
-					)
+					settings :=
+						translationManager.Get(
+							update.Message.Chat.ID,
+						)
 
 					msg := tgbotapi.NewMessage(
 						update.Message.Chat.ID,
@@ -682,12 +881,16 @@ if geminiAPIKey != "" {
 					msg.ParseMode = "HTML"
 
 					if _, err := bot.Send(msg); err != nil {
-						log.Println("Failed to send translation settings:", err)
+						log.Println(
+							"Failed to send translation settings:",
+							err,
+						)
 					}
 				}
 
 			// /about
 			case "about":
+
 				msg := tgbotapi.NewMessage(
 					update.Message.Chat.ID,
 					"🤖 <b>OpenRouter AI Bot</b>\n\n"+
@@ -698,12 +901,17 @@ if geminiAPIKey != "" {
 				msg.ParseMode = "HTML"
 
 				if _, err := bot.Send(msg); err != nil {
-					log.Println("Failed to send /about:", err)
+					log.Println(
+						"Failed to send /about:",
+						err,
+					)
 				}
 
 			// /stop
 			case "stop":
+
 				if userStats.CurrentStream != nil {
+
 					userStats.CurrentStream.Close()
 
 					msg := tgbotapi.NewMessage(
@@ -715,10 +923,11 @@ if geminiAPIKey != "" {
 					)
 
 					if _, err := bot.Send(msg); err != nil {
-						log.Println("Failed to send /stop:", err)
+						log.Println(err)
 					}
 
 				} else {
+
 					msg := tgbotapi.NewMessage(
 						update.Message.Chat.ID,
 						lang.Translate(
@@ -728,7 +937,10 @@ if geminiAPIKey != "" {
 					)
 
 					if _, err := bot.Send(msg); err != nil {
-						log.Println("Failed to send /stop error:", err)
+						log.Println(
+							"Failed to send /stop error:",
+							err,
+						)
 					}
 				}
 			}
@@ -743,9 +955,10 @@ if geminiAPIKey != "" {
 		if update.Message.Chat.Type == "group" ||
 			update.Message.Chat.Type == "supergroup" {
 
-			settings := translationManager.Get(
-				update.Message.Chat.ID,
-			)
+			settings :=
+				translationManager.Get(
+					update.Message.Chat.ID,
+				)
 
 			log.Printf(
 				"Group translation check: chat=%d enabled=%v language=%q text=%q",
@@ -758,16 +971,21 @@ if geminiAPIKey != "" {
 			if settings.Enabled &&
 				strings.TrimSpace(update.Message.Text) != "" {
 
-				sourceText := strings.TrimSpace(
-					update.Message.Text,
-				)
+				sourceText :=
+					strings.TrimSpace(
+						update.Message.Text,
+					)
 
-				targetLanguage := strings.TrimSpace(
-					settings.TargetLanguage,
-				)
+				targetLanguage :=
+					strings.TrimSpace(
+						settings.TargetLanguage,
+					)
 
-				chatID := update.Message.Chat.ID
-				messageID := update.Message.MessageID
+				chatID :=
+					update.Message.Chat.ID
+
+				messageID :=
+					update.Message.MessageID
 
 				go func(
 					chatID int64,
@@ -783,21 +1001,24 @@ if geminiAPIKey != "" {
 						target,
 					)
 
-					translatedText, err := translator.Translate(
-						context.Background(),
-						client,
-						text,
-						target,
-						conf.Model.ModelName,
-					)
+					translatedText, err :=
+						translator.Translate(
+							context.Background(),
+							client,
+							text,
+							target,
+							conf.Model.ModelName,
+						)
 
 					if err != nil {
+
 						log.Printf(
 							"Automatic translation FAILED: chat=%d message=%d error=%v",
 							chatID,
 							messageID,
 							err,
 						)
+
 						return
 					}
 
@@ -819,9 +1040,11 @@ if geminiAPIKey != "" {
 					msg.ParseMode = "HTML"
 
 					// Reply directly to the original message.
-					msg.ReplyToMessageID = messageID
+					msg.ReplyToMessageID =
+						messageID
 
 					if _, err := bot.Send(msg); err != nil {
+
 						log.Printf(
 							"Failed to send automatic translation: chat=%d message=%d error=%v",
 							chatID,
@@ -841,52 +1064,4 @@ if geminiAPIKey != "" {
 
 		// ---------------------------------------------------------
 		// NORMAL AI CHAT
-		// ---------------------------------------------------------
-
-		go func(userStats *user.UsageTracker) {
-
-			if userStats.HaveAccess(conf) {
-
-				log.Printf(
-					"AI REQUEST: chat=%d sender_id=%d username=%q text=%q",
-					update.Message.Chat.ID,
-					senderID,
-					senderUsername,
-					update.Message.Text,
-				)
-
-				responseID :=
-	api.HandleChatGPTStreamResponse(
-		bot,
-		client,
-		geminiClient,
-		update.Message,
-		conf,
-		userStats,
-	)
-
-				if conf.Model.Type == "openrouter" {
-					userStats.GetUsageFromApi(
-						responseID,
-						conf,
-					)
-				}
-
-			} else {
-
-				msg := tgbotapi.NewMessage(
-					update.Message.Chat.ID,
-					lang.Translate(
-						"budget_out",
-						conf.Lang,
-					),
-				)
-
-				if _, err := bot.Send(msg); err != nil {
-					log.Println(err)
-				}
-			}
-
-		}(userStats)
-	}
-}
+		// ---------------------------
