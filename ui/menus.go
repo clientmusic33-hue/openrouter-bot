@@ -236,8 +236,11 @@ func ModelList(providerIndex int, providerName string, models []provider.ModelRe
 	for i := offset; i < end; i++ {
 		ref := models[i]
 
+		// "current" is the model this user effectively uses (their pin, or
+		// the configured default), while ref.Current only reflects the
+		// bot-wide default. Marking both means a pin is always visible.
 		label := ref.Model
-		if ref.Current {
+		if ref.Current || (current != "" && strings.EqualFold(ref.Model, current)) {
 			label = "▶ " + label
 		} else if favourite != nil && favourite(ref.Model) {
 			label = "⭐ " + label

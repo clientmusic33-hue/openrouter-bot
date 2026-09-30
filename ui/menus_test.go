@@ -126,3 +126,55 @@ func TestProviderListMarksState(t *testing.T) {
 		t.Errorf("a keyless provider is not marked: %q", joined)
 	}
 }
+
+// TestModelListMarksThePinnedModel keeps the marker on the row a user just
+// pinned, which is what makes the picker feel like it responded.
+func TestModelListMarksThePinnedModel(t *testing.T) {
+	models := []provider.ModelRef{
+		{Provider: "groq", Model: "llama-3.3-70b-versatile"},
+		{Provider: "groq", Model: "openai/gpt-oss-120b"},
+	}
+
+	keyboard := ModelList(0, "groq", models, "openai/gpt-oss-120b", 0, 10, nil)
+
+	if got := buttonLabels(keyboard); !contains(got, "▶ openai/gpt-oss-120b") {
+		t.Errorf("pinned model is not marked: %v", got)
+	}
+	if got := buttonLabels(keyboard); contains(got, "▶ llama-3.3-70b-versatile") {
+		t.Errorf("an unpinned model is marked as current: %v", got)
+	}
+}
+
+// TestModelListMarksTheConfiguredDefault covers the case with no pin at all.
+func TestModelListMarksTheConfiguredDefault(t *testing.T) {
+	models := []provider.ModelRef{
+		{Provider: "groq", Model: "llama-3.3-70b-versatile", Current: true},
+	}
+
+	keyboard := ModelList(0, "groq", models, "", 0, 10, nil)
+
+	if got := buttonLabels(keyboard); !contains(got, "▶ llama-3.3-70b-versatile") {
+		t.Errorf("the configured model is not marked: %v", got)
+	}
+}
+
+func buttonLabels(keyboard tgbotapi.InlineKeyboardMarkup) []string {
+	var labels []string
+	for _, row := range keyboard.InlineKeyboard {
+		for _, button := range row {
+			labels = append(labels, button.Text)
+		}
+	}
+
+	return labels
+}
+
+func contains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+
+	return false
+}

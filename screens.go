@@ -135,13 +135,20 @@ func (a *app) modelsScreen(conf *config.Config, tracker *user.UsageTracker, prov
 		escapeHTML(providerName), len(models), escapeHTML(tracker.SettingsSummary()),
 	)
 
+	// The marker follows the model this user actually uses, not the
+	// bot-wide default, so a pin is visible in the list it was made from.
+	current := tracker.Preference().Model
+	if current == "" {
+		current = a.chain.Model()
+	}
+
 	return screen{
 		Text: text,
 		Keyboard: ui.ModelList(
 			providerIndex,
 			providerName,
 			models,
-			a.chain.Model(),
+			current,
 			page*modelsPageSize,
 			modelsPageSize,
 			tracker.IsFavourite,
