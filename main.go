@@ -374,6 +374,59 @@ func main() {
 				if _, err := bot.Send(msg); err != nil {
 					log.Println("Failed to send /stats:", err)
 				}
+				case "tr":
+	if update.Message.ReplyToMessage == nil {
+		msg := tgbotapi.NewMessage(
+			update.Message.Chat.ID,
+			"❌ Reply to a message and use:\n\n/tr hi\n/tr en\n/tr ru",
+		)
+		bot.Send(msg)
+		continue
+	}
+
+	targetLanguage := strings.TrimSpace(update.Message.CommandArguments())
+
+	if targetLanguage == "" {
+		targetLanguage = "English"
+	}
+
+	sourceText := update.Message.ReplyToMessage.Text
+
+	if strings.TrimSpace(sourceText) == "" {
+		msg := tgbotapi.NewMessage(
+			update.Message.Chat.ID,
+			"❌ The replied message doesn't contain text.",
+		)
+		bot.Send(msg)
+		continue
+	}
+
+	translatedText, err := translator.Translate(
+		context.Background(),
+		client,
+		sourceText,
+		targetLanguage,
+		conf.Model.ModelName,
+	)
+
+	if err != nil {
+		log.Printf("Translation error: %v", err)
+
+		msg := tgbotapi.NewMessage(
+			update.Message.Chat.ID,
+			"❌ Translation failed. Please try again.",
+		)
+		bot.Send(msg)
+		continue
+	}
+
+	msg := tgbotapi.NewMessage(
+		update.Message.Chat.ID,
+		"🌐 <b>Translation</b>\n\n"+translatedText,
+	)
+
+	msg.ParseMode = "HTML"
+	bot.Send(msg)
 
 			// /about
 			case "about":
