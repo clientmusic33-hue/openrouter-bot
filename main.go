@@ -485,8 +485,6 @@ func main() {
 					continue
 				}
 
-				}
-
 				args := strings.TrimSpace(
 					update.Message.CommandArguments(),
 				)
