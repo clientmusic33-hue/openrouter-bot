@@ -268,49 +268,97 @@ func HandleChatGPTStreamResponse(
 
 		Stream: true,
 	}
-
 	// ---------------------------------------------------------
-	// CREATE STREAM
-	// ---------------------------------------------------------
+// CREATE OPENROUTER STREAM
+// ---------------------------------------------------------
 
-	stream, err := client.CreateChatCompletionStream(
-		ctx,
-		req,
+stream, err := client.CreateChatCompletionStream(
+	ctx,
+	req,
+)
+
+// ---------------------------------------------------------
+// GEMINI FALLBACK
+// ---------------------------------------------------------
+
+if err != nil {
+
+	log.Printf(
+		"OpenRouter ChatCompletionStream error: %v",
+		err,
 	)
 
-	if err != nil {
+	// Fallback to Gemini only when OpenRouter returns 429.
+	if strings.Contains(err.Error(), "429") &&
+		geminiClient != nil {
 
 		log.Printf(
-			"ChatCompletionStream error: %v",
-			err,
+			"OpenRouter rate limit detected. Switching to Gemini.",
 		)
 
-		select {
-		case stopAnimation <- true:
-		default:
-		}
+		geminiReq := req
 
-		errorMsg := tgbotapi.NewEditMessageText(
-			message.Chat.ID,
-			lastMessageID,
-			errorMessage,
+		// Gemini model
+		geminiReq.Model = "gemini-2.5-flash"
+
+		stream, err = geminiClient.CreateChatCompletionStream(
+			ctx,
+			geminiReq,
 		)
 
-		if _, editErr := bot.Send(errorMsg); editErr != nil {
+		if err != nil {
 
 			log.Printf(
-				"Failed to send error message: %v",
-				editErr,
+				"Gemini fallback error: %v",
+				err,
+			)
+
+		} else {
+
+			log.Printf(
+				"Gemini fallback stream started successfully.",
 			)
 		}
+	}
+}
 
-		return ""
+// ---------------------------------------------------------
+// BOTH PROVIDERS FAILED
+// ---------------------------------------------------------
+
+if err != nil {
+
+	select {
+	case stopAnimation <- true:
+	default:
 	}
 
-	defer stream.Close()
+	errorMsg := tgbotapi.NewEditMessageText(
+		message.Chat.ID,
+		lastMessageID,
+		errorMessage,
+	)
 
-	user.CurrentStream = stream
+	if _, editErr := bot.Send(errorMsg); editErr != nil {
 
+		log.Printf(
+			"Failed to send error message: %v",
+			editErr,
+		)
+	}
+
+	return ""
+}
+
+defer stream.Close()
+
+user.CurrentStream = stream
+
+// Stop loading animation
+select {
+case stopAnimation <- true:
+default:
+}
 	// Stop loading animation
 	select {
 	case stopAnimation <- true:
