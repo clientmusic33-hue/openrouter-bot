@@ -543,10 +543,13 @@ func addVisionMessage(
 			fileURL,
 		)
 
-		if message.Text == "" {
-			message.Text =
-				config.VisionPrompt
-		}
+		if strings.TrimSpace(message.Text) == "" {
+	message.Text = config.VisionPrompt
+}
+
+if strings.TrimSpace(message.Text) == "" {
+	message.Text = "Describe this image."
+}
 
 		return openai.ChatCompletionMessage{
 
@@ -561,7 +564,7 @@ func addVisionMessage(
 							openai.ChatMessagePartTypeText,
 
 						Text:
-							message.Text,
+						strings.TrimSpace(message.Text),
 					},
 
 					{
