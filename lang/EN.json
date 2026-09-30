@@ -1,8 +1,8 @@
 {
   "language": "english",
   "commands": {
-    "start":  "<b>Hi! I'm an open source GPT bot created to provide quick help on your questions.</b>\n\nPossibilities:\n\n• Conduct dialogue on various topics and answer questions\n• Help with solving problems and analyzing data\n• Write code in any programming language\n• Generate ideas and offer solutions to problems\n\n",
-    "start_end": "\n\nJust send me a message, and I'll try to help!\n\nYou can run the bot yourself and for free by following the instructions at the link: https://github.com/Lifailon/openrouter-bot",
+    "start": "👨‍💻 <b>Created by: @Hazel21_nut</b>\n\n<b>Hi! I'm an open source GPT bot created to provide quick help on your questions.</b>\n\nPossibilities:\n\n• Conduct dialogue on various topics and answer questions\n• Help with solving problems and analyzing data\n• Write code in any programming language\n• Generate ideas and offer solutions to problems\n\n",
+    "start_end": "\n\nJust send me a message, and I'll try to help!",
     "help": "<b>Available Commands:</b>\n\n<code>/help</code> - Show this help message\n<code>/get_models</code> - Get list of free models\n<code>/set_model [model name]</code> - Set another model\n<code>/set_model default</code> - Set model default\n<code>/reset</code> - Clear conversation history\n<code>/reset [new prompt]</code> - Set a new system prompt\n<code>/reset system</code> - Reset system prompt to default\n<code>/stats</code> - Show current usage statistics\n<code>/stop</code> - Stop the active request\n\n<b>Advice:</b> Before asking a new question that is not related to the old topic, reset the message memory so as not to send the old context, in this case, the answers will be more accurate and the request will take less time to process.",
     "getModels": "List of ↗️ [free models](https://openrouter.ai/models?max_price=0):\n\n",
     "setModel": "Model changed to",
