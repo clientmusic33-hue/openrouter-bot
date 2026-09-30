@@ -118,27 +118,25 @@ func main() {
 		},
 		{
 			Command:     "about",
-			Description: "About this bot",
-		},
-		{
-			Command:     "tr",
-			Description: "Translate a replied message",
-		},
-		{
-			Command:     "translate",
-			Description: "Manage group auto translation",
-		},
-	}
+// OpenRouter/OpenAI client.
+clientOptions := openai.DefaultConfig(conf.OpenAIApiKey)
+clientOptions.BaseURL = conf.OpenAIBaseURL
+client := openai.NewClientWithConfig(clientOptions)
 
-	_, err = bot.Request(tgbotapi.NewSetMyCommands(commands...))
-	if err != nil {
-		log.Fatalf("Failed to set bot commands: %v", err)
-	}
+// Gemini fallback client.
+geminiAPIKey := os.Getenv("GEMINI_API_KEY")
 
-	// OpenRouter/OpenAI client.
-	clientOptions := openai.DefaultConfig(conf.OpenAIApiKey)
-	clientOptions.BaseURL = conf.OpenAIBaseURL
-	client := openai.NewClientWithConfig(clientOptions)
+var geminiClient *openai.Client
+
+if geminiAPIKey != "" {
+	geminiOptions := openai.DefaultConfig(geminiAPIKey)
+	geminiOptions.BaseURL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+	geminiClient = openai.NewClientWithConfig(geminiOptions)
+
+	log.Println("Gemini fallback enabled")
+} else {
+	log.Println("GEMINI_API_KEY not set - Gemini fallback disabled")
+}
 
 	// User manager.
 	userManager := user.NewUserManager("logs")
