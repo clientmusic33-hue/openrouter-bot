@@ -24,10 +24,16 @@ token_price: 0.002
 
 # Model configuration
 type: openrouter
-model: openai/gpt-4o-mini
+model: openrouter/free
 base_url: https://openrouter.ai/api/v1
 temperature: 0.7
 top_p: 0.7
+
+# Response configuration
+max_tokens: 1000
+
+# Conversation history
+max_history_size: 10
 
 # Assistant configuration
 assistant_prompt: |
