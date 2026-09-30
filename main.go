@@ -114,6 +114,10 @@ func main() {
 			Description: "About this bot",
 		},
 	}
+	{
+    Command:     "tr",
+    Description: "Translate a replied message",
+},
 
 	_, err = bot.Request(tgbotapi.NewSetMyCommands(commands...))
 	if err != nil {
