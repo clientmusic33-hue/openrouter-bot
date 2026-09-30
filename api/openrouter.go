@@ -1042,7 +1042,7 @@ func addVisionMessage(
 				openai.ChatMessageRoleUser,
 
 			MultiContent:
-				[]openai.ChatCompletionMessagePart{
+				[]openai.ChatMessagePart{
 
 					{
 						Type:
