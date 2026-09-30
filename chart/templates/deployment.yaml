@@ -78,6 +78,7 @@ spec:
             - name: data
               mountPath: {{ .Values.persistence.mountPath }}
 
+
       volumes:
         - name: data
           {{- if .Values.persistence.enabled }}

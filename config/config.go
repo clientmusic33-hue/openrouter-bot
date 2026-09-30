@@ -105,6 +105,10 @@ type Config struct {
 	// GroupAccess is the default access mode for a new group:
 	// "everyone", "admins" or "owner". A group can override it with /group.
 	GroupAccess string
+	// PrivateAccess is who may use the bot in a direct chat: "everyone",
+	// "admins" (the owner) or "owner". PUBLIC_MODE forces it to everyone,
+	// because a public bot has to answer anybody who finds it.
+	PrivateAccess string
 	// PersonaPrompt holds the response style rules appended to every system
 	// prompt.
 	PersonaPrompt string
@@ -189,6 +193,7 @@ func Load() (*Config, error) {
 		RenderMarkdown: viper.GetBool("RENDER_MARKDOWN"),
 		SuggestModels:  viper.GetBool("SUGGEST_MODELS"),
 		GroupAccess:    strings.ToLower(strings.TrimSpace(viper.GetString("GROUP_ACCESS"))),
+		PrivateAccess:  strings.ToLower(strings.TrimSpace(viper.GetString("PRIVATE_ACCESS"))),
 		PersonaPrompt:  viper.GetString("PERSONA_PROMPT"),
 		TelegramAPIURL: strings.TrimSpace(viper.GetString("TELEGRAM_API_URL")),
 	}
@@ -281,6 +286,12 @@ func (c *Config) Validate() error {
 		}
 		c.GroupAccess = AccessEveryone
 	}
+	if !ValidPrivateAccess(c.PrivateAccess) {
+		if c.PrivateAccess != "" {
+			log.Printf("Unknown PRIVATE_ACCESS %q, falling back to %q", c.PrivateAccess, AccessEveryone)
+		}
+		c.PrivateAccess = AccessEveryone
+	}
 	if strings.TrimSpace(c.PersonaPrompt) == "" {
 		c.PersonaPrompt = DefaultPersonaPrompt
 	}
@@ -291,6 +302,12 @@ func (c *Config) Validate() error {
 		c.GuestBudget = -1
 		c.RateLimitPerMinute = 0
 		c.GroupChatMode = GroupModeAll
+		// A public bot answers anybody, in groups and in direct messages.
+		// Restricting direct messages is the one thing PUBLIC_MODE overrules.
+		if c.PrivateAccess != AccessEveryone {
+			log.Printf("PUBLIC_MODE overrides PRIVATE_ACCESS=%s; direct messages are open", c.PrivateAccess)
+		}
+		c.PrivateAccess = AccessEveryone
 
 		log.Printf(
 			"PUBLIC MODE ENABLED: budgets are unlimited, rate limiting is off " +
@@ -374,6 +391,7 @@ func setDefaults() {
 	viper.SetDefault("RENDER_MARKDOWN", false)
 	viper.SetDefault("SUGGEST_MODELS", true)
 	viper.SetDefault("GROUP_ACCESS", AccessEveryone)
+	viper.SetDefault("PRIVATE_ACCESS", AccessEveryone)
 }
 
 // languageName is intentionally dependency free so that the config package

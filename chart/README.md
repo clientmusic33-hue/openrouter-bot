@@ -18,6 +18,14 @@ helm upgrade --install openrouter-bot openrouter-bot/openrouter-bot \
     --set config.LANG=RU
 ```
 
+> **One replica only.** The bot reads updates with long polling, and Telegram
+> delivers each update to a single poller, so a second replica would answer
+> only part of the traffic. `replicaCount` is 1 for that reason.
+
+With `persistence.enabled=true` the claim is mounted at `data/`, and
+`LOGS_DIR` points per-user preferences at the same volume, so pins,
+favourites and spend survive a restart.
+
 Secrets are kept out of the ConfigMap:
 
 - `secrets.TELEGRAM_BOT_TOKEN` and `secrets.API_KEY` are required.

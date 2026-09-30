@@ -127,10 +127,11 @@ func main() {
 		bot:       bot,
 		manager:   manager,
 		chain:     chain,
-		users:     user.NewUserManager("logs"),
+		users:     user.NewUserManager(logsDir()),
 		groups:    groups.NewManager("data/groups.json"),
 		semaphore: make(chan struct{}, conf.MaxConcurrentRequests),
 		pending:   make(map[int64]map[int]pendingAnswer),
+		warned:    make(map[warnKey]time.Time),
 		started:   time.Now(),
 	}
 
@@ -152,7 +153,7 @@ func main() {
 	// ---------------------------------------------------------------------
 
 	app.ready.Store(true)
-	log.Println("Bot is running, waiting for updates")
+	log.Printf("Bot is running, waiting for updates | user data=%s", logsDir())
 
 	app.run(updates)
 
@@ -178,6 +179,18 @@ func main() {
 	}
 
 	log.Println("Goodbye")
+}
+
+// logsDir is where per-user preferences, favourites and spend live. It is
+// configurable so a container can point it at a mounted volume; the default
+// keeps the original layout next to the binary.
+func logsDir() string {
+	dir := strings.TrimSpace(os.Getenv("LOGS_DIR"))
+	if dir == "" {
+		dir = "logs"
+	}
+
+	return dir
 }
 
 // newBotAPI connects to api.telegram.org, or to a self-hosted Bot API server
@@ -219,6 +232,11 @@ type app struct {
 	// produced it, which is what makes regenerate and feedback possible.
 	pendingMu sync.Mutex
 	pending   map[int64]map[int]pendingAnswer
+
+	// warned remembers when a restricted user was last told why the bot
+	// stayed silent, so the explanation does not repeat on every message.
+	warnMu sync.Mutex
+	warned map[warnKey]time.Time
 
 	started time.Time
 
@@ -316,8 +334,12 @@ func (a *app) processUpdate(update tgbotapi.Update) {
 	// -----------------------------------------------------------------
 
 	if !a.mayUse(update.Message.Chat, senderID, conf) {
-		if a.isMentioned(update.Message) || a.isReplyToBot(update.Message) {
-			a.notifyRestricted(update.Message, conf)
+		if isGroupChat(update.Message.Chat) {
+			if a.isMentioned(update.Message) || a.isReplyToBot(update.Message) {
+				a.notifyRestricted(update.Message, conf)
+			}
+		} else {
+			a.warnRestrictedPrivate(update.Message.Chat.ID, senderID, conf)
 		}
 		return
 	}
@@ -525,26 +547,86 @@ func (a *app) accessMode(chatID int64, conf *config.Config) string {
 	return mode
 }
 
-// mayUse answers "is this user allowed to talk to the bot here?".
+// permitted decides an access mode against what the bot knows about a user.
+// It is the single place where the everyone/admins/owner rule lives, so a
+// private chat and a group can never drift apart.
 //
-// Private chats are always open: the bot is public by default, and the owner
-// can restrict a group with /group.
-func (a *app) mayUse(chat *tgbotapi.Chat, userID int64, conf *config.Config) bool {
-	if !isGroupChat(chat) {
-		return true
-	}
-	if conf.IsAdmin(userID) {
-		return true
-	}
-
-	switch a.accessMode(chat.ID, conf) {
-	case config.AccessAdmins:
-		return groups.IsAdminRole(a.memberRole(chat.ID, userID))
+// The chat-admin check is a function so that it only runs when the mode asks
+// for it: a public group must not spend a Telegram lookup on every member.
+func permitted(mode string, isOwner bool, isChatAdmin func() bool) bool {
+	switch mode {
 	case config.AccessOwner:
-		return false
+		return isOwner
+	case config.AccessAdmins:
+		return isOwner || (isChatAdmin != nil && isChatAdmin())
 	default:
 		return true
 	}
+}
+
+// mayUse answers "is this user allowed to talk to the bot here?".
+//
+// A private chat follows PRIVATE_ACCESS (everyone by default, the owner when
+// the bot is meant as a personal assistant; PUBLIC_MODE always opens it). A
+// group follows its own setting, which any chat admin can change with /group.
+func (a *app) mayUse(chat *tgbotapi.Chat, userID int64, conf *config.Config) bool {
+	owner := conf.IsAdmin(userID)
+
+	if !isGroupChat(chat) {
+		return permitted(conf.PrivateAccess, owner, nil)
+	}
+
+	return permitted(a.accessMode(chat.ID, conf), owner, func() bool {
+		return groups.IsAdminRole(a.memberRole(chat.ID, userID))
+	})
+}
+
+// warnKey identifies one kind of restriction notice for one user, so the
+// group notice and the direct-message notice do not silence each other.
+type warnKey struct {
+	UserID int64
+	Kind   string
+}
+
+// warnOnce reports whether a notice should be sent. Repeated mentions in a
+// group, or a stream of messages from a stranger, would otherwise turn the
+// explanation into spam and into Telegram rate limits; one per hour is enough
+// to make the situation clear.
+func (a *app) warnOnce(userID int64, kind string) bool {
+	a.warnMu.Lock()
+	defer a.warnMu.Unlock()
+
+	// The map is created lazily so that a warning never depends on the
+	// caller having initialised it.
+	if a.warned == nil {
+		a.warned = make(map[warnKey]time.Time)
+	}
+
+	key := warnKey{UserID: userID, Kind: kind}
+	now := time.Now()
+
+	if last, ok := a.warned[key]; ok && now.Sub(last) < time.Hour {
+		return false
+	}
+	a.warned[key] = now
+
+	return true
+}
+
+// warnRestrictedPrivate tells a stranger once why the bot stayed silent in a
+// direct chat. One reply per hour is enough to explain the situation without
+// turning the chat into a fight with the messages the bot is refusing.
+func (a *app) warnRestrictedPrivate(chatID, userID int64, conf *config.Config) {
+	if !a.warnOnce(userID, "private") {
+		return
+	}
+
+	hint := "🔒 This bot only answers its owner."
+	if strings.EqualFold(conf.PrivateAccess, config.AccessAdmins) {
+		hint = "🔒 This bot only answers its owner in direct messages."
+	}
+
+	a.send(chatID, hint+"\nAsk the owner for access, or use the bot in a group.", "")
 }
 
 // isChatAdmin reports whether a user administers the chat (or owns the bot).
@@ -559,8 +641,14 @@ func (a *app) isChatAdmin(chat *tgbotapi.Chat, userID int64, conf *config.Config
 	return groups.IsAdminRole(a.memberRole(chat.ID, userID))
 }
 
-// notifyRestricted explains once why the bot stayed silent.
+// notifyRestricted explains why the bot stayed silent. It is throttled per
+// user, so mentioning the bot repeatedly does not turn into a fight with a
+// notice.
 func (a *app) notifyRestricted(message *tgbotapi.Message, conf *config.Config) {
+	if sender := senderID(message); sender == 0 || !a.warnOnce(sender, "group") {
+		return
+	}
+
 	mode := a.accessMode(message.Chat.ID, conf)
 
 	hint := "🛡 In this group only administrators can use the bot."

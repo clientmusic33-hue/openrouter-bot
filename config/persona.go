@@ -31,6 +31,10 @@ func ValidGroupAccess(mode string) bool {
 	}
 }
 
+// ValidPrivateAccess checks PRIVATE_ACCESS. It accepts the same three modes as
+// a group, because in a private chat "admins" simply means the owner.
+func ValidPrivateAccess(mode string) bool { return ValidGroupAccess(mode) }
+
 // DefaultPersonaPrompt is the response style every answer must follow.
 //
 // It is deliberately strict about formatting: Telegram rejects the whole

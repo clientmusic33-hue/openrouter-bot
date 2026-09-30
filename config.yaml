@@ -58,8 +58,17 @@ lang: EN
 stats_min_role: ADMIN
 
 # PUBLIC_MODE removes every usage restriction at once: unlimited budget for
-# all roles, no rate limiting, and answers to every group message.
+# all roles, no rate limiting, answers to every group message and open direct
+# messages.
 public_mode: true
+
+# Who may use the bot in a direct message:
+#   everyone - anybody who finds it (default, right for a public bot)
+#   admins   - only the bot owner; there are no other admins in a private chat
+#   owner    - the same, spelled out for a personal assistant
+# PUBLIC_MODE forces everyone. A stranger who writes to a restricted bot gets
+# one short explanation instead of silence.
+private_access: everyone
 
 # Who may use the bot in a group before anyone runs /group:
 #   everyone - any member (default, right for a free public bot)

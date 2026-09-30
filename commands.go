@@ -60,9 +60,16 @@ func (a *app) handleCommand(message *tgbotapi.Message, conf *config.Config, trac
 	chatID := message.Chat.ID
 	command := message.Command()
 
-	// Group access control also applies to commands, with the admin panels
-	// handled separately below.
-	if isGroupChat(message.Chat) && !a.mayUse(message.Chat, senderID(message), conf) {
+	// Access control applies to commands too, so that a restricted user
+	// cannot open panels they are not allowed to use. The admin panels are
+	// handled separately below, because the people who may use them are
+	// exactly the ones this gate would turn away.
+	if !a.mayUse(message.Chat, senderID(message), conf) {
+		if !isGroupChat(message.Chat) {
+			a.warnRestrictedPrivate(chatID, senderID(message), conf)
+			return
+		}
+
 		switch command {
 		case "group", "admin":
 			// handled below: admins are the only ones who may use them

@@ -209,8 +209,17 @@ Who may talk to the bot is a separate switch, and it lives in the chat:
 - `owner` — only the bot owner.
 
 Any chat admin can change it from the `/group` panel (no command needed after
-that), and the bot notices when it is promoted to admin in a chat. Private
-chats always get a reply — the bot is public unless the owner restricts it.
+that), and the bot notices when it is promoted to admin in a chat.
+
+Direct messages follow their own switch, `PRIVATE_ACCESS`:
+
+- `everyone` (**default**) — anyone who finds the bot gets an answer. This is
+  what a public bot wants, and `PUBLIC_MODE` forces it.
+- `owner` — the bot only answers you. A stranger who writes anyway gets a
+  single short explanation instead of silence, at most once an hour.
+
+So a public group bot and a private assistant are both one setting apart:
+`PRIVATE_ACCESS=owner` with `GROUP_ACCESS=everyone`.
 
 ---
 
@@ -239,6 +248,8 @@ Every value can be set as a real environment variable **or** in `.env`. `config.
 | `MAX_CONCURRENT_REQUESTS` | `8` | Max AI requests in flight at once |
 | `PUBLIC_MODE` | `false` | `true` removes all limits: unlimited budget for every role, no rate limiting, answers every group message |
 | `GROUP_ACCESS` | `everyone` | Who may use the bot in a group: `everyone`, `admins` or `owner`. Groups override it from `/group` |
+| `PRIVATE_ACCESS` | `everyone` | Who may use the bot in a direct message: `everyone`, `admins` or `owner`. `PUBLIC_MODE` forces `everyone` |
+| `LOGS_DIR` | `logs` | Where per-user preferences, favourites and spend are stored. Point it at a mounted volume in a container |
 | `MAX_REPLY_CHARS` | `3500` | Longest answer sent as one message (Telegram's hard limit is 4096) |
 | `RENDER_MARKDOWN` | `false` | Try MarkdownV2 for the final answer. Off keeps answers plain text |
 | `SUGGEST_MODELS` | `true` | Occasionally suggest a model that suits the user's usage |
@@ -349,7 +360,7 @@ internal/     crash-safe file writes
 - **Long answers** are split into several messages of at most `MAX_REPLY_CHARS` (3500 by default), preferring paragraph boundaries. The assistant is also told to stay under that length.
 - **Formatting**: answers are plain text by default, which is why the built-in persona forbids Markdown — Telegram drops the entire message when markup does not parse. Set `RENDER_MARKDOWN=true` to try `MarkdownV2`, then legacy `Markdown`, then plain text.
 - **Failover is visible**: with the model footer on, every answer ends with the provider and model that produced it, and a note when the chain had to switch (🔀 switched after N failed attempt(s)).
-- **Costs** come from the OpenRouter generation endpoint after the stream ends. Statistics can take a moment to finalise, so the lookup retries once.
+- **Costs** are read back from the provider that answered, using its generation endpoint (OpenRouter-style). Other providers report usage in the response instead, so there is nothing to add. The lookup retries once, because the statistics can take a moment to finalise.
 - **`/stop`** (or the 🛑 button) cancels the request and keeps whatever was generated so far.
 - **Buttons expire** after three hours: the state behind 🔁 Regenerate and 👍/👎 is kept in memory only, so a restart simply disables the old buttons.
 

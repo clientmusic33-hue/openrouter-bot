@@ -1,4 +1,8 @@
 # Deployment
+#
+# Keep this at 1: the bot reads updates with long polling, and Telegram hands
+# each update to a single poller. A second replica would answer only part of
+# the traffic, and the two pods would fight over the same state files.
 replicaCount: 1
 
 image:
@@ -45,7 +49,13 @@ config:
   MAX_REPLY_CHARS: "3500"
   RENDER_MARKDOWN: "false"
   SUGGEST_MODELS: "true"
+  # Who may use the bot in a group: everyone, admins or owner.
   GROUP_ACCESS: everyone
+  # Who may use the bot in a direct message. PUBLIC_MODE forces everyone.
+  PRIVATE_ACCESS: everyone
+  # Per-user preferences, favourites and spend. Lives on the persistent volume
+  # so a restart does not wipe them (persistence.enabled must be true).
+  LOGS_DIR: /openrouter-bot/data/logs
   # true = no budgets, no rate limiting, answers every group message
   PUBLIC_MODE: "false"
 
@@ -66,7 +76,9 @@ probes:
   timeoutSeconds: 5
   failureThreshold: 3
 
-# Persist group translation settings and usage logs.
+# Persist user state: per-chat settings in data/ and per-user preferences,
+# favourites and spend in logs/. Both directories have to survive a restart,
+# otherwise every user loses their pinned model and their usage history.
 persistence:
   enabled: false
   size: 1Gi
