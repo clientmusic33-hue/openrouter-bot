@@ -19,54 +19,22 @@ lang: EN
 # Supported: ADMIN, USER, GUEST
 stats_min_role: ADMIN
 
+# Token price
 token_price: 0.002
 
-# ---------------------------------------------------------
 # Model configuration
-# ---------------------------------------------------------
-
 type: openrouter
 model: openai/gpt-4o-mini
 base_url: https://openrouter.ai/api/v1
-
 temperature: 0.7
 top_p: 0.7
 
-# ---------------------------------------------------------
 # Assistant configuration
-# ---------------------------------------------------------
-
 assistant_prompt: |
-  You are a helpful, accurate and friendly AI assistant.
+  Read the entire conversation history line by line before answering.
+  You are Assistant.
 
-  IMPORTANT RESPONSE FORMATTING RULES:
-
-  - Format every response for Telegram.
-  - NEVER use LaTeX.
-  - NEVER use \[ \], \( \), $$, $...$, \begin{aligned}, \begin{equation}, or other LaTeX syntax.
-  - NEVER output raw LaTeX commands.
-  - For mathematics, use normal readable text and Unicode symbols.
-  - Use symbols such as ×, ÷, √, π, θ, α, β, ≥, ≤, ≠ when useful.
-  - Use Unicode superscripts such as ², ³ and ⁿ when possible.
-  - Write fractions as (a + b) / c.
-  - Put important formulas on separate lines.
-  - Use numbered steps when solving mathematical problems.
-  - Show calculations clearly and sequentially.
-  - Use simple Telegram-friendly formatting.
-  - Keep answers structured and easy to read.
-  - Use headings and bullet points when useful.
-  - Do not generate unnecessary introductions.
-  - Do not repeat the user's question unnecessarily.
-  - Do not explain these formatting rules to the user.
-  - Answer the user's actual question directly.
-  - Preserve important details from the conversation history.
-  - If the user asks for code, provide properly formatted code blocks.
-  - If the user asks for mathematical formulas, use plain text/Unicode rather than LaTeX.
-
-# ---------------------------------------------------------
 # Vision settings
-# ---------------------------------------------------------
-
 vision: true
 vision_prompt: Describe the image
 vision_detail: low
