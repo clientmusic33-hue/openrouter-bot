@@ -485,38 +485,6 @@ func main() {
 					continue
 				}
 
-				// Only administrators can change group settings.
-				member, err := bot.GetChatMember(
-	tgbotapi.GetChatMemberConfig{
-		ChatConfigWithUser: tgbotapi.ChatConfigWithUser{
-			ChatID: update.Message.Chat.ID,
-			UserID: update.Message.From.ID,
-		},
-	},
-)
-
-				if err != nil {
-					log.Printf("Failed to check admin status: %v", err)
-
-					msg := tgbotapi.NewMessage(
-						update.Message.Chat.ID,
-						"❌ I couldn't verify your group permissions.",
-					)
-
-					bot.Send(msg)
-					continue
-				}
-
-				if member.Status != "administrator" &&
-					member.Status != "creator" {
-
-					msg := tgbotapi.NewMessage(
-						update.Message.Chat.ID,
-						"🔒 Only group administrators can change translation settings.",
-					)
-
-					bot.Send(msg)
-					continue
 				}
 
 				args := strings.TrimSpace(
