@@ -856,13 +856,14 @@ if geminiAPIKey != "" {
 				)
 
 				responseID :=
-					api.HandleChatGPTStreamResponse(
-						bot,
-						client,
-						update.Message,
-						conf,
-						userStats,
-					)
+	api.HandleChatGPTStreamResponse(
+		bot,
+		client,
+		geminiClient,
+		update.Message,
+		conf,
+		userStats,
+	)
 
 				if conf.Model.Type == "openrouter" {
 					userStats.GetUsageFromApi(
