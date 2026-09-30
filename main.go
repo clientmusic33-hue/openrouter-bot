@@ -105,6 +105,10 @@ func main() {
 			Description: lang.Translate("description.stop", conf.Lang),
 		},
 	}
+	{
+    Command:     "about",
+    Description: "About this bot",
+},
 
 	_, err = bot.Request(tgbotapi.NewSetMyCommands(commands...))
 	if err != nil {
