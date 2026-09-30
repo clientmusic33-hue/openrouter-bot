@@ -37,27 +37,34 @@ func NewUsageTracker(userID, userName, logsDir string, conf *config.Config) *Usa
 	return usageTracker
 }
 
+// HaveAccess determines whether a user can use the bot.
 func (ut *UsageTracker) HaveAccess(conf *config.Config) bool {
+	// Admins always have unlimited access.
 	for _, id := range conf.AdminChatIDs {
 		idStr := fmt.Sprintf("%d", id)
+
 		if ut.UserID == idStr {
-			log.Println("Admin")
+			log.Printf("Admin access: %s", ut.UserID)
 			return true
 		}
 	}
 
+	// Allowed users always have unlimited access.
 	for _, id := range conf.AllowedUserChatIDs {
 		idStr := fmt.Sprintf("%d", id)
-		if ut.UserID == idStr {
-			currentCost := ut.GetCurrentCost(conf.BudgetPeriod)
 
-			if float64(conf.UserBudget) > currentCost {
-				log.Println("ID:", idStr, " UserBudget:", conf.UserBudget, " CurrentCost:", currentCost)
-				return true
-			}
-			return false
+		if ut.UserID == idStr {
+			log.Printf("Allowed user access: %s", ut.UserID)
+			return true
 		}
 	}
+
+	// Public access:
+	// All other Telegram users are allowed to use the bot
+	// without a guest budget limit.
+	log.Printf("Public guest access: %s", ut.UserID)
+	return true
+}
 	currentCost := ut.GetCurrentCost(conf.BudgetPeriod)
 
 	if float64(conf.GuestBudget) > currentCost {
