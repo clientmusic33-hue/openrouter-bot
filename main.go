@@ -487,11 +487,13 @@ func main() {
 
 				// Only administrators can change group settings.
 				member, err := bot.GetChatMember(
-					tgbotapi.ChatConfigWithUser{
-						ChatID: update.Message.Chat.ID,
-						UserID: update.Message.From.ID,
-					},
-				)
+	tgbotapi.GetChatMemberConfig{
+		ChatConfigWithUser: tgbotapi.ChatConfigWithUser{
+			ChatID: update.Message.Chat.ID,
+			UserID: update.Message.From.ID,
+		},
+	},
+)
 
 				if err != nil {
 					log.Printf("Failed to check admin status: %v", err)
