@@ -31,42 +31,76 @@ type APIResponse struct {
 	Data []Model `json:"data"`
 }
 
+// -------------------------------------------------------------
+// GET FREE MODELS
+// -------------------------------------------------------------
+
 func GetFreeModels() (string, error) {
+
 	manager, err := config.NewManager("./config.yaml")
 	if err != nil {
-		return "", fmt.Errorf("error initializing config manager: %v", err)
+		return "", fmt.Errorf(
+			"error initializing config manager: %v",
+			err,
+		)
 	}
 
 	conf := manager.GetConfig()
 
-	resp, err := http.Get(conf.OpenAIBaseURL + "/models")
+	resp, err := http.Get(
+		conf.OpenAIBaseURL + "/models",
+	)
 	if err != nil {
-		return "", fmt.Errorf("error get models: %v", err)
+		return "", fmt.Errorf(
+			"error get models: %v",
+			err,
+		)
 	}
+
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("error read response: %v", err)
+		return "", fmt.Errorf(
+			"error read response: %v",
+			err,
+		)
 	}
 
 	var apiResponse APIResponse
 
-	err = json.Unmarshal(body, &apiResponse)
+	err = json.Unmarshal(
+		body,
+		&apiResponse,
+	)
 	if err != nil {
-		return "", fmt.Errorf("error parse json: %v", err)
+		return "", fmt.Errorf(
+			"error parse json: %v",
+			err,
+		)
 	}
 
 	var result strings.Builder
 
 	for _, model := range apiResponse.Data {
+
 		if model.Pricing.Prompt == "0" {
-			result.WriteString(fmt.Sprintf("➡ `%s`\n", model.ID))
+
+			result.WriteString(
+				fmt.Sprintf(
+					"➡ `%s`\n",
+					model.ID,
+				),
+			)
 		}
 	}
 
 	return result.String(), nil
 }
+
+// -------------------------------------------------------------
+// MAIN CHAT HANDLER
+// -------------------------------------------------------------
 
 func HandleChatGPTStreamResponse(
 	bot *tgbotapi.BotAPI,
@@ -99,46 +133,74 @@ func HandleChatGPTStreamResponse(
 
 	err := lang.LoadTranslations("./lang/")
 	if err != nil {
-		log.Printf("Error loading translations: %v", err)
+
+		log.Printf(
+			"Error loading translations: %v",
+			err,
+		)
+
 		return ""
 	}
 
-	manager, err := configs.NewManager("./config.yaml")
+	manager, err := configs.NewManager(
+		"./config.yaml",
+	)
 	if err != nil {
-		log.Printf("Error initializing config manager: %v", err)
+
+		log.Printf(
+			"Error initializing config manager: %v",
+			err,
+		)
+
 		return ""
 	}
 
 	conf := manager.GetConfig()
 
-	loadMessage := lang.Translate("loadText", conf.Lang)
-	errorMessage := lang.Translate("errorText", conf.Lang)
+	loadMessage :=
+		lang.Translate(
+			"loadText",
+			conf.Lang,
+		)
+
+	errorMessage :=
+		lang.Translate(
+			"errorText",
+			conf.Lang,
+		)
 
 	// ---------------------------------------------------------
 	// SEND INITIAL MESSAGE
 	// ---------------------------------------------------------
 
-	processingMsg := tgbotapi.NewMessage(
-		message.Chat.ID,
-		loadMessage,
-	)
+	processingMsg :=
+		tgbotapi.NewMessage(
+			message.Chat.ID,
+			loadMessage,
+		)
 
-	sentMsg, err := bot.Send(processingMsg)
+	sentMsg, err :=
+		bot.Send(processingMsg)
+
 	if err != nil {
+
 		log.Printf(
 			"Failed to send processing message: %v",
 			err,
 		)
+
 		return ""
 	}
 
-	lastMessageID := sentMsg.MessageID
+	lastMessageID :=
+		sentMsg.MessageID
 
 	// ---------------------------------------------------------
 	// LOADING ANIMATION
 	// ---------------------------------------------------------
 
-	stopAnimation := make(chan bool)
+	stopAnimation :=
+		make(chan bool)
 
 	go func() {
 
@@ -151,9 +213,10 @@ func HandleChatGPTStreamResponse(
 
 		i := 0
 
-		ticker := time.NewTicker(
-			1500 * time.Millisecond,
-		)
+		ticker :=
+			time.NewTicker(
+				1500 * time.Millisecond,
+			)
 
 		defer ticker.Stop()
 
@@ -166,27 +229,39 @@ func HandleChatGPTStreamResponse(
 
 			case <-ticker.C:
 
-				text := fmt.Sprintf(
-					"%s%s",
-					loadMessage,
-					dots[i],
-				)
+				text :=
+					fmt.Sprintf(
+						"%s%s",
+						loadMessage,
+						dots[i],
+					)
 
-				editMsg := tgbotapi.NewEditMessageText(
-					message.Chat.ID,
-					lastMessageID,
-					text,
-				)
+				editMsg :=
+					tgbotapi.NewEditMessageText(
+						message.Chat.ID,
+						lastMessageID,
+						text,
+					)
 
 				if _, err := bot.Send(editMsg); err != nil {
 
-					log.Printf(
-						"Failed to update loading message: %v",
-						err,
-					)
+					// Ignore Telegram "message is not modified"
+					// because it is harmless.
+					if !strings.Contains(
+						err.Error(),
+						"message is not modified",
+					) {
+
+						log.Printf(
+							"Failed to update loading message: %v",
+							err,
+						)
+					}
 				}
 
-				i = (i + 1) % len(dots)
+				i =
+					(i + 1) %
+						len(dots)
 			}
 		}
 	}()
@@ -195,22 +270,31 @@ func HandleChatGPTStreamResponse(
 	// BUILD CONVERSATION
 	// ---------------------------------------------------------
 
-	messages := []openai.ChatCompletionMessage{
-		{
-			Role:    openai.ChatMessageRoleSystem,
-			Content: user.SystemPrompt,
-		},
-	}
+	messages :=
+		[]openai.ChatCompletionMessage{
+			{
+				Role:
+					openai.ChatMessageRoleSystem,
 
-	for _, msg := range user.GetMessages() {
-
-		messages = append(
-			messages,
-			openai.ChatCompletionMessage{
-				Role:    msg.Role,
-				Content: msg.Content,
+				Content:
+					user.SystemPrompt,
 			},
-		)
+		}
+
+	for _, msg :=
+		range user.GetMessages() {
+
+		messages =
+			append(
+				messages,
+				openai.ChatCompletionMessage{
+					Role:
+						msg.Role,
+
+					Content:
+						msg.Content,
+				},
+			)
 	}
 
 	// ---------------------------------------------------------
@@ -219,149 +303,221 @@ func HandleChatGPTStreamResponse(
 
 	if config.Vision == "true" {
 
-		messages = append(
-			messages,
-			addVisionMessage(
-				bot,
-				message,
-				config,
-			),
-		)
+		messages =
+			append(
+				messages,
+				addVisionMessage(
+					bot,
+					message,
+					config,
+				),
+			)
 
 	} else {
 
-		messages = append(
-			messages,
-			openai.ChatCompletionMessage{
-				Role:    openai.ChatMessageRoleUser,
-				Content: message.Text,
-			},
-		)
+		messages =
+			append(
+				messages,
+				openai.ChatCompletionMessage{
+					Role:
+						openai.ChatMessageRoleUser,
+
+					Content:
+						message.Text,
+				},
+			)
 	}
 
 	// ---------------------------------------------------------
 	// OPENROUTER REQUEST
 	// ---------------------------------------------------------
 
-	req := openai.ChatCompletionRequest{
-		Model: config.Model.ModelName,
+	req :=
+		openai.ChatCompletionRequest{
 
-		FrequencyPenalty: float32(
-			config.Model.FrequencyPenalty,
-		),
+			Model:
+				config.Model.ModelName,
 
-		PresencePenalty: float32(
-			config.Model.PresencePenalty,
-		),
+			FrequencyPenalty:
+				float32(
+					config.Model.FrequencyPenalty,
+				),
 
-		Temperature: float32(
-			config.Model.Temperature,
-		),
+			PresencePenalty:
+				float32(
+					config.Model.PresencePenalty,
+				),
 
-		TopP: float32(
-			config.Model.TopP,
-		),
+			Temperature:
+				float32(
+					config.Model.Temperature,
+				),
 
-		MaxTokens: config.MaxTokens,
+			TopP:
+				float32(
+					config.Model.TopP,
+				),
 
-		Messages: messages,
+			MaxTokens:
+				config.MaxTokens,
 
-		Stream: true,
-	}
+			Messages:
+				messages,
+
+			Stream:
+				true,
+		}
+
 	// ---------------------------------------------------------
-// CREATE OPENROUTER STREAM
-// ---------------------------------------------------------
+	// CREATE OPENROUTER STREAM
+	// ---------------------------------------------------------
 
-stream, err := client.CreateChatCompletionStream(
-	ctx,
-	req,
-)
+	stream, err :=
+		client.CreateChatCompletionStream(
+			ctx,
+			req,
+		)
 
-// ---------------------------------------------------------
-// GEMINI FALLBACK
-// ---------------------------------------------------------
+	// ---------------------------------------------------------
+	// GEMINI FALLBACK
+	// ---------------------------------------------------------
 
-if err != nil {
-
-	log.Printf(
-		"OpenRouter ChatCompletionStream error: %v",
-		err,
-	)
-
-	// Fallback to Gemini only when OpenRouter returns 429.
-	if strings.Contains(err.Error(), "429") &&
-		geminiClient != nil {
+	if err != nil {
 
 		log.Printf(
-			"OpenRouter rate limit detected. Switching to Gemini.",
+			"OpenRouter ChatCompletionStream error: %v",
+			err,
 		)
 
-		geminiReq := req
+		// -----------------------------------------------------
+		// DETECT OPENROUTER RATE LIMIT
+		// -----------------------------------------------------
 
-		// Gemini model
-		geminiReq.Model = "gemini-2.5-flash"
-
-		stream, err = geminiClient.CreateChatCompletionStream(
-			ctx,
-			geminiReq,
-		)
-
-		if err != nil {
+		if strings.Contains(
+			err.Error(),
+			"429",
+		) &&
+			geminiClient != nil {
 
 			log.Printf(
-				"Gemini fallback error: %v",
-				err,
+				"OpenRouter rate limit detected. Switching to Gemini.",
 			)
 
-		} else {
+			// -------------------------------------------------
+			// GEMINI TIMEOUT
+			// -------------------------------------------------
+
+			geminiCtx, cancel :=
+				context.WithTimeout(
+					ctx,
+					60*time.Second,
+				)
+
+			defer cancel()
+
+			// -------------------------------------------------
+			// CLEAN GEMINI REQUEST
+			// -------------------------------------------------
+			//
+			// Do NOT send OpenRouter-specific parameters.
+			//
+
+			geminiReq :=
+				openai.ChatCompletionRequest{
+
+					Model:
+						"gemini-2.5-flash",
+
+					Messages:
+						messages,
+
+					Stream:
+						true,
+
+					// Smaller response = faster generation.
+					MaxTokens:
+						1000,
+
+					Temperature:
+						0.7,
+
+					TopP:
+						0.8,
+				}
 
 			log.Printf(
-				"Gemini fallback stream started successfully.",
+				"Starting Gemini fallback...",
 			)
+
+			stream, err =
+				geminiClient.
+					CreateChatCompletionStream(
+						geminiCtx,
+						geminiReq,
+					)
+
+			if err != nil {
+
+				log.Printf(
+					"Gemini fallback error: %v",
+					err,
+				)
+
+			} else {
+
+				log.Printf(
+					"Gemini fallback stream started successfully.",
+				)
+			}
 		}
 	}
-}
 
-// ---------------------------------------------------------
-// BOTH PROVIDERS FAILED
-// ---------------------------------------------------------
+	// ---------------------------------------------------------
+	// BOTH PROVIDERS FAILED
+	// ---------------------------------------------------------
 
-if err != nil {
+	if err != nil {
 
-	select {
-	case stopAnimation <- true:
-	default:
+		select {
+
+		case stopAnimation <- true:
+
+		default:
+		}
+
+		errorMsg :=
+			tgbotapi.NewEditMessageText(
+				message.Chat.ID,
+				lastMessageID,
+				errorMessage,
+			)
+
+		if _, editErr :=
+			bot.Send(errorMsg); editErr != nil {
+
+			log.Printf(
+				"Failed to send error message: %v",
+				editErr,
+			)
+		}
+
+		return ""
 	}
 
-	errorMsg := tgbotapi.NewEditMessageText(
-		message.Chat.ID,
-		lastMessageID,
-		errorMessage,
-	)
+	// ---------------------------------------------------------
+	// STREAM CLEANUP
+	// ---------------------------------------------------------
 
-	if _, editErr := bot.Send(errorMsg); editErr != nil {
+	defer stream.Close()
 
-		log.Printf(
-			"Failed to send error message: %v",
-			editErr,
-		)
-	}
+	user.CurrentStream =
+		stream
 
-	return ""
-}
-
-defer stream.Close()
-
-user.CurrentStream = stream
-
-// Stop loading animation
-select {
-case stopAnimation <- true:
-default:
-}
-	// Stop loading animation
+	// Stop loading animation.
 	select {
+
 	case stopAnimation <- true:
+
 	default:
 	}
 
@@ -373,11 +529,12 @@ default:
 
 	responseID := ""
 
-	// OpenRouter receives chunks immediately.
-	// Telegram is updated every 700ms.
-	lastEdit := time.Now()
+	// Faster Telegram updates.
+	lastEdit :=
+		time.Now()
 
-	const editInterval = 700 * time.Millisecond
+	const editInterval =
+		400 * time.Millisecond
 
 	log.Printf(
 		"User: %s Stream response.",
@@ -390,7 +547,8 @@ default:
 
 	for {
 
-		response, err := stream.Recv()
+		response, err :=
+			stream.Recv()
 
 		// -----------------------------------------------------
 		// RESPONSE ID
@@ -399,51 +557,69 @@ default:
 		if responseID == "" &&
 			response.ID != "" {
 
-			responseID = response.ID
+			responseID =
+				response.ID
 		}
 
 		// -----------------------------------------------------
 		// STREAM FINISHED
 		// -----------------------------------------------------
 
-		if errors.Is(err, io.EOF) {
+		if errors.Is(
+			err,
+			io.EOF,
+		) {
 
 			log.Printf(
 				"Stream finished, response ID: %s",
 				responseID,
 			)
 
-			// Save user message
+			// -------------------------------------------------
+			// SAVE USER MESSAGE
+			// -------------------------------------------------
+
 			user.AddMessage(
 				openai.ChatMessageRoleUser,
 				message.Text,
 			)
 
-			// Save AI response
+			// -------------------------------------------------
+			// SAVE AI RESPONSE
+			// -------------------------------------------------
+
 			user.AddMessage(
 				openai.ChatMessageRoleAssistant,
 				messageText,
 			)
 
-			// Final Telegram update
-			if strings.TrimSpace(messageText) != "" {
+			// -------------------------------------------------
+			// FINAL TELEGRAM UPDATE
+			// -------------------------------------------------
 
-				editMsg := tgbotapi.NewEditMessageText(
-					message.Chat.ID,
-					lastMessageID,
-					messageText,
-				)
+			if strings.TrimSpace(
+				messageText,
+			) != "" {
+
+				editMsg :=
+					tgbotapi.NewEditMessageText(
+						message.Chat.ID,
+						lastMessageID,
+						messageText,
+					)
 
 				editMsg.ParseMode =
 					tgbotapi.ModeMarkdown
 
-				if _, err := bot.Send(editMsg); err != nil {
+				if _, err :=
+					bot.Send(editMsg); err != nil {
 
 					log.Printf(
 						"Failed to edit final message: %v",
 						err,
 					)
 				}
+
 			} else {
 
 				log.Printf(
@@ -451,7 +627,8 @@ default:
 				)
 			}
 
-			user.CurrentStream = nil
+			user.CurrentStream =
+				nil
 
 			return responseID
 		}
@@ -467,9 +644,12 @@ default:
 				err,
 			)
 
-			user.CurrentStream = nil
+			user.CurrentStream =
+				nil
 
-			if strings.TrimSpace(messageText) == "" {
+			if strings.TrimSpace(
+				messageText,
+			) == "" {
 
 				errorMsg :=
 					tgbotapi.NewEditMessageText(
@@ -478,7 +658,8 @@ default:
 						errorMessage,
 					)
 
-				if _, editErr := bot.Send(errorMsg); editErr != nil {
+				if _, editErr :=
+					bot.Send(errorMsg); editErr != nil {
 
 					log.Printf(
 						"Failed to send stream error: %v",
@@ -503,22 +684,30 @@ default:
 		// -----------------------------------------------------
 
 		content :=
-			response.Choices[0].Delta.Content
+			response.Choices[0].
+				Delta.Content
 
 		if content != "" {
-			messageText += content
+
+			messageText +=
+				content
 		}
 
-		// Don't edit empty messages
-		if strings.TrimSpace(messageText) == "" {
+		// Don't edit empty messages.
+		if strings.TrimSpace(
+			messageText,
+		) == "" {
+
 			continue
 		}
 
 		// -----------------------------------------------------
-		// TELEGRAM STREAM THROTTLE
+		// TELEGRAM STREAM UPDATE
 		// -----------------------------------------------------
 
-		if time.Since(lastEdit) >= editInterval {
+		if time.Since(
+			lastEdit,
+		) >= editInterval {
 
 			editMsg :=
 				tgbotapi.NewEditMessageText(
@@ -530,16 +719,26 @@ default:
 			editMsg.ParseMode =
 				tgbotapi.ModeMarkdown
 
-			if _, err := bot.Send(editMsg); err != nil {
+			if _, err :=
+				bot.Send(editMsg); err != nil {
 
-				log.Printf(
-					"Failed to edit streaming message: %v",
-					err,
-				)
+				// Telegram can reject an edit if the
+				// generated text has not changed.
+				if !strings.Contains(
+					err.Error(),
+					"message is not modified",
+				) {
+
+					log.Printf(
+						"Failed to edit streaming message: %v",
+						err,
+					)
+				}
 
 			} else {
 
-				lastEdit = time.Now()
+				lastEdit =
+					time.Now()
 			}
 		}
 	}
@@ -557,18 +756,28 @@ func addVisionMessage(
 
 	if len(message.Photo) > 0 {
 
-		// Use largest photo
+		// -----------------------------------------------------
+		// USE LARGEST PHOTO
+		// -----------------------------------------------------
+
 		photoSize :=
-			message.Photo[len(message.Photo)-1]
+			message.Photo[
+				len(message.Photo)-1,
+			]
 
-		fileID := photoSize.FileID
+		fileID :=
+			photoSize.FileID
 
-		// Download photo
-		file, err := bot.GetFile(
-			tgbotapi.FileConfig{
-				FileID: fileID,
-			},
-		)
+		// -----------------------------------------------------
+		// DOWNLOAD PHOTO INFORMATION
+		// -----------------------------------------------------
+
+		file, err :=
+			bot.GetFile(
+				tgbotapi.FileConfig{
+					FileID: fileID,
+				},
+			)
 
 		if err != nil {
 
@@ -578,12 +787,18 @@ func addVisionMessage(
 			)
 
 			return openai.ChatCompletionMessage{
-				Role:    openai.ChatMessageRoleUser,
-				Content: message.Text,
+				Role:
+					openai.ChatMessageRoleUser,
+
+				Content:
+					message.Text,
 			}
 		}
 
-		// Telegram file URL
+		// -----------------------------------------------------
+		// TELEGRAM FILE URL
+		// -----------------------------------------------------
+
 		fileURL :=
 			file.Link(bot.Token)
 
@@ -592,13 +807,29 @@ func addVisionMessage(
 			fileURL,
 		)
 
-		if strings.TrimSpace(message.Text) == "" {
-	message.Text = config.VisionPrompt
-}
+		// -----------------------------------------------------
+		// VISION PROMPT
+		// -----------------------------------------------------
 
-if strings.TrimSpace(message.Text) == "" {
-	message.Text = "Describe this image."
-}
+		if strings.TrimSpace(
+			message.Text,
+		) == "" {
+
+			message.Text =
+				config.VisionPrompt
+		}
+
+		if strings.TrimSpace(
+			message.Text,
+		) == "" {
+
+			message.Text =
+				"Describe this image."
+		}
+
+		// -----------------------------------------------------
+		// MULTIMODAL MESSAGE
+		// -----------------------------------------------------
 
 		return openai.ChatCompletionMessage{
 
@@ -606,14 +837,16 @@ if strings.TrimSpace(message.Text) == "" {
 				openai.ChatMessageRoleUser,
 
 			MultiContent:
-				[]openai.ChatMessagePart{
+				[]openai.ChatCompletionMessagePart{
 
 					{
 						Type:
 							openai.ChatMessagePartTypeText,
 
 						Text:
-						strings.TrimSpace(message.Text),
+							strings.TrimSpace(
+								message.Text,
+							),
 					},
 
 					{
@@ -636,7 +869,12 @@ if strings.TrimSpace(message.Text) == "" {
 		}
 	}
 
+	// ---------------------------------------------------------
+	// NORMAL TEXT MESSAGE
+	// ---------------------------------------------------------
+
 	return openai.ChatCompletionMessage{
+
 		Role:
 			openai.ChatMessageRoleUser,
 
