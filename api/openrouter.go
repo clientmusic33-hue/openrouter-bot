@@ -756,7 +756,7 @@ func createGeminiStream(
 		openai.ChatCompletionRequest{
 
 			Model:
-				"gemini-2.5-flash",
+				"gemini-3.8-flash",
 
 			Messages:
 				messages,
