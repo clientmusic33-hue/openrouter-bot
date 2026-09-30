@@ -603,21 +603,85 @@ func main() {
 					bot.Send(msg)
 
 				default:
-					if args == "" {
-						msg := tgbotapi.NewMessage(
-							update.Message.Chat.ID,
-							"🌐 <b>Group Translation</b>\n\n"+
-								"/translate on — Enable\n"+
-								"/translate off — Disable\n"+
-								"/translate hi — Hindi\n"+
-								"/translate en — English\n"+
-								"/translate status — Show settings",
-						)
+    if args == "" {
+        msg := tgbotapi.NewMessage(
+            update.Message.Chat.ID,
+            "🌐 <b>Group Translation</b>\n\n"+
+                "/translate on — Enable\n"+
+                "/translate off — Disable\n"+
+                "/translate hi — Set Hindi and enable\n"+
+                "/translate en — Set English and enable\n"+
+                "/translate status — Show settings",
+        )
 
-						msg.ParseMode = "HTML"
-						bot.Send(msg)
-						continue
-					}
+        msg.ParseMode = "HTML"
+
+        if _, err := bot.Send(msg); err != nil {
+            log.Println("Failed to send translation help:", err)
+        }
+
+        continue
+    }
+
+    // Set the target language.
+    err := translationManager.SetLanguage(
+        update.Message.Chat.ID,
+        args,
+    )
+
+    if err != nil {
+        log.Printf(
+            "Failed to set translation language: %v",
+            err,
+        )
+
+        bot.Send(tgbotapi.NewMessage(
+            update.Message.Chat.ID,
+            "❌ Failed to save translation language.",
+        ))
+
+        continue
+    }
+
+    // Automatically enable translation.
+    err = translationManager.SetEnabled(
+        update.Message.Chat.ID,
+        true,
+    )
+
+    if err != nil {
+        log.Printf(
+            "Failed to enable translation: %v",
+            err,
+        )
+
+        bot.Send(tgbotapi.NewMessage(
+            update.Message.Chat.ID,
+            "❌ Language was saved, but translation could not be enabled.",
+        ))
+
+        continue
+    }
+
+    settings := translationManager.Get(
+        update.Message.Chat.ID,
+    )
+
+    msg := tgbotapi.NewMessage(
+        update.Message.Chat.ID,
+        fmt.Sprintf(
+            "🌐 <b>Auto Translation Enabled</b>\n\n"+
+                "Target language: <b>%s</b>\n\n"+
+                "You don't need to specify the language again.",
+            settings.TargetLanguage,
+        ),
+    )
+
+    msg.ParseMode = "HTML"
+
+    if _, err := bot.Send(msg); err != nil {
+        log.Println("Failed to send translation settings:", err)
+    }
 
 					err := translationManager.SetLanguage(
 						update.Message.Chat.ID,
