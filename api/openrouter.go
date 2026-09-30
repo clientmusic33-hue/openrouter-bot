@@ -1,3 +1,5 @@
+// Package api talks to OpenRouter (or any OpenAI-compatible endpoint) and
+// renders streamed completions into Telegram messages.
 package api
 
 import (
@@ -8,787 +10,489 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
+	"sync"
+	"time"
+
 	"openrouter-bot/config"
-	configs "openrouter-bot/config"
 	"openrouter-bot/lang"
 	"openrouter-bot/user"
-	"strings"
-	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/sashabaranov/go-openai"
 )
 
+// editInterval throttles Telegram edits while streaming. Telegram API calls
+// are relatively expensive; 350ms feels responsive without hammering it.
+const editInterval = 350 * time.Millisecond
+
+// maxChunks caps how many Telegram messages a single answer may occupy.
+const maxChunks = 20
+
+// modelsTimeout bounds the /models lookup.
+const modelsTimeout = 20 * time.Second
+
+type Pricing struct {
+	Prompt     string `json:"prompt"`
+	Completion string `json:"completion"`
+}
+
 type Model struct {
-	ID          string `json:"id"`
-	Description string `json:"description"`
-	Pricing     struct {
-		Prompt string `json:"prompt"`
-	}
+	ID          string  `json:"id"`
+	Description string  `json:"description"`
+	Pricing     Pricing `json:"pricing"`
 }
 
 type APIResponse struct {
 	Data []Model `json:"data"`
 }
 
-// -------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // GET FREE MODELS
-// -------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
-func GetFreeModels() (string, error) {
-
-	manager, err := config.NewManager("./config.yaml")
-	if err != nil {
-		return "", fmt.Errorf(
-			"error initializing config manager: %v",
-			err,
-		)
+// GetFreeModels returns a Markdown list of models that are free for both
+// prompt and completion tokens.
+func GetFreeModels(cfg *config.Config) (string, error) {
+	if cfg == nil {
+		return "", errors.New("no configuration provided")
 	}
 
-	conf := manager.GetConfig()
+	base := strings.TrimRight(cfg.OpenAIBaseURL, "/")
 
-	resp, err := http.Get(
-		conf.OpenAIBaseURL + "/models",
-	)
+	req, err := http.NewRequest(http.MethodGet, base+"/models", nil)
 	if err != nil {
-		return "", fmt.Errorf(
-			"error get models: %v",
-			err,
-		)
+		return "", fmt.Errorf("error building models request: %w", err)
+	}
+	// The endpoint is public, but sending the key avoids stricter rate limits.
+	if cfg.OpenAIApiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.OpenAIApiKey)
 	}
 
+	client := &http.Client{Timeout: modelsTimeout}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("error get models: %w", err)
+	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("models API returned status %s", resp.Status)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
-		return "", fmt.Errorf(
-			"error read response: %v",
-			err,
-		)
+		return "", fmt.Errorf("error read response: %w", err)
 	}
 
 	var apiResponse APIResponse
-
-	if err := json.Unmarshal(
-		body,
-		&apiResponse,
-	); err != nil {
-		return "", fmt.Errorf(
-			"error parse json: %v",
-			err,
-		)
+	if err := json.Unmarshal(body, &apiResponse); err != nil {
+		return "", fmt.Errorf("error parse json: %w", err)
 	}
 
 	var result strings.Builder
-
 	for _, model := range apiResponse.Data {
-
-		if model.Pricing.Prompt == "0" {
-
-			result.WriteString(
-				fmt.Sprintf(
-					"➡ `%s`\n",
-					model.ID,
-				),
-			)
+		if isFreeModel(model) {
+			result.WriteString(fmt.Sprintf("➡ `%s`\n", model.ID))
 		}
+	}
+
+	if result.Len() == 0 {
+		return "", errors.New("no free models returned by the API")
 	}
 
 	return result.String(), nil
 }
 
-// -------------------------------------------------------------
-// MAIN CHAT HANDLER
-// -------------------------------------------------------------
+// isFreeModel reports whether both prompt and completion are free. Checking
+// only the prompt price admits models that charge for generated tokens.
+func isFreeModel(model Model) bool {
+	return isZeroPrice(model.Pricing.Prompt) && isZeroPrice(model.Pricing.Completion)
+}
 
+func isZeroPrice(price string) bool {
+	price = strings.TrimSpace(price)
+
+	return price == "" || price == "0" || strings.Trim(price, "0.") == ""
+}
+
+// -----------------------------------------------------------------------------
+// MAIN CHAT HANDLER
+// -----------------------------------------------------------------------------
+
+// HandleChatGPTStreamResponse streams a completion into Telegram, editing the
+// placeholder message as tokens arrive. It returns the OpenRouter generation
+// id, which the caller uses to fetch the real cost.
 func HandleChatGPTStreamResponse(
+	parentCtx context.Context,
 	bot *tgbotapi.BotAPI,
 	client *openai.Client,
 	geminiClient *openai.Client,
 	message *tgbotapi.Message,
-	config *config.Config,
-	user *user.UsageTracker,
-) string {
-
-	// ---------------------------------------------------------
-	// ONE ACTIVE GENERATION PER USER
-	// ---------------------------------------------------------
-
-	user.ChatMu.Lock()
-	defer user.ChatMu.Unlock()
-
-	// ---------------------------------------------------------
-	// REQUEST CONTEXT
-	// ---------------------------------------------------------
-
-	ctx, cancel := context.WithTimeout(
-		context.Background(),
-		120*time.Second,
-	)
-
-	defer cancel()
-
-	user.CheckHistory(
-		config.MaxHistorySize,
-		config.MaxHistoryTime,
-	)
-
-	user.LastMessageTime = time.Now()
-
-	// ---------------------------------------------------------
-	// LOAD TRANSLATIONS
-	// ---------------------------------------------------------
-
-	if err := lang.LoadTranslations("./lang/"); err != nil {
-
-		log.Printf(
-			"Error loading translations: %v",
-			err,
-		)
-
-		return ""
+	cfg *config.Config,
+	tracker *user.UsageTracker,
+) (string, error) {
+	if cfg == nil {
+		return "", errors.New("no configuration provided")
 	}
 
-	manager, err := configs.NewManager(
-		"./config.yaml",
-	)
+	// One active generation per user. The lock is held for the whole request.
+	tracker.ChatMu.Lock()
+	defer tracker.ChatMu.Unlock()
 
-	if err != nil {
+	loadMessage := lang.Translate("loadText", cfg.Lang)
+	errorMessage := lang.Translate("errorText", cfg.Lang)
 
-		log.Printf(
-			"Error initializing config manager: %v",
-			err,
-		)
-
-		return ""
-	}
-
-	conf := manager.GetConfig()
-
-	loadMessage :=
-		lang.Translate(
-			"loadText",
-			conf.Lang,
-		)
-
-	errorMessage :=
-		lang.Translate(
-			"errorText",
-			conf.Lang,
-		)
-
-	// ---------------------------------------------------------
+	// ---------------------------------------------------------------------
 	// SEND INITIAL MESSAGE
-	// ---------------------------------------------------------
+	// ---------------------------------------------------------------------
 
-	processingMsg :=
-		tgbotapi.NewMessage(
-			message.Chat.ID,
-			loadMessage,
-		)
-
-	sentMsg, err :=
-		bot.Send(processingMsg)
-
+	processingMsg := tgbotapi.NewMessage(message.Chat.ID, loadMessage)
+	sentMsg, err := bot.Send(processingMsg)
 	if err != nil {
-
-		log.Printf(
-			"Failed to send processing message: %v",
-			err,
-		)
-
-		return ""
+		return "", fmt.Errorf("failed to send processing message: %w", err)
 	}
+	lastMessageID := sentMsg.MessageID
 
-	lastMessageID :=
-		sentMsg.MessageID
-
-	// ---------------------------------------------------------
+	// ---------------------------------------------------------------------
 	// LOADING ANIMATION
-	// ---------------------------------------------------------
+	// ---------------------------------------------------------------------
 
-	stopAnimation :=
-		make(chan bool, 1)
+	stopAnimation := make(chan bool, 1)
+	var animationDone sync.WaitGroup
+	animationDone.Add(1)
 
 	go func() {
+		defer animationDone.Done()
+		runLoadingAnimation(bot, message.Chat.ID, lastMessageID, loadMessage, stopAnimation)
+	}()
 
-		dots := []string{
-			"",
-			".",
-			"..",
-			"...",
+	// ---------------------------------------------------------------------
+	// BUILD CONVERSATION
+	// ---------------------------------------------------------------------
+
+	tracker.CheckHistory(cfg.MaxHistorySize, cfg.MaxHistoryTime)
+	tracker.Touch()
+
+	currentMessage, userText := buildUserMessage(bot, message, cfg)
+
+	messages := []openai.ChatCompletionMessage{
+		{
+			Role:    openai.ChatMessageRoleSystem,
+			Content: tracker.GetSystemPrompt(),
+		},
+	}
+	for _, historyMessage := range tracker.GetMessages() {
+		if strings.TrimSpace(historyMessage.Content) == "" {
+			continue
+		}
+		messages = append(messages, openai.ChatCompletionMessage{
+			Role:    historyMessage.Role,
+			Content: historyMessage.Content,
+		})
+	}
+	messages = append(messages, currentMessage)
+
+	req := openai.ChatCompletionRequest{
+		Model:            cfg.Model.ModelName,
+		FrequencyPenalty: float32(cfg.Model.FrequencyPenalty),
+		PresencePenalty:  float32(cfg.Model.PresencePenalty),
+		Temperature:      float32(cfg.Model.Temperature),
+		TopP:             float32(cfg.Model.TopP),
+		MaxTokens:        cfg.MaxTokens,
+		Messages:         messages,
+		Stream:           true,
+	}
+
+	// ---------------------------------------------------------------------
+	// REQUEST CONTEXT
+	// ---------------------------------------------------------------------
+	//
+	// Two independent deadlines:
+	//
+	//   * idle  - aborts a stream that stops delivering chunks
+	//   * total - bounds the whole request, including a slow first token
+	//
+	// Deriving from parentCtx means a shutdown cancels in-flight requests.
+
+	ctx, cancel := context.WithTimeout(parentCtx, cfg.RequestTimeout)
+	defer cancel()
+
+	idleTimer := time.AfterFunc(cfg.StreamIdleTimeout, cancel)
+	defer idleTimer.Stop()
+
+	stream, err := client.CreateChatCompletionStream(ctx, req)
+	usingGemini := false
+
+	if err != nil {
+		log.Printf("OpenRouter stream creation error: %v", err)
+
+		if geminiClient != nil && shouldFallback(err) {
+			log.Printf("⚡ OpenRouter unavailable. Switching to Gemini.")
+
+			stream, err = createGeminiStream(ctx, geminiClient, messages)
+			if err == nil {
+				usingGemini = true
+				log.Printf("⚡ Gemini fallback stream started.")
+			} else {
+				log.Printf("Gemini fallback failed: %v", err)
+			}
+		}
+	}
+
+	// ---------------------------------------------------------------------
+	// BOTH FAILED
+	// ---------------------------------------------------------------------
+
+	if err != nil {
+		stopLoading(stopAnimation)
+		animationDone.Wait()
+
+		log.Printf("All AI providers failed: %v", err)
+
+		editMsg := tgbotapi.NewEditMessageText(message.Chat.ID, lastMessageID, errorMessage)
+		if _, editErr := bot.Send(editMsg); editErr != nil {
+			log.Printf("Failed to send error message: %v", editErr)
 		}
 
-		i := 0
+		return "", err
+	}
 
-		ticker :=
-			time.NewTicker(
-				1200 * time.Millisecond,
-			)
-
-		defer ticker.Stop()
-
-		for {
-
-			select {
-
-			case <-stopAnimation:
-				return
-
-			case <-ticker.C:
-
-				text :=
-					loadMessage + dots[i]
-
-				editMsg :=
-					tgbotapi.NewEditMessageText(
-						message.Chat.ID,
-						lastMessageID,
-						text,
-					)
-
-				if _, err :=
-					bot.Send(editMsg); err != nil {
-
-					if !strings.Contains(
-						err.Error(),
-						"message is not modified",
-					) {
-
-						log.Printf(
-							"Loading edit error: %v",
-							err,
-						)
-					}
-				}
-
-				i =
-					(i + 1) %
-						len(dots)
-			}
+	// Close whichever stream is current when we return: the Gemini fallback
+	// replaces the original, so a plain `defer stream.Close()` would close the
+	// already-closed OpenRouter stream and leak the Gemini one.
+	currentStream := stream
+	defer func() {
+		if currentStream != nil {
+			_ = currentStream.Close()
 		}
 	}()
 
-	// ---------------------------------------------------------
-	// BUILD CONVERSATION
-	// ---------------------------------------------------------
-
-	messages :=
-		[]openai.ChatCompletionMessage{
-			{
-				Role:
-					openai.ChatMessageRoleSystem,
-
-				Content:
-					user.SystemPrompt,
-			},
-		}
-
-	for _, msg :=
-		range user.GetMessages() {
-
-		messages =
-			append(
-				messages,
-				openai.ChatCompletionMessage{
-					Role:
-						msg.Role,
-
-					Content:
-						msg.Content,
-				},
-			)
-	}
-
-	// ---------------------------------------------------------
-	// CURRENT USER MESSAGE
-	// ---------------------------------------------------------
-
-	if config.Vision == "true" {
-
-		messages =
-			append(
-				messages,
-				addVisionMessage(
-					bot,
-					message,
-					config,
-				),
-			)
-
-	} else {
-
-		messages =
-			append(
-				messages,
-				openai.ChatCompletionMessage{
-					Role:
-						openai.ChatMessageRoleUser,
-
-					Content:
-						message.Text,
-				},
-			)
-	}
-
-	// ---------------------------------------------------------
-	// OPENROUTER REQUEST
-	// ---------------------------------------------------------
-
-	req :=
-		openai.ChatCompletionRequest{
-
-			Model:
-				config.Model.ModelName,
-
-			FrequencyPenalty:
-				float32(
-					config.Model.FrequencyPenalty,
-				),
-
-			PresencePenalty:
-				float32(
-					config.Model.PresencePenalty,
-				),
-
-			Temperature:
-				float32(
-					config.Model.Temperature,
-				),
-
-			TopP:
-				float32(
-					config.Model.TopP,
-				),
-
-			MaxTokens:
-				config.MaxTokens,
-
-			Messages:
-				messages,
-
-			Stream:
-				true,
-		}
-
-	// ---------------------------------------------------------
-	// TRY OPENROUTER
-	// ---------------------------------------------------------
-
-	stream, err :=
-		client.CreateChatCompletionStream(
-			ctx,
-			req,
-		)
-
-	usingGemini := false
-
-	// ---------------------------------------------------------
-	// OPENROUTER INITIAL FAILURE
-	// ---------------------------------------------------------
-
-	if err != nil {
-
-		log.Printf(
-			"OpenRouter stream creation error: %v",
-			err,
-		)
-
-		if geminiClient != nil &&
-			isProviderRateLimit(err) {
-
-			log.Printf(
-				"⚡ OpenRouter unavailable. Switching to Gemini.",
-			)
-
-			stream, err =
-				createGeminiStream(
-					ctx,
-					geminiClient,
-					messages,
-				)
-
-			if err == nil {
-
-				usingGemini = true
-
-				log.Printf(
-					"⚡ Gemini fallback stream started.",
-				)
-			}
-		}
-	}
-
-	// ---------------------------------------------------------
-	// BOTH FAILED
-	// ---------------------------------------------------------
-
-	if err != nil {
-
-		stopLoading(stopAnimation)
-
-		log.Printf(
-			"All AI providers failed: %v",
-			err,
-		)
-
-		editMsg :=
-			tgbotapi.NewEditMessageText(
-				message.Chat.ID,
-				lastMessageID,
-				errorMessage,
-			)
-
-		if _, editErr :=
-			bot.Send(editMsg); editErr != nil {
-
-			log.Printf(
-				"Failed to send error message: %v",
-				editErr,
-			)
-		}
-
-		return ""
-	}
-
-	defer stream.Close()
-
-	user.CurrentStream =
-		stream
+	tracker.SetStream(currentStream, cancel)
+	defer tracker.ClearStream()
 
 	stopLoading(stopAnimation)
+	// Wait for the animation goroutine to finish so that a late
+	// "Processing request..." edit cannot overwrite the first tokens.
+	animationDone.Wait()
 
-	// ---------------------------------------------------------
-	// STREAM VARIABLES
-	// ---------------------------------------------------------
+	log.Printf("⚡ Stream started | provider=%s | user=%s", providerName(usingGemini), tracker.UserName)
+
+	sink := newMessageSink(bot, message.Chat.ID, lastMessageID)
+
+	// ---------------------------------------------------------------------
+	// STREAM LOOP
+	// ---------------------------------------------------------------------
 
 	var messageText string
-
 	responseID := ""
-
-	lastEdit :=
-		time.Now()
-
-	// Telegram API calls are relatively expensive.
-	// 350ms gives a fast perceived response without
-	// hammering Telegram.
-	const editInterval =
-		350 * time.Millisecond
-
-	log.Printf(
-		"⚡ Stream started | provider=%s | user=%s",
-		providerName(usingGemini),
-		user.UserName,
-	)
-
-	// ---------------------------------------------------------
-	// STREAM LOOP
-	// ---------------------------------------------------------
+	lastEdit := time.Now()
+	firstEdit := true
 
 	for {
+		response, recvErr := currentStream.Recv()
 
-		response, recvErr :=
-			stream.Recv()
+		// Rearm the idle watchdog: any activity proves the stream is alive.
+		idleTimer.Reset(cfg.StreamIdleTimeout)
 
-		// -----------------------------------------------------
-		// RESPONSE ID
-		// -----------------------------------------------------
-
-		if responseID == "" &&
-			response.ID != "" {
-
-			responseID =
-				response.ID
+		if responseID == "" && response.ID != "" {
+			responseID = response.ID
 		}
 
-		// -----------------------------------------------------
+		// ---------------------------------------------------------------
 		// NORMAL STREAM END
-		// -----------------------------------------------------
+		// ---------------------------------------------------------------
 
-		if errors.Is(
-			recvErr,
-			io.EOF,
-		) {
-
+		if errors.Is(recvErr, io.EOF) {
 			log.Printf(
 				"Stream finished | provider=%s | response=%s",
-				providerName(usingGemini),
-				responseID,
+				providerName(usingGemini), responseID,
 			)
 
-			user.CurrentStream =
-				nil
+			tracker.AddMessage(openai.ChatMessageRoleUser, userText)
+			tracker.AddMessage(openai.ChatMessageRoleAssistant, messageText)
+			sink.Finish(messageText)
 
-			// Save conversation.
-			user.AddMessage(
-				openai.ChatMessageRoleUser,
-				message.Text,
-			)
-
-			user.AddMessage(
-				openai.ChatMessageRoleAssistant,
-				messageText,
-			)
-
-			// Final response.
-			if strings.TrimSpace(
-				messageText,
-			) != "" {
-
-				editFinalMessage(
-					bot,
-					message.Chat.ID,
-					lastMessageID,
-					messageText,
-				)
-			}
-
-			return responseID
+			return responseID, nil
 		}
 
-		// -----------------------------------------------------
+		// ---------------------------------------------------------------
 		// STREAM ERROR
-		// -----------------------------------------------------
+		// ---------------------------------------------------------------
 
 		if recvErr != nil {
+			// Stopped with /stop: keep what was generated so far.
+			if errors.Is(recvErr, context.Canceled) {
+				log.Printf("Stream cancelled by user | user=%s", tracker.UserName)
+
+				tracker.AddMessage(openai.ChatMessageRoleUser, userText)
+				if strings.TrimSpace(messageText) != "" {
+					tracker.AddMessage(openai.ChatMessageRoleAssistant, messageText)
+					sink.Finish(messageText)
+				}
+
+				return responseID, nil
+			}
 
 			log.Printf(
 				"Stream error | provider=%s | error=%v",
-				providerName(usingGemini),
-				recvErr,
+				providerName(usingGemini), recvErr,
 			)
 
-			// -------------------------------------------------
+			// ---------------------------------------------------------
 			// FALLBACK TO GEMINI
-			// -------------------------------------------------
+			// ---------------------------------------------------------
 
-			if !usingGemini &&
-				geminiClient != nil {
+			if !usingGemini && geminiClient != nil && shouldFallback(recvErr) {
+				log.Printf("⚡ OpenRouter stream failed. Retrying with Gemini.")
 
-				log.Printf(
-					"⚡ OpenRouter stream failed. Retrying with Gemini.",
-				)
+				_ = currentStream.Close()
 
-				// Close broken OpenRouter stream.
-				stream.Close()
-
-				geminiStream, geminiErr :=
-					createGeminiStream(
-						ctx,
-						geminiClient,
-						messages,
-					)
-
+				geminiStream, geminiErr := createGeminiStream(ctx, geminiClient, messages)
 				if geminiErr == nil {
+					currentStream = geminiStream
+					usingGemini = true
+					tracker.SetStream(currentStream, cancel)
 
-					stream =
-						geminiStream
+					log.Printf("⚡ Gemini retry stream started.")
 
-					usingGemini =
-						true
-
-					user.CurrentStream =
-						stream
-
-					log.Printf(
-						"⚡ Gemini retry stream started.",
-					)
-
-					// Continue streaming.
 					continue
 				}
 
-				log.Printf(
-					"Gemini retry failed: %v",
-					geminiErr,
-				)
+				log.Printf("Gemini retry failed: %v", geminiErr)
 			}
 
-			user.CurrentStream =
-				nil
+			// ---------------------------------------------------------
+			// KEEP PARTIAL OUTPUT
+			// ---------------------------------------------------------
 
-			// If we already received content,
-			// keep that content instead of replacing
-			// it with an error.
-			if strings.TrimSpace(
-				messageText,
-			) != "" {
+			if strings.TrimSpace(messageText) != "" {
+				tracker.AddMessage(openai.ChatMessageRoleUser, userText)
+				tracker.AddMessage(openai.ChatMessageRoleAssistant, messageText)
+				sink.Finish(messageText)
 
-				editFinalMessage(
-					bot,
-					message.Chat.ID,
-					lastMessageID,
-					messageText,
-				)
-
-				user.AddMessage(
-					openai.ChatMessageRoleUser,
-					message.Text,
-				)
-
-				user.AddMessage(
-					openai.ChatMessageRoleAssistant,
-					messageText,
-				)
-
-				return responseID
+				return responseID, nil
 			}
 
-			editMsg :=
-				tgbotapi.NewEditMessageText(
-					message.Chat.ID,
-					lastMessageID,
-					errorMessage,
-				)
-
-			if _, editErr :=
-				bot.Send(editMsg); editErr != nil {
-
-				log.Printf(
-					"Failed to send stream error: %v",
-					editErr,
-				)
+			editMsg := tgbotapi.NewEditMessageText(message.Chat.ID, lastMessageID, errorMessage)
+			if _, editErr := bot.Send(editMsg); editErr != nil {
+				log.Printf("Failed to send stream error: %v", editErr)
 			}
 
-			return responseID
+			return responseID, recvErr
 		}
 
-		// -----------------------------------------------------
-		// EMPTY CHOICES
-		// -----------------------------------------------------
+		// ---------------------------------------------------------------
+		// COLLECT TOKEN
+		// ---------------------------------------------------------------
 
 		if len(response.Choices) == 0 {
 			continue
 		}
 
-		// -----------------------------------------------------
-		// GET TOKEN
-		// -----------------------------------------------------
-
-		content :=
-			response.Choices[0].
-				Delta.Content
-
+		content := response.Choices[0].Delta.Content
 		if content == "" {
 			continue
 		}
 
-		messageText +=
-			content
+		messageText += content
 
-		// -----------------------------------------------------
-		// FIRST TOKEN
-		// -----------------------------------------------------
-
-		// Send the first visible token immediately.
-		//
-		// This is important for perceived ChatGPT-like
-		// responsiveness.
-
-		if strings.TrimSpace(
-			messageText,
-		) != "" {
-
-			if lastEdit.IsZero() ||
-				len(messageText) <= len(content) {
-
-				editStreamingMessage(
-					bot,
-					message.Chat.ID,
-					lastMessageID,
-					messageText,
-				)
-
-				lastEdit =
-					time.Now()
-
-				continue
-			}
+		if strings.TrimSpace(messageText) == "" {
+			continue
 		}
 
-		// -----------------------------------------------------
-		// NORMAL STREAMING UPDATE
-		// -----------------------------------------------------
-
-		if time.Since(
-			lastEdit,
-		) >= editInterval {
-
-			if editStreamingMessage(
-				bot,
-				message.Chat.ID,
-				lastMessageID,
-				messageText,
-			) {
-
-				lastEdit =
-					time.Now()
+		// Send the first visible token immediately for a responsive feel.
+		if firstEdit || time.Since(lastEdit) >= editInterval {
+			if sink.Update(messageText) {
+				lastEdit = time.Now()
+				firstEdit = false
 			}
 		}
 	}
 }
 
-// -------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// USER MESSAGE
+// -----------------------------------------------------------------------------
+
+// buildUserMessage returns the message to send to the model plus the plain
+// text to store in the conversation history.
+func buildUserMessage(
+	bot *tgbotapi.BotAPI,
+	message *tgbotapi.Message,
+	cfg *config.Config,
+) (openai.ChatCompletionMessage, string) {
+	if cfg.Vision {
+		return addVisionMessage(bot, message, cfg)
+	}
+
+	text := strings.TrimSpace(message.Text)
+
+	return openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleUser,
+		Content: text,
+	}, text
+}
+
+// -----------------------------------------------------------------------------
 // GEMINI STREAM
-// -------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
 func createGeminiStream(
 	parentCtx context.Context,
 	client *openai.Client,
 	messages []openai.ChatCompletionMessage,
 ) (*openai.ChatCompletionStream, error) {
+	req := openai.ChatCompletionRequest{
+		Model:       "gemini-2.5-flash",
+		Messages:    messages,
+		Stream:      true,
+		MaxTokens:   1000,
+		Temperature: 0.7,
+		TopP:        0.8,
+	}
 
-	// Shorter timeout specifically for Gemini fallback.
-	ctx, cancel :=
-		context.WithTimeout(
-			parentCtx,
-			60*time.Second,
-		)
-
-	// The stream owns the HTTP request, so we cannot
-	// immediately cancel this context.
-	//
-	// The timeout will automatically terminate the
-	// request after 60 seconds.
-	_ = cancel
-
-	req :=
-		openai.ChatCompletionRequest{
-
-			Model:
-				"gemini-2.5-flash",
-
-			Messages:
-				messages,
-
-			Stream:
-				true,
-
-			// Keep fallback responses reasonably short.
-			MaxTokens:
-				1000,
-
-			Temperature:
-				0.7,
-
-			TopP:
-				0.8,
-		}
-
-	return client.CreateChatCompletionStream(
-		ctx,
-		req,
-	)
+	return client.CreateChatCompletionStream(parentCtx, req)
 }
 
-// -------------------------------------------------------------
-// PROVIDER NAME
-// -------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// FALLBACK POLICY
+// -----------------------------------------------------------------------------
 
-func providerName(
-	gemini bool,
-) string {
+// shouldFallback reports whether an error is worth retrying on the backup
+// provider. A 400 caused by a bad request is not; a rate limit or a server
+// side failure is.
+func shouldFallback(err error) bool {
+	if err == nil {
+		return false
+	}
 
+	if isProviderRateLimit(err) {
+		return true
+	}
+
+	text := strings.ToLower(err.Error())
+
+	for _, marker := range []string{
+		"500", "502", "503", "504",
+		"internal server error",
+		"bad gateway",
+		"service unavailable",
+		"gateway timeout",
+		"context deadline exceeded",
+		"connection reset",
+		"eof",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func providerName(gemini bool) string {
 	if gemini {
 		return "Gemini"
 	}
@@ -796,294 +500,291 @@ func providerName(
 	return "OpenRouter"
 }
 
-// -------------------------------------------------------------
-// RATE LIMIT DETECTION
-// -------------------------------------------------------------
-
-func isProviderRateLimit(
-	err error,
-) bool {
-
+func isProviderRateLimit(err error) bool {
 	if err == nil {
 		return false
 	}
 
-	errText :=
-		strings.ToLower(
-			err.Error(),
-		)
+	errText := strings.ToLower(err.Error())
 
-	return strings.Contains(
-		errText,
-		"429",
-	) ||
-		strings.Contains(
-			errText,
-			"too many requests",
-		) ||
-		strings.Contains(
-			errText,
-			"rate limit",
-		) ||
-		strings.Contains(
-			errText,
-			"rate_limit",
-		)
+	return strings.Contains(errText, "429") ||
+		strings.Contains(errText, "too many requests") ||
+		strings.Contains(errText, "rate limit") ||
+		strings.Contains(errText, "rate_limit")
 }
 
-// -------------------------------------------------------------
-// STOP LOADING ANIMATION
-// -------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// LOADING ANIMATION
+// -----------------------------------------------------------------------------
 
-func stopLoading(
-	stopAnimation chan bool,
+func runLoadingAnimation(
+	bot *tgbotapi.BotAPI,
+	chatID int64,
+	messageID int,
+	loadMessage string,
+	stop chan bool,
 ) {
+	dots := []string{"", ".", "..", "..."}
 
+	ticker := time.NewTicker(1200 * time.Millisecond)
+	defer ticker.Stop()
+
+	for i := 0; ; i = (i + 1) % len(dots) {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			editMsg := tgbotapi.NewEditMessageText(chatID, messageID, loadMessage+dots[i])
+			if _, err := bot.Send(editMsg); err != nil {
+				if !strings.Contains(err.Error(), "message is not modified") {
+					log.Printf("Loading edit error: %v", err)
+				}
+			}
+		}
+	}
+}
+
+func stopLoading(stopAnimation chan bool) {
 	select {
-
 	case stopAnimation <- true:
-
 	default:
 	}
 }
 
-// -------------------------------------------------------------
-// FAST STREAMING EDIT
-// -------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// CHUNKED MESSAGE RENDERING
+// -----------------------------------------------------------------------------
 
-func editStreamingMessage(
+// messageSink renders a growing answer across as many Telegram messages as it
+// needs. Telegram caps a single message at 4096 characters, and that limit is
+// enforced on edits too, so a long answer has to spill into new messages.
+type messageSink struct {
+	bot        *tgbotapi.BotAPI
+	chatID     int64
+	messageIDs []int
+	rendered   []string
+	limit      int
+	maxChunks  int
+}
+
+func newMessageSink(bot *tgbotapi.BotAPI, chatID int64, firstMessageID int) *messageSink {
+	return &messageSink{
+		bot:        bot,
+		chatID:     chatID,
+		messageIDs: []int{firstMessageID},
+		rendered:   []string{""},
+		limit:      config.ChunkLimit,
+		maxChunks:  maxChunks,
+	}
+}
+
+// Update renders text, sending extra messages when it outgrows the current
+// ones. It reports whether anything changed.
+func (s *messageSink) Update(text string) bool {
+	chunks := SplitMessage(text, s.limit, s.maxChunks)
+	if len(chunks) == 0 {
+		return false
+	}
+
+	changed := false
+
+	for i, chunk := range chunks {
+		if i >= len(s.messageIDs) {
+			msg := tgbotapi.NewMessage(s.chatID, chunk)
+			sent, err := s.bot.Send(msg)
+			if err != nil {
+				log.Printf("Failed to send continuation message: %v", err)
+				return changed
+			}
+			s.messageIDs = append(s.messageIDs, sent.MessageID)
+			s.rendered = append(s.rendered, chunk)
+			changed = true
+
+			continue
+		}
+
+		if chunk == s.rendered[i] {
+			continue
+		}
+
+		if editMessage(s.bot, s.chatID, s.messageIDs[i], chunk, "") {
+			s.rendered[i] = chunk
+			changed = true
+		}
+	}
+
+	return changed
+}
+
+// Finish writes the final text and upgrades formatting, trying MarkdownV2 and
+// then legacy Markdown before settling for plain text.
+func (s *messageSink) Finish(text string) {
+	s.Update(text)
+
+	chunks := SplitMessage(text, s.limit, s.maxChunks)
+
+	for i, chunk := range chunks {
+		if i >= len(s.messageIDs) {
+			return
+		}
+
+		// Markdown is only applied at the end: a half-written "**bold" would
+		// be rejected by Telegram while streaming.
+		if editMessage(s.bot, s.chatID, s.messageIDs[i], chunk, tgbotapi.ModeMarkdownV2) {
+			continue
+		}
+		if editMessage(s.bot, s.chatID, s.messageIDs[i], chunk, tgbotapi.ModeMarkdown) {
+			continue
+		}
+
+		// Leave the plain text version that Update already wrote.
+		log.Printf("Markdown rendering failed for chunk %d, keeping plain text", i)
+	}
+}
+
+func editMessage(
 	bot *tgbotapi.BotAPI,
 	chatID int64,
 	messageID int,
 	text string,
+	parseMode string,
 ) bool {
-
 	if strings.TrimSpace(text) == "" {
 		return false
 	}
 
-	// IMPORTANT:
-	//
-	// Do NOT use Markdown while streaming.
-	//
-	// AI responses often contain incomplete Markdown
-	// such as:
-	//
-	// **hello
-	//
-	// which can cause Telegram parse errors.
-	//
-	// Plain text makes streaming much more reliable.
+	editMsg := tgbotapi.NewEditMessageText(chatID, messageID, text)
+	if parseMode != "" {
+		editMsg.ParseMode = parseMode
+	}
 
-	editMsg :=
-		tgbotapi.NewEditMessageText(
-			chatID,
-			messageID,
-			text,
-		)
-
-	if _, err :=
-		bot.Send(editMsg); err != nil {
-
-		if strings.Contains(
-			err.Error(),
-			"message is not modified",
-		) {
-			return false
+	if _, err := bot.Send(editMsg); err != nil {
+		if !strings.Contains(err.Error(), "message is not modified") {
+			log.Printf("Telegram edit error (parse_mode=%q): %v", parseMode, err)
 		}
-
-		log.Printf(
-			"Streaming Telegram edit error: %v",
-			err,
-		)
-
 		return false
 	}
 
 	return true
 }
 
-// -------------------------------------------------------------
-// FINAL MESSAGE
-// -------------------------------------------------------------
-
-func editFinalMessage(
-	bot *tgbotapi.BotAPI,
-	chatID int64,
-	messageID int,
-	text string,
-) {
-
-	if strings.TrimSpace(text) == "" {
-		return
+// SplitMessage breaks text into chunks of at most limit runes, preferring
+// newline boundaries so that paragraphs and code blocks stay intact.
+func SplitMessage(text string, limit int, maxChunks int) []string {
+	if limit <= 0 {
+		limit = config.ChunkLimit
+	}
+	if maxChunks <= 0 {
+		maxChunks = maxChunksDefault
 	}
 
-	editMsg :=
-		tgbotapi.NewEditMessageText(
-			chatID,
-			messageID,
-			text,
-		)
+	text = strings.TrimRight(text, " \t\n")
+	if text == "" {
+		return nil
+	}
 
-	// Use Markdown only for the final message.
-	editMsg.ParseMode =
-		tgbotapi.ModeMarkdown
+	runes := []rune(text)
+	if len(runes) <= limit {
+		return []string{text}
+	}
 
-	if _, err :=
-		bot.Send(editMsg); err != nil {
+	var chunks []string
 
-		// If Markdown parsing fails, send plain text.
-		log.Printf(
-			"Markdown final edit failed: %v",
-			err,
-		)
-
-		plainMsg :=
-			tgbotapi.NewEditMessageText(
-				chatID,
-				messageID,
-				text,
-			)
-
-		if _, plainErr :=
-			bot.Send(plainMsg); plainErr != nil {
-
-			log.Printf(
-				"Plain final edit failed: %v",
-				plainErr,
-			)
+	for start := 0; start < len(runes); {
+		if len(chunks) == maxChunks-1 {
+			// Last allowed chunk: keep the tail and mark the truncation.
+			tail := strings.TrimRight(string(runes[start:]), " \t\n")
+			chunks = append(chunks, tail+"\n\n… (truncated)")
+			break
 		}
+
+		end := start + limit
+		if end >= len(runes) {
+			chunks = append(chunks, strings.TrimRight(string(runes[start:]), " \t\n"))
+			break
+		}
+
+		cut := -1
+		for i := end; i > start+limit/2; i-- {
+			if runes[i-1] == '\n' {
+				cut = i
+				break
+			}
+		}
+		if cut <= 0 {
+			cut = end
+		}
+
+		chunk := strings.TrimRight(string(runes[start:cut]), " \t\n")
+		if chunk != "" {
+			chunks = append(chunks, chunk)
+		}
+		start = cut
 	}
+
+	if len(chunks) == 0 {
+		return nil
+	}
+
+	return chunks
 }
 
-// -------------------------------------------------------------
+const maxChunksDefault = 20
+
+// -----------------------------------------------------------------------------
 // VISION MESSAGE
-// -------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
 func addVisionMessage(
 	bot *tgbotapi.BotAPI,
 	message *tgbotapi.Message,
-	config *config.Config,
-) openai.ChatCompletionMessage {
+	cfg *config.Config,
+) (openai.ChatCompletionMessage, string) {
+	plainText := strings.TrimSpace(message.Text)
 
-	if len(message.Photo) > 0 {
-
-		// -----------------------------------------------------
-		// LARGEST PHOTO
-		// -----------------------------------------------------
-
-		photoSize :=
-			message.Photo[
-				len(message.Photo)-1,
-			]
-
-		fileID :=
-			photoSize.FileID
-
-		// -----------------------------------------------------
-		// TELEGRAM FILE
-		// -----------------------------------------------------
-
-		file, err :=
-			bot.GetFile(
-				tgbotapi.FileConfig{
-					FileID: fileID,
-				},
-			)
-
-		if err != nil {
-
-			log.Printf(
-				"Error getting file: %v",
-				err,
-			)
-
-			return openai.ChatCompletionMessage{
-				Role:
-					openai.ChatMessageRoleUser,
-
-				Content:
-					message.Text,
-			}
-		}
-
-		fileURL :=
-			file.Link(
-				bot.Token,
-			)
-
-		// -----------------------------------------------------
-		// VISION PROMPT
-		// -----------------------------------------------------
-
-		if strings.TrimSpace(
-			message.Text,
-		) == "" {
-
-			message.Text =
-				config.VisionPrompt
-		}
-
-		if strings.TrimSpace(
-			message.Text,
-		) == "" {
-
-			message.Text =
-				"Describe this image."
-		}
-
-		// -----------------------------------------------------
-		// MULTIMODAL MESSAGE
-		// -----------------------------------------------------
-
+	if len(message.Photo) == 0 {
 		return openai.ChatCompletionMessage{
+			Role:    openai.ChatMessageRoleUser,
+			Content: plainText,
+		}, plainText
+	}
 
-			Role:
-				openai.ChatMessageRoleUser,
+	// Use the largest available photo size.
+	photoSize := message.Photo[len(message.Photo)-1]
 
-			MultiContent:
-				[]openai.ChatMessagePart{
+	file, err := bot.GetFile(tgbotapi.FileConfig{FileID: photoSize.FileID})
+	if err != nil {
+		log.Printf("Error getting file: %v", err)
+		return openai.ChatCompletionMessage{
+			Role:    openai.ChatMessageRoleUser,
+			Content: plainText,
+		}, plainText
+	}
 
-					{
-						Type:
-							openai.ChatMessagePartTypeText,
+	prompt := plainText
+	if prompt == "" {
+		prompt = cfg.VisionPrompt
+	}
+	if prompt == "" {
+		prompt = "Describe this image."
+	}
 
-						Text:
-							strings.TrimSpace(
-								message.Text,
-							),
-					},
-
-					{
-						Type:
-							openai.ChatMessagePartTypeImageURL,
-
-						ImageURL:
-							&openai.ChatMessageImageURL{
-
-								URL:
-									fileURL,
-
-								Detail:
-									openai.ImageURLDetail(
-										config.VisionDetails,
-									),
-							},
-					},
+	visionMessage := openai.ChatCompletionMessage{
+		Role: openai.ChatMessageRoleUser,
+		MultiContent: []openai.ChatMessagePart{
+			{
+				Type: openai.ChatMessagePartTypeText,
+				Text: prompt,
+			},
+			{
+				Type: openai.ChatMessagePartTypeImageURL,
+				ImageURL: &openai.ChatMessageImageURL{
+					URL:    file.Link(bot.Token),
+					Detail: openai.ImageURLDetail(cfg.VisionDetails),
 				},
-		}
+			},
+		},
 	}
 
-	// ---------------------------------------------------------
-	// NORMAL TEXT
-	// ---------------------------------------------------------
-
-	return openai.ChatCompletionMessage{
-
-		Role:
-			openai.ChatMessageRoleUser,
-
-		Content:
-			message.Text,
-	}
+	return visionMessage, prompt
 }

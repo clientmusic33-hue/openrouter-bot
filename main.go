@@ -1,13 +1,21 @@
+// Command openrouter-bot runs a Telegram bot that answers with AI models
+// served through OpenRouter or any OpenAI-compatible endpoint.
 package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
 
 	"openrouter-bot/api"
 	"openrouter-bot/config"
@@ -20,40 +28,32 @@ import (
 	"github.com/sashabaranov/go-openai"
 )
 
+const (
+	shutdownTimeout   = 30 * time.Second
+	translationTimout = 60 * time.Second
+)
+
 func main() {
-	// Render Web Service health server.
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "10000"
-	}
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
-	go func() {
-		mux := http.NewServeMux()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte("OpenRouter Telegram Bot is running"))
-		})
+	// ---------------------------------------------------------------------
+	// TRANSLATIONS
+	// ---------------------------------------------------------------------
+	//
+	// Loaded exactly once. Reloading per message rewrote a package level map
+	// that other goroutines were reading concurrently.
 
-		mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte("OK"))
-		})
-
-		log.Printf("HTTP server listening on 0.0.0.0:%s", port)
-
-		if err := http.ListenAndServe("0.0.0.0:"+port, mux); err != nil {
-			log.Fatalf("HTTP server failed: %v", err)
-		}
-	}()
-
-	// Load translations.
-	err := lang.LoadTranslations("./lang/")
-	if err != nil {
+	if err := lang.LoadTranslations("./lang/"); err != nil {
 		log.Fatalf("Error loading translations: %v", err)
 	}
 
-	// Initialize configuration.
+	// ---------------------------------------------------------------------
+	// CONFIGURATION
+	// ---------------------------------------------------------------------
+
 	manager, err := config.NewManager("./config.yaml")
 	if err != nil {
 		log.Fatalf("Error initializing config manager: %v", err)
@@ -61,1055 +61,742 @@ func main() {
 
 	conf := manager.GetConfig()
 
-	// Initialize Telegram bot.
+	// ---------------------------------------------------------------------
+	// TELEGRAM BOT
+	// ---------------------------------------------------------------------
+
+	if conf.TelegramBotToken == "" {
+		log.Fatal("TELEGRAM_BOT_TOKEN is not set")
+	}
+
 	bot, err := tgbotapi.NewBotAPI(conf.TelegramBotToken)
 	if err != nil {
-		log.Panic(err)
+		log.Fatalf("Failed to create Telegram bot: %v", err)
 	}
 
 	bot.Debug = false
+	log.Printf("Authorized as @%s", bot.Self.UserName)
 
-	// Delete webhook so long polling can work.
-	_, err = bot.Request(tgbotapi.DeleteWebhookConfig{})
-	if err != nil {
-		log.Fatalf("Failed to delete webhook: %v", err)
+	if _, err := bot.Request(tgbotapi.DeleteWebhookConfig{}); err != nil {
+		log.Printf("Warning: failed to delete webhook: %v", err)
 	}
 
-	// Telegram long polling.
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
-
 	updates := bot.GetUpdatesChan(u)
 
-	// Initialize group translation manager.
-	translationManager := grouptranslate.NewManager(
-		"data/translations.json",
-	)
-
-	// Set Telegram bot commands.
-	commands := []tgbotapi.BotCommand{
-		{
-			Command:     "start",
-			Description: lang.Translate("description.start", conf.Lang),
-		},
-		{
-			Command:     "help",
-			Description: lang.Translate("description.help", conf.Lang),
-		},
-		{
-			Command:     "get_models",
-			Description: lang.Translate("description.getModels", conf.Lang),
-		},
-		{
-			Command:     "set_model",
-			Description: lang.Translate("description.setModel", conf.Lang),
-		},
-		{
-			Command:     "reset",
-			Description: lang.Translate("description.reset", conf.Lang),
-		},
-		{
-			Command:     "stats",
-			Description: lang.Translate("description.stats", conf.Lang),
-		},
-		{
-			Command:     "stop",
-			Description: lang.Translate("description.stop", conf.Lang),
-		},
-		{
-			Command:     "about",
-			Description: "About this bot",
-		},
-		{
-			Command:     "tr",
-			Description: "Translate a replied message",
-		},
-		{
-			Command:     "translate",
-			Description: "Manage group auto translation",
-		},
-	}
-
-	_, err = bot.Request(tgbotapi.NewSetMyCommands(commands...))
-	if err != nil {
-		log.Fatalf("Failed to set bot commands: %v", err)
-	}
-
-	// ---------------------------------------------------------
-	// OPENROUTER CLIENT
-	// ---------------------------------------------------------
+	// ---------------------------------------------------------------------
+	// AI CLIENTS
+	// ---------------------------------------------------------------------
 
 	clientOptions := openai.DefaultConfig(conf.OpenAIApiKey)
 	clientOptions.BaseURL = conf.OpenAIBaseURL
 	client := openai.NewClientWithConfig(clientOptions)
 
-	// ---------------------------------------------------------
-	// GEMINI FALLBACK CLIENT
-	// ---------------------------------------------------------
-
-	geminiAPIKey := os.Getenv("GEMINI_API_KEY")
-
 	var geminiClient *openai.Client
-
-	if geminiAPIKey != "" {
-		geminiOptions := openai.DefaultConfig(geminiAPIKey)
-
-		geminiOptions.BaseURL =
-			"https://generativelanguage.googleapis.com/v1beta/openai/"
-
+	if conf.GeminiAPIKey != "" {
+		geminiOptions := openai.DefaultConfig(conf.GeminiAPIKey)
+		geminiOptions.BaseURL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 		geminiClient = openai.NewClientWithConfig(geminiOptions)
-
 		log.Println("Gemini fallback enabled")
 	} else {
 		log.Println("GEMINI_API_KEY not set - Gemini fallback disabled")
 	}
 
-	// ---------------------------------------------------------
-	// USER MANAGER
-	// ---------------------------------------------------------
-
-	userManager := user.NewUserManager("logs")
-
-	// ---------------------------------------------------------
-	// PROCESS TELEGRAM UPDATES
-	// ---------------------------------------------------------
-
-	for update := range updates {
-
-		if update.Message == nil {
-			continue
-		}
-
-		// Ignore messages sent by bots.
-		if update.Message.From != nil &&
-			update.Message.From.IsBot {
-			continue
-		}
-
-		// ---------------------------------------------------------
-		// IDENTIFY MESSAGE SENDER
-		// ---------------------------------------------------------
-
-		senderID := int64(0)
-		senderUsername := ""
-
-		if update.Message.From != nil {
-
-			senderID =
-				update.Message.From.ID
-
-			senderUsername =
-				update.Message.From.UserName
-
-		} else if update.Message.SenderChat != nil {
-
-			senderID =
-				update.Message.SenderChat.ID
-
-			senderUsername =
-				update.Message.SenderChat.UserName
-		}
-
-		log.Printf(
-			"INCOMING MESSAGE: chat=%d type=%s sender_id=%d username=%q text=%q",
-			update.Message.Chat.ID,
-			update.Message.Chat.Type,
-			senderID,
-			senderUsername,
-			update.Message.Text,
-		)
-
-		userStats := userManager.GetUser(
-			senderID,
-			senderUsername,
-			conf,
-		)
-
-		// ---------------------------------------------------------
-		// COMMANDS
-		// ---------------------------------------------------------
-
-		if update.Message.IsCommand() {
-
-			switch update.Message.Command() {
-
-			// /start
-			case "start":
-
-				msgText :=
-					lang.Translate(
-						"commands.start",
-						conf.Lang,
-					) +
-						lang.Translate(
-							"commands.help",
-							conf.Lang,
-						) +
-						lang.Translate(
-							"commands.start_end",
-							conf.Lang,
-						)
-
-				msg := tgbotapi.NewMessage(
-					update.Message.Chat.ID,
-					msgText,
-				)
-
-				msg.ParseMode = "HTML"
-
-				if _, err := bot.Send(msg); err != nil {
-					log.Println(
-						"Failed to send /start:",
-						err,
-					)
-				}
-
-			// /help
-			case "help":
-
-				msg := tgbotapi.NewMessage(
-					update.Message.Chat.ID,
-					lang.Translate(
-						"commands.help",
-						conf.Lang,
-					),
-				)
-
-				msg.ParseMode = "HTML"
-
-				if _, err := bot.Send(msg); err != nil {
-					log.Println(
-						"Failed to send /help:",
-						err,
-					)
-				}
-
-			// /get_models
-			case "get_models":
-
-				models, err := api.GetFreeModels()
-
-				if err != nil {
-
-					log.Printf(
-						"Error getting models: %v",
-						err,
-					)
-
-					msg := tgbotapi.NewMessage(
-						update.Message.Chat.ID,
-						"❌ Failed to get available models. Please try again later.",
-					)
-
-					if _, err := bot.Send(msg); err != nil {
-						log.Println(
-							"Failed to send models error:",
-							err,
-						)
-					}
-
-					continue
-				}
-
-				text :=
-					lang.Translate(
-						"commands.getModels",
-						conf.Lang,
-					) +
-						models
-
-				msg := tgbotapi.NewMessage(
-					update.Message.Chat.ID,
-					text,
-				)
-
-				msg.ParseMode =
-					tgbotapi.ModeMarkdown
-
-				if _, err := bot.Send(msg); err != nil {
-					log.Println(
-						"Failed to send models:",
-						err,
-					)
-				}
-
-			// /set_model
-			case "set_model":
-
-				args :=
-					update.Message.CommandArguments()
-
-				argsArr :=
-					strings.Fields(args)
-
-				msg := tgbotapi.NewMessage(
-					update.Message.Chat.ID,
-					conf.Model.ModelName,
-				)
-
-				msg.ParseMode =
-					tgbotapi.ModeMarkdown
-
-				switch {
-
-				case args == "default":
-
-					conf.Model.ModelName =
-						conf.Model.ModelNameDefault
-
-					msg.Text =
-						lang.Translate(
-							"commands.setModel",
-							conf.Lang,
-						) +
-							" `" +
-							conf.Model.ModelName +
-							"`"
-
-				case args == "":
-
-					msg.Text =
-						lang.Translate(
-							"commands.noArgsModel",
-							conf.Lang,
-						)
-
-				case len(argsArr) > 1:
-
-					msg.Text =
-						lang.Translate(
-							"commands.noSpaceModel",
-							conf.Lang,
-						)
-
-				default:
-
-					conf.Model.ModelName =
-						argsArr[0]
-
-					msg.Text =
-						lang.Translate(
-							"commands.setModel",
-							conf.Lang,
-						) +
-							" `" +
-							conf.Model.ModelName +
-							"`"
-				}
-
-				if _, err := bot.Send(msg); err != nil {
-					log.Println(
-						"Failed to send /set_model:",
-						err,
-					)
-				}
-
-			// /reset
-			case "reset":
-
-				args :=
-					update.Message.CommandArguments()
-
-				msg := tgbotapi.NewMessage(
-					update.Message.Chat.ID,
-					"",
-				)
-
-				if args == "system" {
-
-					userStats.SystemPrompt =
-						conf.SystemPrompt
-
-					msg.Text =
-						lang.Translate(
-							"commands.reset_system",
-							conf.Lang,
-						)
-
-				} else if args != "" {
-
-					userStats.SystemPrompt =
-						args
-
-					msg.Text =
-						lang.Translate(
-							"commands.reset_prompt",
-							conf.Lang,
-						) +
-							args +
-							"."
-
-				} else {
-
-					userStats.ClearHistory()
-
-					msg.Text =
-						lang.Translate(
-							"commands.reset",
-							conf.Lang,
-						)
-				}
-
-				if _, err := bot.Send(msg); err != nil {
-					log.Println(
-						"Failed to send /reset:",
-						err,
-					)
-				}
-
-			// /stats
-			case "stats":
-
-				userStats.CheckHistory(
-					conf.MaxHistorySize,
-					conf.MaxHistoryTime,
-				)
-
-				countedUsage :=
-					strconv.FormatFloat(
-						userStats.GetCurrentCost(
-							conf.BudgetPeriod,
-						),
-						'f',
-						6,
-						64,
-					)
-
-				todayUsage :=
-					strconv.FormatFloat(
-						userStats.GetCurrentCost("daily"),
-						'f',
-						6,
-						64,
-					)
-
-				monthUsage :=
-					strconv.FormatFloat(
-						userStats.GetCurrentCost("monthly"),
-						'f',
-						6,
-						64,
-					)
-
-				totalUsage :=
-					strconv.FormatFloat(
-						userStats.GetCurrentCost("total"),
-						'f',
-						6,
-						64,
-					)
-
-				messagesCount :=
-					strconv.Itoa(
-						len(userStats.GetMessages()),
-					)
-
-				var statsMessage string
-
-				if userStats.CanViewStats(conf) {
-
-					statsMessage =
-						fmt.Sprintf(
-							lang.Translate(
-								"commands.stats",
-								conf.Lang,
-							),
-							countedUsage,
-							todayUsage,
-							monthUsage,
-							totalUsage,
-							messagesCount,
-						)
-
-				} else {
-
-					statsMessage =
-						fmt.Sprintf(
-							lang.Translate(
-								"commands.stats_min",
-								conf.Lang,
-							),
-							messagesCount,
-						)
-				}
-
-				msg := tgbotapi.NewMessage(
-					update.Message.Chat.ID,
-					statsMessage,
-				)
-
-				msg.ParseMode = "HTML"
-
-				if _, err := bot.Send(msg); err != nil {
-					log.Println(
-						"Failed to send /stats:",
-						err,
-					)
-				}
-
-			// /tr
-			case "tr":
-
-				if update.Message.ReplyToMessage == nil {
-
-					msg := tgbotapi.NewMessage(
-						update.Message.Chat.ID,
-						"❌ Reply to a message and use:\n\n/tr hi\n/tr en\n/tr ru",
-					)
-
-					if _, err := bot.Send(msg); err != nil {
-						log.Println(
-							"Failed to send /tr help:",
-							err,
-						)
-					}
-
-					continue
-				}
-
-				targetLanguage :=
-					strings.TrimSpace(
-						update.Message.CommandArguments(),
-					)
-
-				if targetLanguage == "" {
-					targetLanguage = "English"
-				}
-
-				sourceText :=
-					update.Message.ReplyToMessage.Text
-
-				if strings.TrimSpace(sourceText) == "" {
-
-					msg := tgbotapi.NewMessage(
-						update.Message.Chat.ID,
-						"❌ The replied message doesn't contain text.",
-					)
-
-					if _, err := bot.Send(msg); err != nil {
-						log.Println(
-							"Failed to send /tr error:",
-							err,
-						)
-					}
-
-					continue
-				}
-
-				translatedText, err :=
-					translator.Translate(
-						context.Background(),
-						client,
-						sourceText,
-						targetLanguage,
-						conf.Model.ModelName,
-					)
-
-				if err != nil {
-
-					log.Printf(
-						"Translation error: %v",
-						err,
-					)
-
-					msg := tgbotapi.NewMessage(
-						update.Message.Chat.ID,
-						"❌ Translation failed. Please try again.",
-					)
-
-					if _, err := bot.Send(msg); err != nil {
-						log.Println(
-							"Failed to send translation error:",
-							err,
-						)
-					}
-
-					continue
-				}
-
-				msg := tgbotapi.NewMessage(
-					update.Message.Chat.ID,
-					"🌐 <b>Translation</b>\n\n"+
-						translatedText,
-				)
-
-				msg.ParseMode = "HTML"
-
-				if _, err := bot.Send(msg); err != nil {
-					log.Println(
-						"Failed to send translation:",
-						err,
-					)
-				}
-
-			// /translate
-			case "translate":
-
-				if update.Message.Chat.Type != "group" &&
-					update.Message.Chat.Type != "supergroup" {
-
-					msg := tgbotapi.NewMessage(
-						update.Message.Chat.ID,
-						"❌ This command can only be used in a group.",
-					)
-
-					if _, err := bot.Send(msg); err != nil {
-						log.Println(
-							"Failed to send /translate error:",
-							err,
-						)
-					}
-
-					continue
-				}
-
-				args :=
-					strings.TrimSpace(
-						update.Message.CommandArguments(),
-					)
-
-				argsLower :=
-					strings.ToLower(args)
-
-				switch argsLower {
-
-				case "on":
-
-					err :=
-						translationManager.SetEnabled(
-							update.Message.Chat.ID,
-							true,
-						)
-
-					if err != nil {
-
-						log.Printf(
-							"Failed to enable translation: %v",
-							err,
-						)
-
-						bot.Send(
-							tgbotapi.NewMessage(
-								update.Message.Chat.ID,
-								"❌ Failed to save translation settings.",
-							),
-						)
-
-						continue
-					}
-
-					settings :=
-						translationManager.Get(
-							update.Message.Chat.ID,
-						)
-
-					msg := tgbotapi.NewMessage(
-						update.Message.Chat.ID,
-						fmt.Sprintf(
-							"🌐 <b>Auto Translation Enabled</b>\n\n"+
-								"Target language: <b>%s</b>\n\n"+
-								"New group messages will now be translated automatically.",
-							settings.TargetLanguage,
-						),
-					)
-
-					msg.ParseMode = "HTML"
-
-					if _, err := bot.Send(msg); err != nil {
-						log.Println(
-							"Failed to send translation status:",
-							err,
-						)
-					}
-
-				case "off":
-
-					err :=
-						translationManager.SetEnabled(
-							update.Message.Chat.ID,
-							false,
-						)
-
-					if err != nil {
-
-						log.Printf(
-							"Failed to disable translation: %v",
-							err,
-						)
-
-						bot.Send(
-							tgbotapi.NewMessage(
-								update.Message.Chat.ID,
-								"❌ Failed to save translation settings.",
-							),
-						)
-
-						continue
-					}
-
-					bot.Send(
-						tgbotapi.NewMessage(
-							update.Message.Chat.ID,
-							"🌐 Auto translation disabled.",
-						),
-					)
-
-				case "status":
-
-					settings :=
-						translationManager.Get(
-							update.Message.Chat.ID,
-						)
-
-					status :=
-						"🔴 Disabled"
-
-					if settings.Enabled {
-						status = "🟢 Enabled"
-					}
-
-					msg := tgbotapi.NewMessage(
-						update.Message.Chat.ID,
-						fmt.Sprintf(
-							"🌐 <b>Translation Status</b>\n\n"+
-								"Status: %s\n"+
-								"Language: <b>%s</b>\n"+
-								"Mode: Automatic",
-							status,
-							settings.TargetLanguage,
-						),
-					)
-
-					msg.ParseMode = "HTML"
-
-					if _, err := bot.Send(msg); err != nil {
-						log.Println(
-							"Failed to send translation status:",
-							err,
-						)
-					}
-
-				default:
-
-					if args == "" {
-
-						msg := tgbotapi.NewMessage(
-							update.Message.Chat.ID,
-							"🌐 <b>Group Translation</b>\n\n"+
-								"/translate on — Enable\n"+
-								"/translate off — Disable\n"+
-								"/translate hi — Set Hindi and enable\n"+
-								"/translate en — Set English and enable\n"+
-								"/translate status — Show settings",
-						)
-
-						msg.ParseMode = "HTML"
-
-						if _, err := bot.Send(msg); err != nil {
-							log.Println(
-								"Failed to send translation help:",
-								err,
-							)
-						}
-
-						continue
-					}
-
-					// Set the target language.
-					err :=
-						translationManager.SetLanguage(
-							update.Message.Chat.ID,
-							args,
-						)
-
-					if err != nil {
-
-						log.Printf(
-							"Failed to set translation language: %v",
-							err,
-						)
-
-						bot.Send(
-							tgbotapi.NewMessage(
-								update.Message.Chat.ID,
-								"❌ Failed to save translation language.",
-							),
-						)
-
-						continue
-					}
-
-					// Automatically enable translation.
-					err =
-						translationManager.SetEnabled(
-							update.Message.Chat.ID,
-							true,
-						)
-
-					if err != nil {
-
-						log.Printf(
-							"Failed to enable translation: %v",
-							err,
-						)
-
-						bot.Send(
-							tgbotapi.NewMessage(
-								update.Message.Chat.ID,
-								"❌ Language was saved, but translation could not be enabled.",
-							),
-						)
-
-						continue
-					}
-
-					settings :=
-						translationManager.Get(
-							update.Message.Chat.ID,
-						)
-
-					msg := tgbotapi.NewMessage(
-						update.Message.Chat.ID,
-						fmt.Sprintf(
-							"🌐 <b>Auto Translation Enabled</b>\n\n"+
-								"Target language: <b>%s</b>\n\n"+
-								"You don't need to specify the language again.",
-							settings.TargetLanguage,
-						),
-					)
-
-					msg.ParseMode = "HTML"
-
-					if _, err := bot.Send(msg); err != nil {
-						log.Println(
-							"Failed to send translation settings:",
-							err,
-						)
-					}
-				}
-
-			// /about
-			case "about":
-
-				msg := tgbotapi.NewMessage(
-					update.Message.Chat.ID,
-					"🤖 <b>OpenRouter AI Bot</b>\n\n"+
-						"👨‍💻 <b>Created by:</b> @Hazel21_nut\n"+
-						"⚡ <b>Powered by:</b> OpenRouter",
-				)
-
-				msg.ParseMode = "HTML"
-
-				if _, err := bot.Send(msg); err != nil {
-					log.Println(
-						"Failed to send /about:",
-						err,
-					)
-				}
-
-			// /stop
-			case "stop":
-
-				if userStats.CurrentStream != nil {
-
-					userStats.CurrentStream.Close()
-
-					msg := tgbotapi.NewMessage(
-						update.Message.Chat.ID,
-						lang.Translate(
-							"commands.stop",
-							conf.Lang,
-						),
-					)
-
-					if _, err := bot.Send(msg); err != nil {
-						log.Println(err)
-					}
-
-				} else {
-
-					msg := tgbotapi.NewMessage(
-						update.Message.Chat.ID,
-						lang.Translate(
-							"commands.stop_err",
-							conf.Lang,
-						),
-					)
-
-					if _, err := bot.Send(msg); err != nil {
-						log.Println(
-							"Failed to send /stop error:",
-							err,
-						)
-					}
-				}
+	// ---------------------------------------------------------------------
+	// APPLICATION
+	// ---------------------------------------------------------------------
+
+	app := &app{
+		ctx:          ctx,
+		bot:          bot,
+		manager:      manager,
+		client:       client,
+		geminiClient: geminiClient,
+		users:        user.NewUserManager("logs"),
+		translations: grouptranslate.NewManager("data/translations.json"),
+		semaphore:    make(chan struct{}, conf.MaxConcurrentRequests),
+	}
+
+	app.setCommands(manager.GetConfig())
+
+	// ---------------------------------------------------------------------
+	// HEALTH SERVER
+	// ---------------------------------------------------------------------
+
+	server := app.startHealthServer()
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
+	}()
+
+	// ---------------------------------------------------------------------
+	// UPDATE LOOP
+	// ---------------------------------------------------------------------
+
+	app.ready.Store(true)
+	log.Println("Bot is running, waiting for updates")
+
+	app.run(updates)
+
+	// ---------------------------------------------------------------------
+	// GRACEFUL SHUTDOWN
+	// ---------------------------------------------------------------------
+
+	log.Println("Shutting down, waiting for in-flight requests")
+
+	bot.StopReceivingUpdates()
+
+	done := make(chan struct{})
+	go func() {
+		app.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		log.Println("All requests finished")
+	case <-time.After(shutdownTimeout):
+		log.Printf("Timed out after %s waiting for requests to finish", shutdownTimeout)
+	}
+
+	log.Println("Goodbye")
+}
+
+// -----------------------------------------------------------------------------
+// APPLICATION
+// -----------------------------------------------------------------------------
+
+type app struct {
+	ctx          context.Context
+	bot          *tgbotapi.BotAPI
+	manager      *config.Manager
+	client       *openai.Client
+	geminiClient *openai.Client
+
+	users        *user.Manager
+	translations *grouptranslate.Manager
+
+	// semaphore caps concurrent AI requests so that a burst of group
+	// messages cannot exhaust the upstream rate limit.
+	semaphore chan struct{}
+
+	wg    sync.WaitGroup
+	ready atomic.Bool
+}
+
+// run consumes Telegram updates until the channel closes or the context is
+// cancelled.
+func (a *app) run(updates tgbotapi.UpdatesChannel) {
+	for {
+		select {
+		case <-a.ctx.Done():
+			return
+		case update, ok := <-updates:
+			if !ok {
+				return
 			}
+			a.processUpdate(update)
+		}
+	}
+}
 
-			continue
+func (a *app) processUpdate(update tgbotapi.Update) {
+	if update.Message == nil {
+		return
+	}
+
+	// Ignore messages sent by other bots.
+	if update.Message.From != nil && update.Message.From.IsBot {
+		return
+	}
+
+	senderID, senderUsername := senderInfo(update.Message)
+	if senderID == 0 {
+		log.Printf("Ignoring message without a resolvable sender in chat %d", update.Message.Chat.ID)
+		return
+	}
+
+	// Read a fresh snapshot: the configuration may have been reloaded.
+	conf := a.manager.GetConfig()
+
+	tracker := a.users.GetUser(update.Message.Chat.ID, senderID, senderUsername, conf)
+
+	log.Printf(
+		"INCOMING MESSAGE: chat=%d type=%s sender_id=%d username=%q text=%q",
+		update.Message.Chat.ID,
+		update.Message.Chat.Type,
+		senderID,
+		senderUsername,
+		update.Message.Text,
+	)
+
+	if update.Message.IsCommand() {
+		a.handleCommand(update.Message, conf, tracker)
+		return
+	}
+
+	// -----------------------------------------------------------------
+	// AUTOMATIC GROUP TRANSLATION
+	// -----------------------------------------------------------------
+
+	if isGroupChat(update.Message.Chat) {
+		settings := a.translations.Get(update.Message.Chat.ID)
+		text := strings.TrimSpace(messageText(update.Message))
+
+		if settings.Enabled && text != "" {
+			a.startTranslation(update.Message, settings.TargetLanguage, conf)
+
+			// Translation mode replaces the chat mode for this group.
+			// Without this return every message would also trigger a full
+			// AI completion.
+			return
+		}
+	}
+
+	// -----------------------------------------------------------------
+	// NORMAL AI CHAT
+	// -----------------------------------------------------------------
+
+	if !a.shouldAnswer(update.Message, conf) {
+		return
+	}
+
+	a.wg.Add(1)
+	go a.handleChat(update.Message, conf, tracker)
+}
+
+// handleChat runs one AI request. It is started in its own goroutine and
+// bounded by the concurrency semaphore.
+func (a *app) handleChat(message *tgbotapi.Message, conf *config.Config, tracker *user.UsageTracker) {
+	defer a.wg.Done()
+
+	select {
+	case a.semaphore <- struct{}{}:
+		defer func() { <-a.semaphore }()
+	case <-a.ctx.Done():
+		return
+	}
+
+	if !tracker.HaveAccess(conf) {
+		sendMessage(a.bot, message.Chat.ID, lang.Translate("budget_out", conf.Lang), "")
+		return
+	}
+
+	if err := tracker.AllowRequest(conf); err != nil {
+		log.Printf("Rate limiting user %s: %v", tracker.UserID, err)
+		sendMessage(a.bot, message.Chat.ID, lang.Translate("rate_limit", conf.Lang), "")
+		return
+	}
+
+	log.Printf(
+		"AI REQUEST: chat=%d sender_id=%s username=%q text=%q",
+		message.Chat.ID,
+		tracker.UserID,
+		tracker.UserName,
+		message.Text,
+	)
+
+	responseID, err := api.HandleChatGPTStreamResponse(
+		a.ctx,
+		a.bot,
+		a.client,
+		a.geminiClient,
+		message,
+		conf,
+		tracker,
+	)
+	if err != nil {
+		log.Printf("AI request failed for user %s: %v", tracker.UserID, err)
+	}
+
+	if conf.Model.Type == "openrouter" {
+		if err := tracker.GetUsageFromApi(responseID, conf); err != nil {
+			log.Printf("Failed to fetch usage for user %s: %v", tracker.UserID, err)
+		}
+	}
+}
+
+// -----------------------------------------------------------------------------
+// GROUP BEHAVIOUR
+// -----------------------------------------------------------------------------
+
+// shouldAnswer decides whether the bot answers a non-command message.
+func (a *app) shouldAnswer(message *tgbotapi.Message, conf *config.Config) bool {
+	if !isGroupChat(message.Chat) {
+		return true
+	}
+
+	switch conf.GroupChatMode {
+	case config.GroupModeOff:
+		return false
+	case config.GroupModeAll:
+		return true
+	default: // config.GroupModeMention
+		if message.ReplyToMessage != nil &&
+			message.ReplyToMessage.From != nil &&
+			message.ReplyToMessage.From.ID == a.bot.Self.ID {
+			return true
+		}
+		return a.isMentioned(message)
+	}
+}
+
+func (a *app) isMentioned(message *tgbotapi.Message) bool {
+	username := strings.ToLower(a.bot.Self.UserName)
+	if username == "" {
+		return false
+	}
+
+	return strings.Contains(strings.ToLower(messageText(message)), "@"+username)
+}
+
+func (a *app) startTranslation(message *tgbotapi.Message, target string, conf *config.Config) {
+	chatID := message.Chat.ID
+	messageID := message.MessageID
+	text := strings.TrimSpace(messageText(message))
+
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+
+		select {
+		case a.semaphore <- struct{}{}:
+			defer func() { <-a.semaphore }()
+		case <-a.ctx.Done():
+			return
 		}
 
-		// ---------------------------------------------------------
-		// AUTOMATIC GROUP TRANSLATION
-		// ---------------------------------------------------------
+		ctx, cancel := context.WithTimeout(a.ctx, translationTimout)
+		defer cancel()
 
-		if update.Message.Chat.Type == "group" ||
-			update.Message.Chat.Type == "supergroup" {
+		log.Printf("Starting automatic translation: chat=%d message=%d target=%q", chatID, messageID, target)
 
-			settings :=
-				translationManager.Get(
-					update.Message.Chat.ID,
-				)
-
-			log.Printf(
-				"Group translation check: chat=%d enabled=%v language=%q text=%q",
-				update.Message.Chat.ID,
-				settings.Enabled,
-				settings.TargetLanguage,
-				update.Message.Text,
-			)
-
-			if settings.Enabled &&
-				strings.TrimSpace(update.Message.Text) != "" {
-
-				sourceText :=
-					strings.TrimSpace(
-						update.Message.Text,
-					)
-
-				targetLanguage :=
-					strings.TrimSpace(
-						settings.TargetLanguage,
-					)
-
-				chatID :=
-					update.Message.Chat.ID
-
-				messageID :=
-					update.Message.MessageID
-
-				go func(
-					chatID int64,
-					messageID int,
-					text string,
-					target string,
-				) {
-
-					log.Printf(
-						"Starting automatic translation: chat=%d message=%d target=%q",
-						chatID,
-						messageID,
-						target,
-					)
-
-					translatedText, err :=
-						translator.Translate(
-							context.Background(),
-							client,
-							text,
-							target,
-							conf.Model.ModelName,
-						)
-
-					if err != nil {
-
-						log.Printf(
-							"Automatic translation FAILED: chat=%d message=%d error=%v",
-							chatID,
-							messageID,
-							err,
-						)
-
-						return
-					}
-
-					log.Printf(
-						"Automatic translation SUCCESS: chat=%d message=%d",
-						chatID,
-						messageID,
-					)
-
-					msg := tgbotapi.NewMessage(
-						chatID,
-						fmt.Sprintf(
-							"🌐 <b>%s</b>\n\n%s",
-							target,
-							translatedText,
-						),
-					)
-
-					msg.ParseMode = "HTML"
-
-					// Reply directly to the original message.
-					msg.ReplyToMessageID =
-						messageID
-
-					if _, err := bot.Send(msg); err != nil {
-
-						log.Printf(
-							"Failed to send automatic translation: chat=%d message=%d error=%v",
-							chatID,
-							messageID,
-							err,
-						)
-					}
-
-				}(
-					chatID,
-					messageID,
-					sourceText,
-					targetLanguage,
-				)
-			}
+		translated, err := translator.Translate(ctx, a.client, text, target, conf.Model.ModelName)
+		if err != nil {
+			log.Printf("Automatic translation FAILED: chat=%d message=%d error=%v", chatID, messageID, err)
+			return
 		}
-// ---------------------------------------------------------
-// NORMAL AI CHAT
-// ---------------------------------------------------------
 
-go func(userStats *user.UsageTracker) {
+		log.Printf("Automatic translation SUCCESS: chat=%d message=%d", chatID, messageID)
 
-	if userStats.HaveAccess(conf) {
+		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("🌐 <b>%s</b>\n\n%s", escapeHTML(target), escapeHTML(translated)))
+		msg.ParseMode = "HTML"
+		msg.ReplyToMessageID = messageID
 
-		log.Printf(
-			"AI REQUEST: chat=%d sender_id=%d username=%q text=%q",
-			update.Message.Chat.ID,
-			senderID,
-			senderUsername,
-			update.Message.Text,
+		if _, err := a.bot.Send(msg); err != nil {
+			log.Printf("Failed to send automatic translation: chat=%d message=%d error=%v", chatID, messageID, err)
+		}
+	}()
+}
+
+// -----------------------------------------------------------------------------
+// COMMANDS
+// -----------------------------------------------------------------------------
+
+func (a *app) handleCommand(message *tgbotapi.Message, conf *config.Config, tracker *user.UsageTracker) {
+	chatID := message.Chat.ID
+
+	switch message.Command() {
+
+	case "start":
+		sendMessage(a.bot, chatID,
+			lang.Translate("commands.start", conf.Lang)+
+				lang.Translate("commands.help", conf.Lang)+
+				lang.Translate("commands.start_end", conf.Lang),
+			"HTML",
 		)
 
-		responseID :=
-			api.HandleChatGPTStreamResponse(
-				bot,
-				client,
-				geminiClient,
-				update.Message,
-				conf,
-				userStats,
-			)
+	case "help":
+		sendMessage(a.bot, chatID, lang.Translate("commands.help", conf.Lang), "HTML")
 
-		if conf.Model.Type == "openrouter" {
-
-			userStats.GetUsageFromApi(
-				responseID,
-				conf,
-			)
+	case "get_models":
+		models, err := api.GetFreeModels(conf)
+		if err != nil {
+			log.Printf("Error getting models: %v", err)
+			sendMessage(a.bot, chatID, "❌ Failed to get available models. Please try again later.", "")
+			return
 		}
 
+		sendMessage(a.bot, chatID,
+			lang.Translate("commands.getModels", conf.Lang)+models,
+			tgbotapi.ModeMarkdown,
+		)
+
+	case "set_model":
+		a.handleSetModel(message, conf)
+
+	case "reset":
+		a.handleReset(message, conf, tracker)
+
+	case "stats":
+		a.handleStats(message, conf, tracker)
+
+	case "stop":
+		if tracker.StopStream() {
+			sendMessage(a.bot, chatID, lang.Translate("commands.stop", conf.Lang), "HTML")
+			return
+		}
+		sendMessage(a.bot, chatID, lang.Translate("commands.stop_err", conf.Lang), "HTML")
+
+	case "about":
+		sendMessage(a.bot, chatID,
+			"🤖 <b>OpenRouter AI Bot</b>\n\n"+
+				"👨‍💻 <b>Created by:</b> @Hazel21_nut\n"+
+				"⚡ <b>Powered by:</b> OpenRouter",
+			"HTML",
+		)
+
+	case "tr":
+		a.handleTranslateReply(message, conf)
+
+	case "translate":
+		a.handleTranslateSettings(message, conf)
+
+	default:
+		log.Printf("Unknown command: %s", message.Command())
+	}
+}
+
+func (a *app) handleSetModel(message *tgbotapi.Message, conf *config.Config) {
+	args := strings.TrimSpace(message.CommandArguments())
+
+	switch {
+	case strings.EqualFold(args, "default"):
+		model := a.manager.ResetModel()
+		sendMessage(a.bot, message.Chat.ID,
+			lang.Translate("commands.setModel", conf.Lang)+" `"+model+"`",
+			tgbotapi.ModeMarkdown,
+		)
+
+	case args == "":
+		sendMessage(a.bot, message.Chat.ID,
+			lang.Translate("commands.noArgsModel", conf.Lang),
+			tgbotapi.ModeMarkdown,
+		)
+
+	case strings.ContainsAny(args, " \t"):
+		sendMessage(a.bot, message.Chat.ID,
+			lang.Translate("commands.noSpaceModel", conf.Lang),
+			tgbotapi.ModeMarkdown,
+		)
+
+	default:
+		a.manager.SetModel(args)
+		log.Printf("Model changed to %s in chat %d", args, message.Chat.ID)
+		sendMessage(a.bot, message.Chat.ID,
+			lang.Translate("commands.setModel", conf.Lang)+" `"+args+"`",
+			tgbotapi.ModeMarkdown,
+		)
+	}
+}
+
+func (a *app) handleReset(message *tgbotapi.Message, conf *config.Config, tracker *user.UsageTracker) {
+	args := strings.TrimSpace(message.CommandArguments())
+
+	tracker.ClearHistory()
+
+	switch {
+	case args == "":
+		sendMessage(a.bot, message.Chat.ID, lang.Translate("commands.reset", conf.Lang), "HTML")
+
+	case strings.EqualFold(args, "system"):
+		tracker.SetSystemPrompt(conf.SystemPrompt)
+		sendMessage(a.bot, message.Chat.ID, lang.Translate("commands.reset_system", conf.Lang), "HTML")
+
+	default:
+		tracker.SetSystemPrompt(args)
+		sendMessage(a.bot, message.Chat.ID,
+			lang.Translate("commands.reset_prompt", conf.Lang)+escapeHTML(args)+".",
+			"HTML",
+		)
+	}
+}
+
+func (a *app) handleStats(message *tgbotapi.Message, conf *config.Config, tracker *user.UsageTracker) {
+	tracker.CheckHistory(conf.MaxHistorySize, conf.MaxHistoryTime)
+
+	countedUsage := formatMoney(tracker.GetCurrentCost(conf.BudgetPeriod))
+	todayUsage := formatMoney(tracker.GetCurrentCost("daily"))
+	monthUsage := formatMoney(tracker.GetCurrentCost("monthly"))
+	totalUsage := formatMoney(tracker.GetCurrentCost("total"))
+	messagesCount := strconv.Itoa(len(tracker.GetMessages()))
+
+	var statsMessage string
+	if tracker.CanViewStats(conf) {
+		statsMessage = fmt.Sprintf(
+			lang.Translate("commands.stats", conf.Lang),
+			countedUsage, todayUsage, monthUsage, totalUsage, messagesCount,
+		)
 	} else {
+		statsMessage = fmt.Sprintf(
+			lang.Translate("commands.stats_min", conf.Lang),
+			messagesCount,
+		)
+	}
 
-		msg := tgbotapi.NewMessage(
-			update.Message.Chat.ID,
-			lang.Translate(
-				"budget_out",
-				conf.Lang,
-			),
+	sendMessage(a.bot, message.Chat.ID, statsMessage, "HTML")
+}
+
+func (a *app) handleTranslateReply(message *tgbotapi.Message, conf *config.Config) {
+	if message.ReplyToMessage == nil {
+		sendMessage(a.bot, message.Chat.ID,
+			"❌ Reply to a message and use:\n\n/tr hi\n/tr en\n/tr ru", "")
+		return
+	}
+
+	targetLanguage := strings.TrimSpace(message.CommandArguments())
+	if targetLanguage == "" {
+		targetLanguage = "English"
+	}
+
+	sourceText := strings.TrimSpace(messageText(message.ReplyToMessage))
+	if sourceText == "" {
+		sendMessage(a.bot, message.Chat.ID, "❌ The replied message doesn't contain text.", "")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(a.ctx, translationTimout)
+	defer cancel()
+
+	translated, err := translator.Translate(ctx, a.client, sourceText, targetLanguage, conf.Model.ModelName)
+	if err != nil {
+		log.Printf("Translation error: %v", err)
+		sendMessage(a.bot, message.Chat.ID, "❌ Translation failed. Please try again.", "")
+		return
+	}
+
+	sendMessage(a.bot, message.Chat.ID,
+		"🌐 <b>Translation</b>\n\n"+escapeHTML(translated),
+		"HTML",
+	)
+}
+
+func (a *app) handleTranslateSettings(message *tgbotapi.Message, conf *config.Config) {
+	if !isGroupChat(message.Chat) {
+		sendMessage(a.bot, message.Chat.ID, "❌ This command can only be used in a group.", "")
+		return
+	}
+
+	chatID := message.Chat.ID
+	args := strings.TrimSpace(message.CommandArguments())
+
+	switch strings.ToLower(args) {
+
+	case "on":
+		if err := a.translations.SetEnabled(chatID, true); err != nil {
+			log.Printf("Failed to enable translation: %v", err)
+			sendMessage(a.bot, chatID, "❌ Failed to save translation settings.", "")
+			return
+		}
+		settings := a.translations.Get(chatID)
+		sendMessage(a.bot, chatID, fmt.Sprintf(
+			"🌐 <b>Auto Translation Enabled</b>\n\n"+
+				"Target language: <b>%s</b>\n\n"+
+				"New group messages will now be translated automatically.",
+			escapeHTML(settings.TargetLanguage),
+		), "HTML")
+
+	case "off":
+		if err := a.translations.SetEnabled(chatID, false); err != nil {
+			log.Printf("Failed to disable translation: %v", err)
+			sendMessage(a.bot, chatID, "❌ Failed to save translation settings.", "")
+			return
+		}
+		sendMessage(a.bot, chatID, "🌐 Auto translation disabled.", "")
+
+	case "status":
+		settings := a.translations.Get(chatID)
+		status := "🔴 Disabled"
+		if settings.Enabled {
+			status = "🟢 Enabled"
+		}
+		sendMessage(a.bot, chatID, fmt.Sprintf(
+			"🌐 <b>Translation Status</b>\n\n"+
+				"Status: %s\n"+
+				"Language: <b>%s</b>\n"+
+				"Mode: Automatic",
+			status,
+			escapeHTML(settings.TargetLanguage),
+		), "HTML")
+
+	case "":
+		sendMessage(a.bot, chatID,
+			"🌐 <b>Group Translation</b>\n\n"+
+				"/translate on — Enable\n"+
+				"/translate off — Disable\n"+
+				"/translate hi — Set Hindi and enable\n"+
+				"/translate en — Set English and enable\n"+
+				"/translate status — Show settings",
+			"HTML",
 		)
 
+	default:
+		if err := a.translations.SetLanguage(chatID, args); err != nil {
+			log.Printf("Failed to set translation language: %v", err)
+			sendMessage(a.bot, chatID, "❌ Failed to save translation language.", "")
+			return
+		}
+		if err := a.translations.SetEnabled(chatID, true); err != nil {
+			log.Printf("Failed to enable translation: %v", err)
+			sendMessage(a.bot, chatID, "❌ Language was saved, but translation could not be enabled.", "")
+			return
+		}
+		settings := a.translations.Get(chatID)
+		sendMessage(a.bot, chatID, fmt.Sprintf(
+			"🌐 <b>Auto Translation Enabled</b>\n\n"+
+				"Target language: <b>%s</b>\n\n"+
+				"You don't need to specify the language again.",
+			escapeHTML(settings.TargetLanguage),
+		), "HTML")
+	}
+}
+
+func (a *app) setCommands(conf *config.Config) {
+	commands := []tgbotapi.BotCommand{
+		{Command: "start", Description: lang.Translate("description.start", conf.Lang)},
+		{Command: "help", Description: lang.Translate("description.help", conf.Lang)},
+		{Command: "get_models", Description: lang.Translate("description.getModels", conf.Lang)},
+		{Command: "set_model", Description: lang.Translate("description.setModel", conf.Lang)},
+		{Command: "reset", Description: lang.Translate("description.reset", conf.Lang)},
+		{Command: "stats", Description: lang.Translate("description.stats", conf.Lang)},
+		{Command: "stop", Description: lang.Translate("description.stop", conf.Lang)},
+		{Command: "about", Description: "About this bot"},
+		{Command: "tr", Description: "Translate a replied message"},
+		{Command: "translate", Description: "Manage group auto translation"},
+	}
+
+	if _, err := a.bot.Request(tgbotapi.NewSetMyCommands(commands...)); err != nil {
+		log.Printf("Warning: failed to set bot commands: %v", err)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// HEALTH SERVER
+// -----------------------------------------------------------------------------
+
+func (a *app) startHealthServer() *http.Server {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "10000"
+	}
+
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OpenRouter Telegram Bot is running"))
+	})
+
+	// /healthz reports real readiness: it fails until the bot is polling and
+	// returns 503 once the process is shutting down.
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		if !a.ready.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("starting"))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
+
+	server := &http.Server{
+		Addr:              "0.0.0.0:" + port,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	go func() {
+		log.Printf("HTTP server listening on %s", server.Addr)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			// Never Fatalf from a goroutine: it would kill the bot because a
+			// port happened to be busy.
+			a.ready.Store(false)
+			log.Printf("HTTP server failed: %v", err)
+		}
+	}()
+
+	return server
+}
+
+// -----------------------------------------------------------------------------
+// HELPERS
+// -----------------------------------------------------------------------------
+
+// sendMessage sends text, splitting it into Telegram sized chunks and
+// retrying without formatting if the parse mode is rejected.
+func sendMessage(bot *tgbotapi.BotAPI, chatID int64, text string, parseMode string) error {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+
+	for _, chunk := range api.SplitMessage(text, config.ChunkLimit, 0) {
+		if parseMode != "" {
+			msg := tgbotapi.NewMessage(chatID, chunk)
+			msg.ParseMode = parseMode
+
+			_, err := bot.Send(msg)
+			if err == nil {
+				continue
+			}
+
+			// Telegram rejects the whole message when it cannot parse the
+			// markup, so retry this chunk without formatting rather than
+			// losing it.
+			log.Printf("Sending chunk with parse mode %q failed, retrying as plain text: %v", parseMode, err)
+		}
+
+		msg := tgbotapi.NewMessage(chatID, chunk)
 		if _, err := bot.Send(msg); err != nil {
-			log.Println(err)
+			log.Printf("Failed to send message to chat %d: %v", chatID, err)
+			return err
 		}
 	}
 
-}(userStats)
+	return nil
+}
+
+func senderInfo(message *tgbotapi.Message) (int64, string) {
+	if message.From != nil {
+		return message.From.ID, message.From.UserName
 	}
+	if message.SenderChat != nil {
+		return message.SenderChat.ID, message.SenderChat.UserName
+	}
+
+	return 0, ""
+}
+
+// messageText returns the text or, for media messages, the caption.
+func messageText(message *tgbotapi.Message) string {
+	if message == nil {
+		return ""
+	}
+	if message.Text != "" {
+		return message.Text
+	}
+
+	return message.Caption
+}
+
+func isGroupChat(chat *tgbotapi.Chat) bool {
+	return chat != nil && (chat.Type == "group" || chat.Type == "supergroup")
+}
+
+func formatMoney(value float64) string {
+	return strconv.FormatFloat(value, 'f', 6, 64)
+}
+
+// escapeHTML escapes user and model supplied text before it is embedded in an
+// HTML formatted Telegram message.
+func escapeHTML(text string) string {
+	replacer := strings.NewReplacer(
+		"&", "&amp;",
+		"<", "&lt;",
+		">", "&gt;",
+	)
+
+	return replacer.Replace(text)
 }

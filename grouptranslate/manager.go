@@ -1,13 +1,26 @@
+// Package grouptranslate stores per-group automatic translation settings.
 package grouptranslate
 
 import (
 	"encoding/json"
+	"errors"
+	"log"
 	"os"
+	"strings"
 	"sync"
+
+	"openrouter-bot/internal/atomicfile"
 )
 
+// DefaultLanguage is used when a group has no language configured.
+const DefaultLanguage = "English"
+
+// maxLanguageLength guards against someone setting a language to a wall of
+// text with /translate <anything>.
+const maxLanguageLength = 32
+
 type Settings struct {
-	Enabled       bool   `json:"enabled"`
+	Enabled        bool   `json:"enabled"`
 	TargetLanguage string `json:"target_language"`
 }
 
@@ -23,7 +36,9 @@ func NewManager(filePath string) *Manager {
 		groups:   make(map[int64]Settings),
 	}
 
-	_ = m.load()
+	if err := m.load(); err != nil {
+		log.Printf("Could not load translation settings from %s: %v", filePath, err)
+	}
 
 	return m
 }
@@ -37,26 +52,36 @@ func (m *Manager) load() error {
 		return err
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	var groups map[int64]Settings
+	if err := json.Unmarshal(data, &groups); err != nil {
+		return err
+	}
+	if groups == nil {
+		groups = make(map[int64]Settings)
+	}
 
-	return json.Unmarshal(data, &m.groups)
+	m.mu.Lock()
+	m.groups = groups
+	m.mu.Unlock()
+
+	log.Printf("Loaded translation settings for %d group(s) from %s", len(groups), m.filePath)
+
+	return nil
 }
 
-func (m *Manager) save() error {
-	m.mu.RLock()
+// saveLocked writes the settings while the write lock is held.
+//
+// Serialising the whole marshal-and-write cycle is what makes concurrent
+// updates safe: releasing the lock in between lets two writers interleave,
+// and the write that finishes last wins even when it started first, silently
+// discarding another group's settings.
+func (m *Manager) saveLocked() error {
 	data, err := json.MarshalIndent(m.groups, "", "  ")
-	m.mu.RUnlock()
-
 	if err != nil {
 		return err
 	}
 
-	if err := os.MkdirAll("data", 0755); err != nil {
-		return err
-	}
-
-	return os.WriteFile(m.filePath, data, 0644)
+	return atomicfile.Write(m.filePath, data, 0o644)
 }
 
 func (m *Manager) Get(chatID int64) Settings {
@@ -64,12 +89,15 @@ func (m *Manager) Get(chatID int64) Settings {
 	defer m.mu.RUnlock()
 
 	settings, exists := m.groups[chatID]
-
 	if !exists {
 		return Settings{
 			Enabled:        false,
-			TargetLanguage: "English",
+			TargetLanguage: DefaultLanguage,
 		}
+	}
+
+	if strings.TrimSpace(settings.TargetLanguage) == "" {
+		settings.TargetLanguage = DefaultLanguage
 	}
 
 	return settings
@@ -77,32 +105,33 @@ func (m *Manager) Get(chatID int64) Settings {
 
 func (m *Manager) SetEnabled(chatID int64, enabled bool) error {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	settings := m.groups[chatID]
 	settings.Enabled = enabled
-
-	if settings.TargetLanguage == "" {
-		settings.TargetLanguage = "English"
+	if strings.TrimSpace(settings.TargetLanguage) == "" {
+		settings.TargetLanguage = DefaultLanguage
 	}
-
 	m.groups[chatID] = settings
-	m.mu.Unlock()
 
-	return m.save()
+	return m.saveLocked()
 }
 
 func (m *Manager) SetLanguage(chatID int64, language string) error {
+	language = strings.TrimSpace(language)
+	if language == "" {
+		return errors.New("language must not be empty")
+	}
+	if len(language) > maxLanguageLength {
+		return errors.New("language name is too long")
+	}
+
 	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	settings := m.groups[chatID]
 	settings.TargetLanguage = language
-
-	if settings.TargetLanguage == "" {
-		settings.TargetLanguage = "English"
-	}
-
 	m.groups[chatID] = settings
-	m.mu.Unlock()
 
-	return m.save()
+	return m.saveLocked()
 }

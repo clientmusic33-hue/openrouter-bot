@@ -1,8 +1,46 @@
 # Deployment
 replicaCount: 1
+
 image:
-  img: "lifailon/openrouter-bot"
+  repository: openrouter-bot
   tag: "latest"
+  pullPolicy: IfNotPresent
+
+# ---------------------------------------------------------------------------
+# Secrets - rendered into a Kubernetes Secret, never a ConfigMap.
+# Prefer supplying these with --set or an external secret manager instead of
+# committing real values here.
+# ---------------------------------------------------------------------------
+secrets:
+  API_KEY: "sk-or-v1-XXX"
+  TELEGRAM_BOT_TOKEN: "7777777777:XXX"
+
+# ---------------------------------------------------------------------------
+# Non-sensitive configuration - rendered into a ConfigMap.
+# ---------------------------------------------------------------------------
+config:
+  ADMIN_IDS: "7777777777"
+  ALLOWED_USER_IDS: "7777777777,8888888888"
+  BASE_URL: https://openrouter.ai/api/v1
+  MODEL: deepseek/deepseek-r1:free
+  VISION: "false"
+  MAX_HISTORY_SIZE: "20"
+  MAX_HISTORY_TIME: "60"
+  MAX_TOKENS: "2000"
+  USER_BUDGET: "1"
+  GUEST_BUDGET: "0"
+  BUDGET_PERIOD: monthly
+  LANG: EN
+  STATS_MIN_ROLE: ADMIN
+  GROUP_CHAT_MODE: mention
+  RATE_LIMIT_PER_MINUTE: "10"
+  MAX_CONCURRENT_REQUESTS: "8"
+  REQUEST_TIMEOUT_SECONDS: "300"
+  STREAM_IDLE_TIMEOUT_SECONDS: "120"
+
+# Optional Gemini fallback key. Leave empty to disable the fallback.
+geminiApiKey: ""
+
 resources:
   requests:
     cpu: "100m"
@@ -10,28 +48,19 @@ resources:
   limits:
     cpu: "200m"
     memory: "256Mi"
-readinessProbe:
-  enabled: true
-livenessProbe:
-  enabled: true
-probeSettings:
-  exec:
-    command: ["pgrep", "-f", "openrouter-bot"]
-  initialDelaySeconds: 5
-  periodSeconds: 10
-  timeoutSeconds: 3
+
+# Probes now hit the real /healthz endpoint instead of pgrep-ing the process.
+probes:
+  path: /healthz
+  port: 10000
+  initialDelaySeconds: 10
+  periodSeconds: 30
+  timeoutSeconds: 5
   failureThreshold: 3
 
-# configMap for env
-API_KEY: "sk-or-v1-XXX"
-TELEGRAM_BOT_TOKEN: "7777777777:XXX"
-ADMIN_IDS: "7777777777"
-ALLOWED_USER_IDS: "7777777777,8888888888"
-BASE_URL: https://openrouter.ai/api/v1
-MODEL: deepseek/deepseek-r1:free
-VISION: false
-MAX_HISTORY_SIZE: 20
-MAX_HISTORY_TIME: 60
-GUEST_BUDGET: 0
-LANG: RU
-STATS_MIN_ROLE: ADMIN
+# Persist group translation settings and usage logs.
+persistence:
+  enabled: false
+  size: 1Gi
+  storageClassName: ""
+  mountPath: /openrouter-bot/data

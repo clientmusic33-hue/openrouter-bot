@@ -1,46 +1,83 @@
+# ---------------------------------------------------------------------------
+# This file supplies defaults. Anything set as a real environment variable
+# (or in .env) takes precedence over the values here.
+# ---------------------------------------------------------------------------
+
+# Backend type. "openrouter" enables generation cost accounting.
+type: openrouter
+
+# Model configuration
+model: deepseek/deepseek-r1:free
+base_url: https://openrouter.ai/api/v1
+temperature: 0.7
+top_p: 0.7
+frequency_penalty: 0
+presence_penalty: 0
+
+# Response configuration
+max_tokens: 2000
+
+# ---------------------------------------------------------------------------
+# Access control
+# ---------------------------------------------------------------------------
+
 # Telegram user ID of admins, or empty to assign no admin
 admin_ids: ""
 
-# Allowed USER IDs
+# Allowed USER IDs. Leave empty to treat everyone as USER.
 allowed_user_ids: ""
 
-# Budget configuration
+# Budget configuration, in USD per budget_period
 user_budget: 1
-guest_budget: 0.5
+guest_budget: 0
 
 # Budget period: daily, monthly, total
 budget_period: monthly
 
-# Language to use for the bot
-# Supported: EN, RU
+# ---------------------------------------------------------------------------
+# Behaviour
+# ---------------------------------------------------------------------------
+
+# Language to use for the bot (supported: EN, RU)
 lang: EN
 
-# Minimum role to show stats
-# Supported: ADMIN, USER, GUEST
+# Minimum role to show stats (ADMIN, USER, GUEST)
 stats_min_role: ADMIN
 
-# Token price
-token_price: 0.002
+# How the bot behaves in group chats:
+#   mention - answer only when mentioned or replied to
+#   all     - answer every group message
+#   off     - never answer in groups
+group_chat_mode: mention
 
-# Model configuration
-type: openrouter
-model: openrouter/free
-base_url: https://openrouter.ai/api/v1
-temperature: 0.7
-top_p: 0.7
+# Max AI requests per user per minute (0 disables rate limiting)
+rate_limit_per_minute: 10
 
-# Response configuration
-max_tokens: 1000
+# Max AI requests running at the same time
+max_concurrent_requests: 8
 
+# Total timeout for one request, including streaming (seconds)
+request_timeout_seconds: 300
+
+# Abort a stream that delivers nothing for this long (seconds)
+stream_idle_timeout_seconds: 120
+
+# ---------------------------------------------------------------------------
 # Conversation history
-max_history_size: 10
+# ---------------------------------------------------------------------------
 
-# Assistant configuration
+max_history_size: 10
+max_history_time: 60
+
+# ---------------------------------------------------------------------------
+# Prompts and vision
+# ---------------------------------------------------------------------------
+
 assistant_prompt: |
   Read the entire conversation history line by line before answering.
   You are Assistant.
 
-# Vision settings
-vision: true
+# Vision is off by default: enabling it sends user images to the model.
+vision: false
 vision_prompt: Describe the image
 vision_detail: low

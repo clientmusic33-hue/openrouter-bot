@@ -1,3 +1,8 @@
+// Package lang provides a minimal, thread-safe translation store.
+//
+// Translation files are plain JSON documents named after the language they
+// contain, for example EN.json or RU.json. A language is therefore added by
+// dropping a new file into the directory - no code change is required.
 package lang
 
 import (
@@ -5,61 +10,171 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 )
 
-var translations map[string]map[string]interface{}
+// DefaultLanguage is used whenever the requested language is unknown or empty.
+const DefaultLanguage = "EN"
 
-func LoadTranslations(langDir string) error {
+var (
+	// mu guards translations. The map is replaced wholesale when translations
+	// are reloaded, so readers must never observe a partially built map.
+	mu           sync.RWMutex
 	translations = make(map[string]map[string]interface{})
+)
 
-	languages := []string{"EN", "RU"}
+// LoadTranslations reads every *.json file in langDir and atomically replaces
+// the active translation set. It is safe to call concurrently with Translate
+// and safe to call more than once.
+func LoadTranslations(langDir string) error {
+	entries, err := os.ReadDir(langDir)
+	if err != nil {
+		return err
+	}
 
-	for _, lang := range languages {
-		filePath := filepath.Join(langDir, lang+".json")
-		data, err := os.ReadFile(filePath)
+	loaded := make(map[string]map[string]interface{})
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".json") {
+			continue
+		}
+
+		code := Normalize(strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name())))
+		if code == "" {
+			continue
+		}
+
+		data, err := os.ReadFile(filepath.Join(langDir, entry.Name()))
 		if err != nil {
 			return err
 		}
 
-		var langMap map[string]interface{}
-		err = json.Unmarshal(data, &langMap)
-		if err != nil {
+		var parsed map[string]interface{}
+		if err := json.Unmarshal(data, &parsed); err != nil {
 			return err
 		}
 
-		translations[lang] = langMap
+		loaded[code] = parsed
 	}
 
-	for _, lang := range languages {
-		filePath := filepath.Join(langDir, lang+".json")
-		log.Printf("Loading translations from: %s", filePath)
+	if len(loaded) == 0 {
+		return &NoTranslationsError{Dir: langDir}
 	}
 
-	//log.Printf("Loaded translations: %+v", translations)
+	mu.Lock()
+	translations = loaded
+	mu.Unlock()
+
+	codes := Languages()
+	sort.Strings(codes)
+	log.Printf("Loaded %d translation file(s) from %s: %v", len(codes), langDir, codes)
+
 	return nil
 }
 
-func Translate(key string, lang string) string {
-	//log.Printf("Translating key: %s, language: %s", key, lang)
-	if translations == nil {
-		log.Println("Translations not loaded. Did you call LoadTranslations?")
-		return key
-	}
-	keys := strings.Split(key, ".")
-	value := interface{}(translations[lang])
+// Normalize turns arbitrary user or configuration input ("en", " en ", "EN")
+// into the canonical upper-case language code used as a map key.
+func Normalize(language string) string {
+	return strings.ToUpper(strings.TrimSpace(language))
+}
 
-	for _, k := range keys {
-		if m, ok := value.(map[string]interface{}); ok {
-			value = m[k]
-		} else {
-			return key
+// Languages returns the sorted list of currently available language codes.
+func Languages() []string {
+	mu.RLock()
+	defer mu.RUnlock()
+
+	codes := make([]string, 0, len(translations))
+	for code := range translations {
+		codes = append(codes, code)
+	}
+	sort.Strings(codes)
+
+	return codes
+}
+
+// Translate resolves a dotted key such as "commands.start" for the given
+// language.
+//
+// Resolution order:
+//
+//  1. the requested language (normalised to upper case)
+//  2. the default language
+//  3. any available language
+//  4. the key itself, so a missing translation is visible rather than silent
+func Translate(key string, language string) string {
+	mu.RLock()
+	defer mu.RUnlock()
+
+	for _, code := range candidates(language) {
+		if value, ok := lookup(code, key); ok {
+			return value
 		}
 	}
 
-	if str, ok := value.(string); ok {
-		return str
+	return key
+}
+
+// Has reports whether a key exists for the given language.
+func Has(key string, language string) bool {
+	mu.RLock()
+	defer mu.RUnlock()
+
+	_, ok := lookup(Normalize(language), key)
+
+	return ok
+}
+
+// candidates returns the languages to try, in priority order.
+func candidates(language string) []string {
+	requested := Normalize(language)
+
+	order := make([]string, 0, len(translations)+1)
+	if requested != "" {
+		order = append(order, requested)
+	}
+	if requested != DefaultLanguage {
+		order = append(order, DefaultLanguage)
+	}
+	for _, code := range Languages() {
+		if code != requested && code != DefaultLanguage {
+			order = append(order, code)
+		}
 	}
 
-	return key
+	return order
+}
+
+func lookup(language, key string) (string, bool) {
+	bundle, ok := translations[language]
+	if !ok {
+		return "", false
+	}
+
+	var value interface{} = bundle
+	for _, part := range strings.Split(key, ".") {
+		node, ok := value.(map[string]interface{})
+		if !ok {
+			return "", false
+		}
+		value, ok = node[part]
+		if !ok {
+			return "", false
+		}
+	}
+
+	str, ok := value.(string)
+
+	return str, ok
+}
+
+// NoTranslationsError is returned when a translation directory contains no
+// usable JSON files.
+type NoTranslationsError struct {
+	Dir string
+}
+
+func (e *NoTranslationsError) Error() string {
+	return "no translation files found in " + e.Dir
 }

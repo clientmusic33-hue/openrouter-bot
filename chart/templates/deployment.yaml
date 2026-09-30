@@ -4,6 +4,7 @@ metadata:
   name: {{ .Release.Name }}
   labels:
     app: {{ .Release.Name }}
+
 spec:
   replicas: {{ .Values.replicaCount }}
   selector:
@@ -16,53 +17,72 @@ spec:
       labels:
         app: {{ .Release.Name }}
     spec:
+      {{- if gt (int .Values.replicaCount) 1 }}
       affinity:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
-          - labelSelector:
-              matchExpressions:
-              - key: app
-                operator: In
-                values: [openrouter-bot]
-            topologyKey: "kubernetes.io/hostname"
-      terminationGracePeriodSeconds: 30
+            # Must match this release's pod label, otherwise the rule never
+            # selects anything and the anti-affinity silently does nothing.
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values: ["{{ .Release.Name }}"]
+              topologyKey: "kubernetes.io/hostname"
+      {{- end }}
+      terminationGracePeriodSeconds: 40
       containers:
-      - image: {{ .Values.image.img }}:{{ .Values.image.tag }}
-        name: {{ .Release.Name }}
-        imagePullPolicy: IfNotPresent
-        resources:
-          requests:
-            cpu: "{{ .Values.resources.requests.cpu | default "100m" }}"
-            memory: "{{ .Values.resources.requests.memory | default "128Mi" }}"
-          limits:
-            cpu: "{{ .Values.resources.limits.cpu | default "200m" }}"
-            memory: "{{ .Values.resources.limits.memory | default "256Mi" }}"
-        {{- if .Values.readinessProbe.enabled }}
-        readinessProbe:
-          exec:
-            command: {{ .Values.probeSettings.exec.command | toJson }}
-          initialDelaySeconds: {{ .Values.probeSettings.initialDelaySeconds }}
-          periodSeconds: {{ .Values.probeSettings.periodSeconds }}
-          timeoutSeconds: {{ .Values.probeSettings.timeoutSeconds }}
-          failureThreshold: {{ .Values.probeSettings.failureThreshold }}
-        {{- end }}
-        {{- if .Values.livenessProbe.enabled }}
-        livenessProbe:
-          exec:
-            command: {{ .Values.probeSettings.exec.command | toJson }}
-          initialDelaySeconds: {{ .Values.probeSettings.initialDelaySeconds }}
-          periodSeconds: {{ .Values.probeSettings.periodSeconds }}
-          timeoutSeconds: {{ .Values.probeSettings.timeoutSeconds }}
-          failureThreshold: {{ .Values.probeSettings.failureThreshold }}
-        {{- end }}
-        volumeMounts:
-        - name: config-volume
-          mountPath: /openrouter-bot/.env
-          subPath: .env
+        - name: {{ .Release.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+
+          # Configuration is injected as real environment variables, so no
+          # .env file has to be mounted.
+          envFrom:
+            - configMapRef:
+                name: {{ .Release.Name }}-config
+            - secretRef:
+                name: {{ .Release.Name }}-secrets
+
+          ports:
+            - name: http
+              containerPort: {{ .Values.probes.port }}
+
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.failureThreshold }}
+
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.failureThreshold }}
+
+          resources:
+            requests:
+              cpu: {{ .Values.resources.requests.cpu | quote }}
+              memory: {{ .Values.resources.requests.memory | quote }}
+            limits:
+              cpu: {{ .Values.resources.limits.cpu | quote }}
+              memory: {{ .Values.resources.limits.memory | quote }}
+
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath }}
+
       volumes:
-      - name: config-volume
-        configMap:
-          name: {{ .Release.Name }}-config
-          items:
-          - key: .env
-            path: .env
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Release.Name }}-data
+          {{- else }}
+          emptyDir: {}
+          {{- end }}

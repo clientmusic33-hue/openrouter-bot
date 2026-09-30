@@ -57,6 +57,12 @@ jobs:
         with:
           go-version: 1.25
 
+      - name: Vet and test
+        if: ${{ github.event.inputs.Binary == 'true' }}
+        run: |
+          go vet ./...
+          go test ./...
+
       - name: Build binaries
         if: ${{ github.event.inputs.Binary == 'true' }}
         run: |

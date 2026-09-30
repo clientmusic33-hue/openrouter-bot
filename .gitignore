@@ -1,10 +1,13 @@
 # dev config
 .env
+!.env.example
 
-# logs
-logs
+# runtime state
+logs/
+data/
 
 # bin
 openrouter-bot
+bin/
 *debug*
 *.exe

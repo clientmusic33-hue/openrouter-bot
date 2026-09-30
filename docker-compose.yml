@@ -1,10 +1,23 @@
 services:
-  OpenRouter-Bot:
-    container_name: OpenRouter-Bot
-    image: lifailon/openrouter-bot:latest
+  openrouter-bot:
+    container_name: openrouter-bot
+    # Build locally instead of pulling someone else's image.
     build:
       context: .
       dockerfile: Dockerfile
-    volumes:
-      - .env:/openrouter-bot/.env
+    image: openrouter-bot:local
     restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persist group translation settings and usage logs.
+      - ./data:/openrouter-bot/data
+      - ./logs:/openrouter-bot/logs
+    ports:
+      - "10000:10000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:10000/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

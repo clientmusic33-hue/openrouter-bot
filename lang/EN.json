@@ -26,6 +26,7 @@
     "stop": "Stop the current request"
   },
   "budget_out": "You have no budget or you have exhausted it.",
+  "rate_limit": "⏳ Too many requests. Please wait a moment and try again.",
   "loadText": "Processing request",
   "errorText": "Error processing request"
 }
