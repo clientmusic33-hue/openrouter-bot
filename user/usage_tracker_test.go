@@ -208,10 +208,10 @@ func TestGetUsageFromApiIgnoresEmptyID(t *testing.T) {
 	tracker := newTracker(t, "1", conf)
 
 	// An empty id must be a no-op, not an HTTP request that 400s.
-	if err := tracker.GetUsageFromApi("", conf); err != nil {
+	if err := tracker.GetUsageFromApi("", "", ""); err != nil {
 		t.Errorf("empty id should be ignored, got %v", err)
 	}
-	if err := tracker.GetUsageFromApi("   ", conf); err != nil {
+	if err := tracker.GetUsageFromApi("   ", "", ""); err != nil {
 		t.Errorf("blank id should be ignored, got %v", err)
 	}
 }

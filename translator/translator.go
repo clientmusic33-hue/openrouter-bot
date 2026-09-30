@@ -1,11 +1,14 @@
 // Package translator turns free-form text into another language using the
-// configured chat model.
+// provider chain, so a translation survives the same outages an answer does.
 package translator
 
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
+
+	"openrouter-bot/provider"
 
 	"github.com/sashabaranov/go-openai"
 )
@@ -16,17 +19,18 @@ const maxOutputTokens = 2000
 
 // Translate translates text into the requested target language.
 //
-// The caller owns ctx and should bound it with a timeout - a translation is a
+// It walks the provider chain exactly like a chat answer: if a model fails the
+// next model is tried, and if a provider fails the next provider is tried. The
+// caller owns ctx and should bound it with a timeout - a translation is a
 // normal network request and can otherwise hang forever.
 func Translate(
 	ctx context.Context,
-	client *openai.Client,
+	chain *provider.Chain,
 	text string,
 	targetLanguage string,
-	model string,
 ) (string, error) {
-	if client == nil {
-		return "", fmt.Errorf("no AI client configured")
+	if chain == nil {
+		return "", fmt.Errorf("no AI provider chain configured")
 	}
 
 	if strings.TrimSpace(text) == "" {
@@ -38,7 +42,66 @@ func Translate(
 		return "", fmt.Errorf("target language is empty")
 	}
 
-	prompt := fmt.Sprintf(
+	req := openai.ChatCompletionRequest{
+		Messages: []openai.ChatCompletionMessage{
+			{
+				Role:    openai.ChatMessageRoleSystem,
+				Content: "You are a translation-only assistant.",
+			},
+			{
+				Role:    openai.ChatMessageRoleUser,
+				Content: buildPrompt(text, targetLanguage),
+			},
+		},
+		Temperature: 0,
+		MaxTokens:   maxOutputTokens,
+	}
+
+	candidates := chain.CandidatesFor(provider.Preference{Auto: true}, nil)
+	if len(candidates) == 0 {
+		return "", fmt.Errorf("no usable models in the provider chain")
+	}
+
+	var lastErr error
+
+	for _, candidate := range candidates {
+		resp, err := candidate.Complete(ctx, req)
+		if err != nil {
+			lastErr = err
+			chain.RecordFailure(candidate.Provider, err)
+
+			log.Printf(
+				"Translation attempt failed | provider=%s model=%s error=%v",
+				candidate.Provider, candidate.Model, err,
+			)
+
+			// A cancelled or expired context will not succeed anywhere else.
+			if ctx.Err() != nil {
+				return "", fmt.Errorf("translation request failed: %w", err)
+			}
+
+			continue
+		}
+
+		if len(resp.Choices) == 0 {
+			lastErr = fmt.Errorf("translation returned no response")
+			chain.RecordFailure(candidate.Provider, lastErr)
+
+			continue
+		}
+
+		chain.RecordSuccess(candidate.Provider)
+
+		return strings.TrimSpace(resp.Choices[0].Message.Content), nil
+	}
+
+	return "", fmt.Errorf("translation request failed: %w", lastErr)
+}
+
+// buildPrompt keeps the model on a short leash: it must translate and nothing
+// else.
+func buildPrompt(text, targetLanguage string) string {
+	return fmt.Sprintf(
 		"Translate the following text to %s.\n\n"+
 			"Rules:\n"+
 			"- Return only the translation.\n"+
@@ -51,37 +114,4 @@ func Translate(
 		targetLanguage,
 		text,
 	)
-
-	resp, err := client.CreateChatCompletion(
-		ctx,
-		openai.ChatCompletionRequest{
-			Model: model,
-			Messages: []openai.ChatCompletionMessage{
-				{
-					Role:    openai.ChatMessageRoleSystem,
-					Content: "You are a translation-only assistant.",
-				},
-				{
-					Role:    openai.ChatMessageRoleUser,
-					Content: prompt,
-				},
-			},
-			Temperature: 0,
-			MaxTokens:   maxOutputTokens,
-		},
-	)
-	if err != nil {
-		return "", fmt.Errorf("translation request failed: %w", err)
-	}
-
-	if len(resp.Choices) == 0 {
-		return "", fmt.Errorf("translation returned no response")
-	}
-
-	result := strings.TrimSpace(resp.Choices[0].Message.Content)
-	if result == "" {
-		return "", fmt.Errorf("translation returned empty response")
-	}
-
-	return result, nil
 }

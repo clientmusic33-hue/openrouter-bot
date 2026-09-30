@@ -14,6 +14,11 @@ image:
 secrets:
   API_KEY: "sk-or-v1-XXX"
   TELEGRAM_BOT_TOKEN: "7777777777:XXX"
+  # Every extra provider key joins the failover chain automatically.
+  GROQ_API_KEY: ""
+  GEMINI_API_KEY: ""
+  CEREBRAS_API_KEY: ""
+  NVIDIA_API_KEY: ""
 
 # ---------------------------------------------------------------------------
 # Non-sensitive configuration - rendered into a ConfigMap.
@@ -37,9 +42,12 @@ config:
   MAX_CONCURRENT_REQUESTS: "8"
   REQUEST_TIMEOUT_SECONDS: "300"
   STREAM_IDLE_TIMEOUT_SECONDS: "120"
-
-# Optional Gemini fallback key. Leave empty to disable the fallback.
-geminiApiKey: ""
+  MAX_REPLY_CHARS: "3500"
+  RENDER_MARKDOWN: "false"
+  SUGGEST_MODELS: "true"
+  GROUP_ACCESS: everyone
+  # true = no budgets, no rate limiting, answers every group message
+  PUBLIC_MODE: "false"
 
 resources:
   requests:

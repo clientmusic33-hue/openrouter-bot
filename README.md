@@ -14,7 +14,7 @@
 This project allows you to launch your Telegram bot in a few minutes to communicate with free and paid AI models via [OpenRouter](https://openrouter.ai), or local LLMs, for example, via [LM Studio](https://lmstudio.ai).
 
 > [!NOTE]
-> This repository is a fork of the [openrouter-gpt-telegram-bot](https://github.com/deinfinite/openrouter-gpt-telegram-bot) project, which adds new features (such as switch current model, group translation, Gemini fallback and `Markdown` formatting in bot responses) and optimizes the container startup process.
+> This repository is a fork of the [openrouter-gpt-telegram-bot](https://github.com/deinfinite/openrouter-gpt-telegram-bot) project. It grew into a button-first assistant: pick a provider and a model from inline menus, let the bot route automatically when it knows your usage, and let the failover chain answer from the next backend when one is down.
 
 <details>
     <summary>Example</summary>
@@ -28,12 +28,19 @@ This project allows you to launch your Telegram bot in a few minutes to communic
 
 | Feature | Notes |
 |---|---|
-| Streaming responses | Tokens are edited into the message as they arrive |
-| Gemini fallback | Switches provider on rate limits or 5xx, at start **and** mid-stream |
+| Streaming responses | Tokens are edited into the message as they arrive, with a 🛑 Stop button |
+| Provider chain with failover | OpenRouter, Groq, Gemini, Cerebras, NVIDIA, Mistral, DeepSeek, Together, Ollama — the next model answers when one fails, at start **and** mid-stream |
+| Provider → model picker | Inline buttons, no commands to memorise: providers, models, favourites, auto |
+| Smart routing | In auto mode the bot scores every model against your usage (volume, prompt length, images, feedback) and starts with the best one |
+| 👍 / 👎 feedback | A thumbs down steers the automatic routing away from that model |
+| 🔁 Regenerate | Replays the last question with one tap |
+| Per-user settings | Model, model footer, live typing and favourites are stored per user |
+| Groups with roles | `/group` panel: everyone / admins / owner, auto-translation, bot-admin detection |
+| Plain text by default | The assistant is asked for plain text, so Telegram can never reject an answer over broken markup |
+| Public mode | Unlimited budgets, no rate limiting, free to use |
 | `/tr` and `/translate` | Translate a single message, or auto-translate a whole group |
 | Vision | Send a photo and ask about it |
 | Per-user budgets | Spend caps per day / month / all time |
-| Rate limiting | Requests per user per minute |
 | Long answers | Automatically split across several Telegram messages |
 
 ---
@@ -78,27 +85,49 @@ The binary reads `./config.yaml` and `./lang/` from the working directory, so ru
 
 ---
 
+## Usage: buttons first
+
+Almost nothing needs to be typed. `/start` (or `/menu`) opens a panel, and the
+persistent reply keyboard keeps the four entry points one tap away:
+
+- 🧠 **Model** — pick a provider from the list, then a model inside it. The
+  first row is always `✨ Auto — best for my usage`.
+- ⚙️ **Settings** — auto model on/off, the model footer, live typing, favourites.
+- 📊 **Usage** — your requests and (when allowed) your spend.
+- 🔮 **Best for me** — scores every available model against your usage and
+  offers a one-tap switch.
+
+Every answer carries its own controls: 🛑 **Stop** while it streams, then
+🔁 **Regenerate**, 🧠 **Model**, 👍 / 👎 and ⭐ to bookmark the model that
+answered. A group panel (`/group`) gives admins the same treatment for the
+chat: who may use the bot, and auto-translation.
+
 ## Commands
+
+Commands still work for power users; nothing is hidden behind them.
 
 | Command | Description |
 |---|---|
-| `/start` | Welcome message and help |
-| `/help` | Show the command list |
-| `/get_models` | List models that are free for prompt **and** completion |
-| `/set_model <name>` | Change the model (alias: `/model`) |
-| `/set_model default` | Restore the configured model |
-| `/providers` | Show the provider chain and its health |
-| `/provider <n\|name>` | Switch the active provider |
-| `/models [provider]` | List a provider's models with capabilities |
-| `/model <n\|name>` | Select a model by number or id |
-| `/recommend` | Suggest a model based on how you use the bot |
+| `/start`, `/menu` | Main panel with buttons |
+| `/help` | How to use the bot |
+| `/model` | Open the model picker |
+| `/model <n\|name>` | Pin a model by catalogue number or id |
+| `/model default`, `/auto` | Back to automatic model choice |
+| `/provider` | Open the provider list |
+| `/provider <n\|name>` | Pin a provider, keep auto model choice inside it |
+| `/models [provider]` | Numbered model list for one provider |
+| `/recommend` | Best model for your usage, with a one-tap switch |
+| `/settings` | Your preferences as buttons |
+| `/stats`, `/usage` | Your usage statistics (respects `STATS_MIN_ROLE`) |
 | `/reset` | Clear the conversation history |
 | `/reset <prompt>` | Clear history and set a new system prompt |
 | `/reset system` | Clear history and restore the default system prompt |
-| `/stats` | Usage statistics (respects `STATS_MIN_ROLE`) |
 | `/stop` | Stop the request currently streaming for you |
+| `/get_models` | Free models of the preferred provider (OpenRouter style APIs) |
 | `/tr [lang]` | Translate the message you replied to (defaults to English) |
 | `/translate on\|off\|<lang>\|status` | Automatic group translation (groups only) |
+| `/group` | Group admin panel: access mode, auto-translation |
+| `/admin` | Owner panel: uptime, users, provider health |
 | `/about` | About this bot |
 
 ---
@@ -110,43 +139,56 @@ providers, and on **any** failure the next model is tried, then the next
 provider — at stream creation *and* mid-stream. Partial output is kept, so a
 user never loses what already arrived.
 
-Providers are defined in `config.yaml`:
+Providers are defined in `config.yaml`. A preset name is enough: the endpoint,
+the models and the name of the key variable come from the built-in catalogue.
 
 ```yaml
 providers:
-  - name: openrouter
-    base_url: https://openrouter.ai/api/v1
-    api_key_env: API_KEY
-    models:
-      - deepseek/deepseek-r1:free
-      - openrouter/free
-
-  - name: groq
-    base_url: https://api.groq.com/openai/v1
-    api_key_env: GROQ_API_KEY
-    models:
-      - llama-3.3-70b-versatile
-      - openai/gpt-oss-120b
-      - llama-3.1-8b-instant
-
-  - name: ollama          # local, never rate limited
-    base_url: http://localhost:11434/v1
-    models:
-      - llama3.2:3b
+  - name: openrouter        # API_KEY
+  - name: groq              # GROQ_API_KEY
+  - name: gemini            # GEMINI_API_KEY
+  - name: cerebras          # CEREBRAS_API_KEY
+  #- name: nvidia           # NVIDIA_API_KEY
+  #- name: mistral          # MISTRAL_API_KEY
+  #- name: deepseek         # DEEPSEEK_API_KEY
+  #- name: together         # TOGETHER_API_KEY
+  #- name: ollama           # local, no key
 ```
 
-- `api_key_env` names the environment variable holding the key, so no secret
-  ever goes in the file.
-- A provider without a key stays in the list and is reported by `/providers`
-  as having no key, rather than being dropped silently.
-- A provider that fails 3 times in a row drops to the back of the chain for
-  60 seconds, so healthy providers are tried first without manual intervention.
-- Any OpenAI-compatible endpoint works. Remove the block entirely to fall back
-  to the flat `BASE_URL` / `MODEL` / `API_KEY` variables.
+Built-in presets: `openrouter`, `groq`, `gemini`, `cerebras`, `nvidia`,
+`mistral`, `deepseek`, `together`, `ollama`, `lmstudio`. Anything can be
+overridden per entry:
 
-`/recommend` scores every available model against your actual usage — requests
-per day, average prompt length, conversation size, whether you send images —
-and explains its choice.
+```yaml
+  - name: groq
+    base_url: https://api.groq.com/openai/v1   # optional
+    api_key_env: GROQ_API_KEY                  # optional
+    models:                                    # optional
+      - llama-3.3-70b-versatile
+      - openai/gpt-oss-120b
+```
+
+- A provider whose key is missing is still listed by `/providers` and in the
+  model picker (marked `no key`), but it never costs a request: nothing has to
+  be commented out while a key is absent.
+- A provider that fails 3 times in a row drops to the back of the chain, first
+  for 60 seconds and then for longer (up to 10 minutes) while it keeps failing.
+  Healthy providers come first again on their own.
+- Every user can override the order for themselves from the picker: pin a
+  provider, pin a model, or stay on `auto`. A pin never beats the health
+  tracking — a cooling-down backend is still skipped.
+- Any OpenAI-compatible endpoint works. Remove the block entirely to fall back
+  to the flat `BASE_URL` / `MODEL` / `API_KEY` variables plus every preset
+  whose key is set.
+
+### Automatic model choice
+
+In `auto` mode the bot scores every available model against the user's actual
+usage — requests per day, average prompt length, conversation size, whether
+they send images, and which models they downvoted — and starts with the best
+one. The rest of the list stays as the failover order. `/recommend` shows the
+same scoring with an explanation, and a 💡 hint appears occasionally when a
+pinned model is clearly worse than the recommendation.
 
 ## Group behaviour
 
@@ -158,7 +200,17 @@ Two independent behaviours, so the bot never answers a single message twice:
   - `all` — answer every group message
   - `off` — never answer in groups
 
-Private chats always get a reply.
+Who may talk to the bot is a separate switch, and it lives in the chat:
+
+- `everyone` (**default**) — any member can use it, which is what a free
+  public bot wants.
+- `admins` — only chat administrators and the bot owner are answered;
+  everyone else gets a short note instead of silence.
+- `owner` — only the bot owner.
+
+Any chat admin can change it from the `/group` panel (no command needed after
+that), and the bot notices when it is promoted to admin in a chat. Private
+chats always get a reply — the bot is public unless the owner restricts it.
 
 ---
 
@@ -186,6 +238,10 @@ Every value can be set as a real environment variable **or** in `.env`. `config.
 | `RATE_LIMIT_PER_MINUTE` | `10` | Max requests per user per minute. `0` disables it |
 | `MAX_CONCURRENT_REQUESTS` | `8` | Max AI requests in flight at once |
 | `PUBLIC_MODE` | `false` | `true` removes all limits: unlimited budget for every role, no rate limiting, answers every group message |
+| `GROUP_ACCESS` | `everyone` | Who may use the bot in a group: `everyone`, `admins` or `owner`. Groups override it from `/group` |
+| `MAX_REPLY_CHARS` | `3500` | Longest answer sent as one message (Telegram's hard limit is 4096) |
+| `RENDER_MARKDOWN` | `false` | Try MarkdownV2 for the final answer. Off keeps answers plain text |
+| `SUGGEST_MODELS` | `true` | Occasionally suggest a model that suits the user's usage |
 
 ### Provider keys
 
@@ -197,8 +253,9 @@ Every value can be set as a real environment variable **or** in `.env`. `config.
 | `CEREBRAS_API_KEY` | Cerebras |
 | `NVIDIA_API_KEY` | NVIDIA NIM |
 
-Extra providers also need a matching entry in the `providers:` block of
-`config.yaml`.
+Every extra provider with a key set joins the chain automatically; a matching
+preset entry in `config.yaml` is the only other thing needed (a name alone is
+enough).
 
 > [!WARNING]
 > Set `GUEST_BUDGET=0` (the default) unless you intend to run a public bot.
@@ -231,6 +288,9 @@ Extra providers also need a matching entry in the `providers:` block of
 | `GROUP_CHAT_MODE` | `mention` | `mention`, `all` or `off` |
 | `PORT` | `10000` | Health server port |
 | `ENV_FILE` | `.env` | Path to the dotenv file |
+| `PERSONA_PROMPT` | built in | Replaces the response rules (plain text, no Markdown, short answers) |
+| `OLLAMA_BASE_URL` | – | Adds a local Ollama endpoint to the fallback chain |
+| `TELEGRAM_API_URL` | – | Self-hosted Bot API server, e.g. `http://localhost:8081/bot%s/%s` |
 
 ---
 
@@ -267,24 +327,31 @@ CI (`.github/workflows/ci.yml`) runs formatting, `go vet`, `go mod tidy` verific
 ### Layout
 
 ```
-main.go              update loop, commands, group behaviour
-api/                 OpenRouter + Gemini streaming, Telegram rendering
-config/              configuration loading and hot reload
-lang/                translation bundles (EN.json, RU.json)
-user/                spend tracking, budgets, rate limits, history
-grouptranslate/      per-group auto-translation settings
-translator/          one-shot translation helper
-internal/atomicfile/ crash-safe file writes
+main.go       update loop, group access, chat handling
+commands.go   slash commands and reply-keyboard actions
+callbacks.go  inline button handling
+screens.go    the panels (menu, models, settings, group, owner)
+hints.go      occasional model suggestions
+api/          provider chain streaming, Telegram rendering, chunking
+provider/     backends, presets, routing scores, health and failover
+config/       configuration loading, hot reload, persona
+ui/           every keyboard and the callback data format
+groups/       per-chat settings: access mode, translation, bot admin
+user/         spend tracking, budgets, history, per-user preferences
+translator/   one-shot translation helper
+internal/     crash-safe file writes
 ```
 
 ---
 
 ## Notes on behaviour
 
-- **Long answers** are split into several messages of at most 3800 characters, preferring paragraph boundaries.
-- **Formatting**: streaming uses plain text (a half-written `**bold` would be rejected by Telegram). The final message retries with `MarkdownV2`, then legacy `Markdown`, then plain text.
+- **Long answers** are split into several messages of at most `MAX_REPLY_CHARS` (3500 by default), preferring paragraph boundaries. The assistant is also told to stay under that length.
+- **Formatting**: answers are plain text by default, which is why the built-in persona forbids Markdown — Telegram drops the entire message when markup does not parse. Set `RENDER_MARKDOWN=true` to try `MarkdownV2`, then legacy `Markdown`, then plain text.
+- **Failover is visible**: with the model footer on, every answer ends with the provider and model that produced it, and a note when the chain had to switch (🔀 switched after N failed attempt(s)).
 - **Costs** come from the OpenRouter generation endpoint after the stream ends. Statistics can take a moment to finalise, so the lookup retries once.
-- **`/stop`** cancels the request and keeps whatever was generated so far.
+- **`/stop`** (or the 🛑 button) cancels the request and keeps whatever was generated so far.
+- **Buttons expire** after three hours: the state behind 🔁 Regenerate and 👍/👎 is kept in memory only, so a restart simply disables the old buttons.
 
 ## License
 

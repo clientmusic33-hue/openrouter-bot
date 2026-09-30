@@ -1,5 +1,9 @@
 // Command openrouter-bot runs a Telegram bot that answers with AI models
-// served through OpenRouter or any OpenAI-compatible endpoint.
+// served through OpenRouter, Groq, Gemini or any OpenAI-compatible endpoint.
+//
+// The bot is designed to be usable without commands: every action has a
+// button, and the AI answer itself carries stop / regenerate / feedback
+// controls.
 package main
 
 import (
@@ -19,18 +23,22 @@ import (
 
 	"openrouter-bot/api"
 	"openrouter-bot/config"
-	"openrouter-bot/grouptranslate"
+	"openrouter-bot/groups"
 	"openrouter-bot/lang"
 	"openrouter-bot/provider"
 	"openrouter-bot/translator"
+	"openrouter-bot/ui"
 	"openrouter-bot/user"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
 const (
-	shutdownTimeout   = 30 * time.Second
-	translationTimout = 60 * time.Second
+	shutdownTimeout    = 30 * time.Second
+	translationTimeout = 60 * time.Second
+
+	// pendingTTL is how long the buttons under an answer keep working.
+	pendingTTL = 3 * time.Hour
 )
 
 func main() {
@@ -69,7 +77,7 @@ func main() {
 		log.Fatal("TELEGRAM_BOT_TOKEN is not set")
 	}
 
-	bot, err := tgbotapi.NewBotAPI(conf.TelegramBotToken)
+	bot, err := newBotAPI(conf)
 	if err != nil {
 		log.Fatalf("Failed to create Telegram bot: %v", err)
 	}
@@ -91,8 +99,8 @@ func main() {
 
 	providers := conf.Providers
 	if len(providers) == 0 {
-		// No providers: chain in config.yaml, so fall back to the flat
-		// environment variables.
+		// No providers block in config.yaml, so fall back to the flat
+		// environment variables plus every preset with a key.
 		providers = config.FallbackProviders(conf)
 	}
 
@@ -102,10 +110,11 @@ func main() {
 	}
 
 	for _, status := range chain.Status() {
-		if status.Configured {
+		switch {
+		case !status.Configured:
+			log.Printf("Provider %s listed without an API key, requests will skip it", status.Name)
+		default:
 			log.Printf("Provider %s ready: %d model(s)", status.Name, len(status.Models))
-		} else {
-			log.Printf("Provider %s configured without an API key, requests to it will fail", status.Name)
 		}
 	}
 
@@ -114,13 +123,15 @@ func main() {
 	// ---------------------------------------------------------------------
 
 	app := &app{
-		ctx:          ctx,
-		bot:          bot,
-		manager:      manager,
-		chain:        chain,
-		users:        user.NewUserManager("logs"),
-		translations: grouptranslate.NewManager("data/translations.json"),
-		semaphore:    make(chan struct{}, conf.MaxConcurrentRequests),
+		ctx:       ctx,
+		bot:       bot,
+		manager:   manager,
+		chain:     chain,
+		users:     user.NewUserManager("logs"),
+		groups:    groups.NewManager("data/groups.json"),
+		semaphore: make(chan struct{}, conf.MaxConcurrentRequests),
+		pending:   make(map[int64]map[int]pendingAnswer),
+		started:   time.Now(),
 	}
 
 	app.setCommands(manager.GetConfig())
@@ -169,6 +180,22 @@ func main() {
 	log.Println("Goodbye")
 }
 
+// newBotAPI connects to api.telegram.org, or to a self-hosted Bot API server
+// when telegram_api_url is configured.
+func newBotAPI(conf *config.Config) (*tgbotapi.BotAPI, error) {
+	if conf.TelegramAPIURL != "" {
+		log.Printf("Using custom Telegram API endpoint %s", conf.TelegramAPIURL)
+		bot, err := tgbotapi.NewBotAPIWithAPIEndpoint(conf.TelegramBotToken, conf.TelegramAPIURL)
+		if err != nil {
+			return nil, err
+		}
+
+		return bot, nil
+	}
+
+	return tgbotapi.NewBotAPI(conf.TelegramBotToken)
+}
+
 // -----------------------------------------------------------------------------
 // APPLICATION
 // -----------------------------------------------------------------------------
@@ -181,15 +208,32 @@ type app struct {
 	// chain is the ordered list of AI providers tried on every request.
 	chain *provider.Chain
 
-	users        *user.Manager
-	translations *grouptranslate.Manager
+	users  *user.Manager
+	groups *groups.Manager
 
 	// semaphore caps concurrent AI requests so that a burst of group
 	// messages cannot exhaust the upstream rate limit.
 	semaphore chan struct{}
 
+	// pending links the buttons under an answer back to the question that
+	// produced it, which is what makes regenerate and feedback possible.
+	pendingMu sync.Mutex
+	pending   map[int64]map[int]pendingAnswer
+
+	started time.Time
+
 	wg    sync.WaitGroup
 	ready atomic.Bool
+}
+
+// pendingAnswer is the state a button press needs.
+type pendingAnswer struct {
+	ChatID    int64
+	MessageID int
+	UserID    int64
+	Prompt    string
+	Model     string
+	CreatedAt time.Time
 }
 
 // run consumes Telegram updates until the channel closes or the context is
@@ -209,6 +253,20 @@ func (a *app) run(updates tgbotapi.UpdatesChannel) {
 }
 
 func (a *app) processUpdate(update tgbotapi.Update) {
+	// Read a fresh snapshot: the configuration may have been reloaded.
+	conf := a.manager.GetConfig()
+
+	if update.CallbackQuery != nil {
+		a.handleCallback(update.CallbackQuery, conf)
+		return
+	}
+
+	// The bot joining, leaving or being promoted in a chat.
+	if update.MyChatMember != nil {
+		a.handleChatMember(update.MyChatMember, conf)
+		return
+	}
+
 	if update.Message == nil {
 		return
 	}
@@ -224,9 +282,6 @@ func (a *app) processUpdate(update tgbotapi.Update) {
 		return
 	}
 
-	// Read a fresh snapshot: the configuration may have been reloaded.
-	conf := a.manager.GetConfig()
-
 	tracker := a.users.GetUser(update.Message.Chat.ID, senderID, senderUsername, conf)
 
 	log.Printf(
@@ -238,8 +293,32 @@ func (a *app) processUpdate(update tgbotapi.Update) {
 		update.Message.Text,
 	)
 
+	if isGroupChat(update.Message.Chat) {
+		a.trackChat(update.Message.Chat, conf)
+	}
+
 	if update.Message.IsCommand() {
 		a.handleCommand(update.Message, conf, tracker)
+		return
+	}
+
+	// The persistent keyboard sends plain text, not commands, so the labels
+	// are routed here. Restricted groups only get the menus, never an answer.
+	if action, ok := quickAction(update.Message.Text); ok {
+		if a.mayUse(update.Message.Chat, senderID, conf) {
+			a.handleQuickAction(update.Message, action, conf, tracker)
+		}
+		return
+	}
+
+	// -----------------------------------------------------------------
+	// ACCESS CONTROL
+	// -----------------------------------------------------------------
+
+	if !a.mayUse(update.Message.Chat, senderID, conf) {
+		if a.isMentioned(update.Message) || a.isReplyToBot(update.Message) {
+			a.notifyRestricted(update.Message, conf)
+		}
 		return
 	}
 
@@ -248,10 +327,10 @@ func (a *app) processUpdate(update tgbotapi.Update) {
 	// -----------------------------------------------------------------
 
 	if isGroupChat(update.Message.Chat) {
-		settings := a.translations.Get(update.Message.Chat.ID)
+		settings := a.groups.Get(update.Message.Chat.ID)
 		text := strings.TrimSpace(messageText(update.Message))
 
-		if settings.Enabled && text != "" {
+		if settings.TranslateEnabled && text != "" {
 			a.startTranslation(update.Message, settings.TargetLanguage, conf)
 
 			// Translation mode replaces the chat mode for this group.
@@ -286,46 +365,75 @@ func (a *app) handleChat(message *tgbotapi.Message, conf *config.Config, tracker
 	}
 
 	if !tracker.HaveAccess(conf) {
-		sendMessage(a.bot, message.Chat.ID, lang.Translate("budget_out", conf.Lang), "")
+		a.send(message.Chat.ID, lang.Translate("budget_out", conf.Lang), "")
 		return
 	}
 
 	if err := tracker.AllowRequest(conf); err != nil {
 		log.Printf("Rate limiting user %s: %v", tracker.UserID, err)
-		sendMessage(a.bot, message.Chat.ID, lang.Translate("rate_limit", conf.Lang), "")
+		a.send(message.Chat.ID, lang.Translate("rate_limit", conf.Lang), "")
 		return
 	}
+
+	prompt := messageText(message)
 
 	log.Printf(
 		"AI REQUEST: chat=%d sender_id=%s username=%q text=%q",
 		message.Chat.ID,
 		tracker.UserID,
 		tracker.UserName,
-		message.Text,
+		prompt,
 	)
 
-	tracker.RecordRequest(len(messageText(message)))
+	tracker.RecordRequest(len(strings.TrimSpace(prompt)))
 	if len(message.Photo) > 0 {
 		tracker.MarkVision()
 	}
 
-	responseID, servedBy, err := api.HandleChatGPTStreamResponse(
+	result, err := api.HandleChatGPTStreamResponse(
 		a.ctx,
 		a.bot,
 		a.chain,
 		message,
 		conf,
 		tracker,
+		a.chatOptions(conf, tracker),
 	)
 	if err != nil {
 		log.Printf("AI request failed for user %s: %v", tracker.UserID, err)
 	}
 
-	// Cost statistics are an OpenRouter specific endpoint.
-	if servedBy == "openrouter" && conf.Model.Type == "openrouter" {
-		if err := tracker.GetUsageFromApi(responseID, conf); err != nil {
+	// Buttons under the answer need to find the question again.
+	if len(result.Messages) > 0 && result.Text != "" && !result.Stopped {
+		a.rememberAnswer(message.Chat.ID, result.Messages[0], senderID(message), prompt, result.Model)
+	}
+
+	// Cost statistics: only the provider that answered knows the price, and
+	// only OpenRouter-style endpoints expose a generation lookup. Anything
+	// else simply has no cost to add.
+	if baseURL, apiKey, ok := a.chain.CostEndpoint(result.Provider); ok {
+		if err := tracker.GetUsageFromApi(result.ResponseID, baseURL, apiKey); err != nil {
 			log.Printf("Failed to fetch usage for user %s: %v", tracker.UserID, err)
 		}
+	}
+
+	a.maybeSuggestModel(message.Chat.ID, conf, tracker)
+}
+
+// chatOptions assembles the per-request rendering options from the user's
+// stored settings.
+func (a *app) chatOptions(conf *config.Config, tracker *user.UsageTracker) api.Options {
+	settings := tracker.Settings()
+	profile := tracker.UsageProfile()
+
+	return api.Options{
+		Preference: tracker.Preference(),
+		Profile:    &profile,
+		ShowFooter: settings.ShowFooter,
+		Streaming:  settings.Streaming,
+		Markdown:   conf.RenderMarkdown,
+		MaxChars:   conf.MaxReplyChars,
+		Buttons:    true,
 	}
 }
 
@@ -345,13 +453,14 @@ func (a *app) shouldAnswer(message *tgbotapi.Message, conf *config.Config) bool 
 	case config.GroupModeAll:
 		return true
 	default: // config.GroupModeMention
-		if message.ReplyToMessage != nil &&
-			message.ReplyToMessage.From != nil &&
-			message.ReplyToMessage.From.ID == a.bot.Self.ID {
-			return true
-		}
-		return a.isMentioned(message)
+		return a.isReplyToBot(message) || a.isMentioned(message)
 	}
+}
+
+func (a *app) isReplyToBot(message *tgbotapi.Message) bool {
+	return message.ReplyToMessage != nil &&
+		message.ReplyToMessage.From != nil &&
+		message.ReplyToMessage.From.ID == a.bot.Self.ID
 }
 
 func (a *app) isMentioned(message *tgbotapi.Message) bool {
@@ -360,9 +469,136 @@ func (a *app) isMentioned(message *tgbotapi.Message) bool {
 		return false
 	}
 
-	return strings.Contains(strings.ToLower(messageText(message)), "@"+username)
+	if strings.Contains(strings.ToLower(messageText(message)), "@"+username) {
+		return true
+	}
+
+	// A reply to any message of the bot counts, including replies to an
+	// answer that was rendered as several messages.
+	return a.isReplyToBot(message)
 }
 
+// trackChat records the chat title and the bot's own membership.
+func (a *app) trackChat(chat *tgbotapi.Chat, conf *config.Config) {
+	if chat == nil {
+		return
+	}
+
+	if strings.TrimSpace(chat.Title) != "" {
+		a.groups.SetTitle(chat.ID, chat.Title)
+	}
+}
+
+// memberRole resolves a member's role, caching the Telegram lookup so the API
+// is not called for every message.
+func (a *app) memberRole(chatID, userID int64) string {
+	if role, ok := a.groups.MemberRole(chatID, userID); ok {
+		return role
+	}
+
+	member, err := a.bot.GetChatMember(tgbotapi.GetChatMemberConfig{
+		ChatConfigWithUser: tgbotapi.ChatConfigWithUser{
+			ChatID: chatID,
+			UserID: userID,
+		},
+	})
+	if err != nil {
+		log.Printf("Could not resolve member %d in chat %d: %v", userID, chatID, err)
+		return ""
+	}
+
+	a.groups.SetMemberRole(chatID, userID, member.Status)
+
+	return member.Status
+}
+
+// accessMode returns the effective access mode for a chat.
+func (a *app) accessMode(chatID int64, conf *config.Config) string {
+	mode := strings.ToLower(strings.TrimSpace(a.groups.Get(chatID).Access))
+	if !config.ValidGroupAccess(mode) {
+		mode = conf.GroupAccess
+	}
+	if !config.ValidGroupAccess(mode) {
+		mode = config.AccessEveryone
+	}
+
+	return mode
+}
+
+// mayUse answers "is this user allowed to talk to the bot here?".
+//
+// Private chats are always open: the bot is public by default, and the owner
+// can restrict a group with /group.
+func (a *app) mayUse(chat *tgbotapi.Chat, userID int64, conf *config.Config) bool {
+	if !isGroupChat(chat) {
+		return true
+	}
+	if conf.IsAdmin(userID) {
+		return true
+	}
+
+	switch a.accessMode(chat.ID, conf) {
+	case config.AccessAdmins:
+		return groups.IsAdminRole(a.memberRole(chat.ID, userID))
+	case config.AccessOwner:
+		return false
+	default:
+		return true
+	}
+}
+
+// isChatAdmin reports whether a user administers the chat (or owns the bot).
+func (a *app) isChatAdmin(chat *tgbotapi.Chat, userID int64, conf *config.Config) bool {
+	if conf.IsAdmin(userID) {
+		return true
+	}
+	if !isGroupChat(chat) {
+		return false
+	}
+
+	return groups.IsAdminRole(a.memberRole(chat.ID, userID))
+}
+
+// notifyRestricted explains once why the bot stayed silent.
+func (a *app) notifyRestricted(message *tgbotapi.Message, conf *config.Config) {
+	mode := a.accessMode(message.Chat.ID, conf)
+
+	hint := "🛡 In this group only administrators can use the bot."
+	if mode == config.AccessOwner {
+		hint = "🔒 In this group only the bot owner can use the bot."
+	}
+
+	a.send(message.Chat.ID, hint+"\nAn admin can change this with /group.", "")
+}
+
+// handleChatMember reacts to the bot joining, leaving or being promoted.
+func (a *app) handleChatMember(update *tgbotapi.ChatMemberUpdated, conf *config.Config) {
+	chatID := update.Chat.ID
+
+	if strings.TrimSpace(update.Chat.Title) != "" {
+		a.groups.SetTitle(chatID, update.Chat.Title)
+	}
+
+	status := string(update.NewChatMember.Status)
+	a.groups.SetBotAdmin(chatID, groups.IsAdminRole(status))
+
+	switch status {
+	case "member", "administrator":
+		if update.OldChatMember.Status == "left" || update.OldChatMember.Status == "kicked" {
+			// Freshly added: introduce the bot and its buttons.
+			text := "👋 Thanks for adding me!\n\n" +
+				"Mention me or reply to my messages and I will answer.\n" +
+				"Admins can open the group panel with /group.\n\n" +
+				"Your free AI assistant, no limits, no signup. 🤖✨"
+
+			a.sendKeyboard(chatID, text, ui.GroupPanel(a.accessMode(chatID, conf), false, groups.IsAdminRole(status)), false)
+		}
+	case "left", "kicked":
+		log.Printf("Removed from chat %d", chatID)
+	}
+}
+
+// startTranslation translates one message into the group's language.
 func (a *app) startTranslation(message *tgbotapi.Message, target string, conf *config.Config) {
 	chatID := message.Chat.ID
 	messageID := message.MessageID
@@ -379,12 +615,12 @@ func (a *app) startTranslation(message *tgbotapi.Message, target string, conf *c
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(a.ctx, translationTimout)
+		ctx, cancel := context.WithTimeout(a.ctx, translationTimeout)
 		defer cancel()
 
 		log.Printf("Starting automatic translation: chat=%d message=%d target=%q", chatID, messageID, target)
 
-		translated, err := translator.Translate(ctx, a.chain.ActiveClient(), text, target, a.chain.Model())
+		translated, err := translator.Translate(ctx, a.chain, text, target)
 		if err != nil {
 			log.Printf("Automatic translation FAILED: chat=%d message=%d error=%v", chatID, messageID, err)
 			return
@@ -403,483 +639,70 @@ func (a *app) startTranslation(message *tgbotapi.Message, target string, conf *c
 }
 
 // -----------------------------------------------------------------------------
-// COMMANDS
+// PENDING ANSWERS
 // -----------------------------------------------------------------------------
 
-func (a *app) handleCommand(message *tgbotapi.Message, conf *config.Config, tracker *user.UsageTracker) {
-	chatID := message.Chat.ID
+// rememberAnswer stores the question behind an answer so its buttons work.
+func (a *app) rememberAnswer(chatID int64, messageID int, userID int64, prompt, model string) {
+	a.pendingMu.Lock()
+	defer a.pendingMu.Unlock()
 
-	switch message.Command() {
+	a.sweepLocked()
 
-	case "start":
-		sendMessage(a.bot, chatID,
-			lang.Translate("commands.start", conf.Lang)+
-				lang.Translate("commands.help", conf.Lang)+
-				lang.Translate("commands.start_end", conf.Lang),
-			"HTML",
-		)
-
-	case "help":
-		sendMessage(a.bot, chatID, lang.Translate("commands.help", conf.Lang), "HTML")
-
-	case "get_models":
-		models, err := api.GetFreeModels(a.chain.ActiveBaseURL(), a.chain.ActiveAPIKey())
-		if err != nil {
-			log.Printf("Error getting models: %v", err)
-			sendMessage(a.bot, chatID, "❌ Failed to get available models. Please try again later.", "")
-			return
-		}
-
-		sendMessage(a.bot, chatID,
-			lang.Translate("commands.getModels", conf.Lang)+models,
-			tgbotapi.ModeMarkdown,
-		)
-
-	case "set_model", "model":
-		a.handleSetModel(message, conf)
-
-	case "providers":
-		a.handleProviders(message, conf)
-
-	case "provider":
-		a.handleProvider(message, conf)
-
-	case "models":
-		a.handleModels(message, conf)
-
-	case "recommend":
-		a.handleRecommend(message, conf, tracker)
-
-	case "reset":
-		a.handleReset(message, conf, tracker)
-
-	case "stats":
-		a.handleStats(message, conf, tracker)
-
-	case "stop":
-		if tracker.StopStream() {
-			sendMessage(a.bot, chatID, lang.Translate("commands.stop", conf.Lang), "HTML")
-			return
-		}
-		sendMessage(a.bot, chatID, lang.Translate("commands.stop_err", conf.Lang), "HTML")
-
-	case "about":
-		sendMessage(a.bot, chatID,
-			"🤖 <b>OpenRouter AI Bot</b>\n\n"+
-				"👨‍💻 <b>Created by:</b> @Hazel21_nut\n"+
-				"⚡ <b>Powered by:</b> OpenRouter",
-			"HTML",
-		)
-
-	case "tr":
-		a.handleTranslateReply(message, conf)
-
-	case "translate":
-		a.handleTranslateSettings(message, conf)
-
-	default:
-		log.Printf("Unknown command: %s", message.Command())
+	if a.pending[chatID] == nil {
+		a.pending[chatID] = make(map[int]pendingAnswer)
+	}
+	a.pending[chatID][messageID] = pendingAnswer{
+		ChatID:    chatID,
+		MessageID: messageID,
+		UserID:    userID,
+		Prompt:    prompt,
+		Model:     model,
+		CreatedAt: time.Now(),
 	}
 }
 
-func (a *app) handleSetModel(message *tgbotapi.Message, conf *config.Config) {
-	args := strings.TrimSpace(message.CommandArguments())
+// pendingAnswer returns the state for a message, if it is still fresh.
+func (a *app) pendingAnswer(chatID int64, messageID int) (pendingAnswer, bool) {
+	a.pendingMu.Lock()
+	defer a.pendingMu.Unlock()
 
-	switch {
-	case strings.EqualFold(args, "default"):
-		model := a.chain.ResetModel()
-		sendMessage(a.bot, message.Chat.ID,
-			lang.Translate("commands.setModel", conf.Lang)+" `"+model+"`",
-			tgbotapi.ModeMarkdown,
-		)
+	a.sweepLocked()
 
-	case args == "":
-		sendMessage(a.bot, message.Chat.ID,
-			lang.Translate("commands.noArgsModel", conf.Lang),
-			tgbotapi.ModeMarkdown,
-		)
-
-	case strings.ContainsAny(args, " \t"):
-		sendMessage(a.bot, message.Chat.ID,
-			lang.Translate("commands.noSpaceModel", conf.Lang),
-			tgbotapi.ModeMarkdown,
-		)
-
-	default:
-		if err := a.chain.SetModel(args); err != nil {
-			sendMessage(a.bot, message.Chat.ID, "❌ "+escapeHTML(err.Error()), "")
-			return
-		}
-		log.Printf("Model changed to %s in chat %d", args, message.Chat.ID)
-		sendMessage(a.bot, message.Chat.ID,
-			lang.Translate("commands.setModel", conf.Lang)+" `"+args+"`",
-			tgbotapi.ModeMarkdown,
-		)
-	}
-}
-
-func (a *app) handleReset(message *tgbotapi.Message, conf *config.Config, tracker *user.UsageTracker) {
-	args := strings.TrimSpace(message.CommandArguments())
-
-	tracker.ClearHistory()
-
-	switch {
-	case args == "":
-		sendMessage(a.bot, message.Chat.ID, lang.Translate("commands.reset", conf.Lang), "HTML")
-
-	case strings.EqualFold(args, "system"):
-		tracker.SetSystemPrompt(conf.SystemPrompt)
-		sendMessage(a.bot, message.Chat.ID, lang.Translate("commands.reset_system", conf.Lang), "HTML")
-
-	default:
-		tracker.SetSystemPrompt(args)
-		sendMessage(a.bot, message.Chat.ID,
-			lang.Translate("commands.reset_prompt", conf.Lang)+escapeHTML(args)+".",
-			"HTML",
-		)
-	}
-}
-
-func (a *app) handleStats(message *tgbotapi.Message, conf *config.Config, tracker *user.UsageTracker) {
-	tracker.CheckHistory(conf.MaxHistorySize, conf.MaxHistoryTime)
-
-	countedUsage := formatMoney(tracker.GetCurrentCost(conf.BudgetPeriod))
-	todayUsage := formatMoney(tracker.GetCurrentCost("daily"))
-	monthUsage := formatMoney(tracker.GetCurrentCost("monthly"))
-	totalUsage := formatMoney(tracker.GetCurrentCost("total"))
-	messagesCount := strconv.Itoa(len(tracker.GetMessages()))
-
-	var statsMessage string
-	if tracker.CanViewStats(conf) {
-		statsMessage = fmt.Sprintf(
-			lang.Translate("commands.stats", conf.Lang),
-			countedUsage, todayUsage, monthUsage, totalUsage, messagesCount,
-		)
-	} else {
-		statsMessage = fmt.Sprintf(
-			lang.Translate("commands.stats_min", conf.Lang),
-			messagesCount,
-		)
-	}
-
-	sendMessage(a.bot, message.Chat.ID, statsMessage, "HTML")
-}
-
-func (a *app) handleTranslateReply(message *tgbotapi.Message, conf *config.Config) {
-	if message.ReplyToMessage == nil {
-		sendMessage(a.bot, message.Chat.ID,
-			"❌ Reply to a message and use:\n\n/tr hi\n/tr en\n/tr ru", "")
-		return
-	}
-
-	targetLanguage := strings.TrimSpace(message.CommandArguments())
-	if targetLanguage == "" {
-		targetLanguage = "English"
-	}
-
-	sourceText := strings.TrimSpace(messageText(message.ReplyToMessage))
-	if sourceText == "" {
-		sendMessage(a.bot, message.Chat.ID, "❌ The replied message doesn't contain text.", "")
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(a.ctx, translationTimout)
-	defer cancel()
-
-	translated, err := translator.Translate(ctx, a.chain.ActiveClient(), sourceText, targetLanguage, a.chain.Model())
-	if err != nil {
-		log.Printf("Translation error: %v", err)
-		sendMessage(a.bot, message.Chat.ID, "❌ Translation failed. Please try again.", "")
-		return
-	}
-
-	sendMessage(a.bot, message.Chat.ID,
-		"🌐 <b>Translation</b>\n\n"+escapeHTML(translated),
-		"HTML",
-	)
-}
-
-func (a *app) handleTranslateSettings(message *tgbotapi.Message, conf *config.Config) {
-	if !isGroupChat(message.Chat) {
-		sendMessage(a.bot, message.Chat.ID, "❌ This command can only be used in a group.", "")
-		return
-	}
-
-	chatID := message.Chat.ID
-	args := strings.TrimSpace(message.CommandArguments())
-
-	switch strings.ToLower(args) {
-
-	case "on":
-		if err := a.translations.SetEnabled(chatID, true); err != nil {
-			log.Printf("Failed to enable translation: %v", err)
-			sendMessage(a.bot, chatID, "❌ Failed to save translation settings.", "")
-			return
-		}
-		settings := a.translations.Get(chatID)
-		sendMessage(a.bot, chatID, fmt.Sprintf(
-			"🌐 <b>Auto Translation Enabled</b>\n\n"+
-				"Target language: <b>%s</b>\n\n"+
-				"New group messages will now be translated automatically.",
-			escapeHTML(settings.TargetLanguage),
-		), "HTML")
-
-	case "off":
-		if err := a.translations.SetEnabled(chatID, false); err != nil {
-			log.Printf("Failed to disable translation: %v", err)
-			sendMessage(a.bot, chatID, "❌ Failed to save translation settings.", "")
-			return
-		}
-		sendMessage(a.bot, chatID, "🌐 Auto translation disabled.", "")
-
-	case "status":
-		settings := a.translations.Get(chatID)
-		status := "🔴 Disabled"
-		if settings.Enabled {
-			status = "🟢 Enabled"
-		}
-		sendMessage(a.bot, chatID, fmt.Sprintf(
-			"🌐 <b>Translation Status</b>\n\n"+
-				"Status: %s\n"+
-				"Language: <b>%s</b>\n"+
-				"Mode: Automatic",
-			status,
-			escapeHTML(settings.TargetLanguage),
-		), "HTML")
-
-	case "":
-		sendMessage(a.bot, chatID,
-			"🌐 <b>Group Translation</b>\n\n"+
-				"/translate on — Enable\n"+
-				"/translate off — Disable\n"+
-				"/translate hi — Set Hindi and enable\n"+
-				"/translate en — Set English and enable\n"+
-				"/translate status — Show settings",
-			"HTML",
-		)
-
-	default:
-		if err := a.translations.SetLanguage(chatID, args); err != nil {
-			log.Printf("Failed to set translation language: %v", err)
-			sendMessage(a.bot, chatID, "❌ Failed to save translation language.", "")
-			return
-		}
-		if err := a.translations.SetEnabled(chatID, true); err != nil {
-			log.Printf("Failed to enable translation: %v", err)
-			sendMessage(a.bot, chatID, "❌ Language was saved, but translation could not be enabled.", "")
-			return
-		}
-		settings := a.translations.Get(chatID)
-		sendMessage(a.bot, chatID, fmt.Sprintf(
-			"🌐 <b>Auto Translation Enabled</b>\n\n"+
-				"Target language: <b>%s</b>\n\n"+
-				"You don't need to specify the language again.",
-			escapeHTML(settings.TargetLanguage),
-		), "HTML")
-	}
-}
-
-func (a *app) setCommands(conf *config.Config) {
-	commands := []tgbotapi.BotCommand{
-		{Command: "start", Description: lang.Translate("description.start", conf.Lang)},
-		{Command: "help", Description: lang.Translate("description.help", conf.Lang)},
-		{Command: "get_models", Description: lang.Translate("description.getModels", conf.Lang)},
-		{Command: "set_model", Description: lang.Translate("description.setModel", conf.Lang)},
-		{Command: "providers", Description: "List AI providers and their health"},
-		{Command: "provider", Description: "Switch the active AI provider"},
-		{Command: "models", Description: "List models of a provider"},
-		{Command: "recommend", Description: "Recommend a model based on your usage"},
-		{Command: "reset", Description: lang.Translate("description.reset", conf.Lang)},
-		{Command: "stats", Description: lang.Translate("description.stats", conf.Lang)},
-		{Command: "stop", Description: lang.Translate("description.stop", conf.Lang)},
-		{Command: "about", Description: "About this bot"},
-		{Command: "tr", Description: "Translate a replied message"},
-		{Command: "translate", Description: "Manage group auto translation"},
-	}
-
-	if _, err := a.bot.Request(tgbotapi.NewSetMyCommands(commands...)); err != nil {
-		log.Printf("Warning: failed to set bot commands: %v", err)
-	}
-}
-
-// -----------------------------------------------------------------------------
-// PROVIDER AND MODEL COMMANDS
-// -----------------------------------------------------------------------------
-
-// handleProviders shows the failover chain and its health.
-func (a *app) handleProviders(message *tgbotapi.Message, conf *config.Config) {
-	status := a.chain.Status()
-
-	var builder strings.Builder
-
-	builder.WriteString("🌐 <b>AI providers</b>\n\n")
-
-	for i, info := range status {
-		marker := "  "
-		if info.Active {
-			marker = "▶ "
-		}
-
-		state := "🟢"
-		switch {
-		case !info.Configured:
-			state = "🔑" // missing API key
-		case info.Cooldown > 0:
-			state = "⏳"
-		case info.Failures > 0:
-			state = "🟡"
-		}
-
-		builder.WriteString(fmt.Sprintf(
-			"<code>%d</code> %s %s <b>%s</b> · %d model(s)\n",
-			i+1, marker, state, escapeHTML(info.Name), len(info.Models),
-		))
-
-		detail := fmt.Sprintf(
-			"     current: <code>%s</code>",
-			escapeHTML(a.chain.Model()),
-		)
-		if info.Cooldown > 0 {
-			detail += fmt.Sprintf(" · cooling down %s", info.Cooldown)
-		}
-		if info.Failures > 0 {
-			detail += fmt.Sprintf(" · %d failure(s)", info.Failures)
-		}
-		if !info.Configured {
-			detail += " · no API key"
-		}
-		if info.Active {
-			builder.WriteString(detail + "\n")
-		}
-	}
-
-	builder.WriteString(fmt.Sprintf(
-		"\nCurrent model: <code>%s</code>\n",
-		escapeHTML(a.chain.Model()),
-	))
-	builder.WriteString("\nSwitch with <code>/provider 2</code>, list models with <code>/models</code>.")
-
-	sendMessage(a.bot, message.Chat.ID, builder.String(), "HTML")
-}
-
-// handleProvider switches the preferred provider by number or name.
-func (a *app) handleProvider(message *tgbotapi.Message, conf *config.Config) {
-	args := strings.TrimSpace(message.CommandArguments())
-	if args == "" {
-		a.handleProviders(message, conf)
-		return
-	}
-
-	names := a.chain.Names()
-
-	target := args
-	if index, err := strconv.Atoi(args); err == nil && index >= 1 && index <= len(names) {
-		target = names[index-1]
-	}
-
-	name, err := a.chain.SetActive(target)
-	if err != nil {
-		sendMessage(a.bot, message.Chat.ID,
-			fmt.Sprintf("❌ %s\n\nAvailable: %s", escapeHTML(err.Error()), escapeHTML(strings.Join(names, ", "))),
-			"HTML",
-		)
-		return
-	}
-
-	sendMessage(a.bot, message.Chat.ID, fmt.Sprintf(
-		"🌐 Provider switched to <b>%s</b>\n\nModel: <code>%s</code>",
-		escapeHTML(name), escapeHTML(a.chain.Model()),
-	), "HTML")
-}
-
-// handleModels lists the models of a provider with their capabilities.
-func (a *app) handleModels(message *tgbotapi.Message, conf *config.Config) {
-	args := strings.TrimSpace(message.CommandArguments())
-
-	providerName := a.chain.ActiveName()
-	if args != "" {
-		names := a.chain.Names()
-		if index, err := strconv.Atoi(args); err == nil && index >= 1 && index <= len(names) {
-			providerName = names[index-1]
-		} else {
-			providerName = args
-		}
-	}
-
-	models, ok := a.chain.ModelsOf(providerName)
+	byMessage, ok := a.pending[chatID]
 	if !ok {
-		sendMessage(a.bot, message.Chat.ID, fmt.Sprintf(
-			"❌ Unknown provider %q.\n\nAvailable: %s",
-			escapeHTML(args), escapeHTML(strings.Join(a.chain.Names(), ", ")),
-		), "HTML")
-		return
+		return pendingAnswer{}, false
 	}
 
-	current := a.chain.Model()
+	answer, ok := byMessage[messageID]
 
-	var builder strings.Builder
-	builder.WriteString(fmt.Sprintf("🧠 <b>Models on %s</b>\n\n", escapeHTML(providerName)))
-
-	for i, model := range models {
-		marker := "  "
-		if model == current {
-			marker = "▶ "
-		}
-
-		line := fmt.Sprintf("<code>%d</code> %s <code>%s</code>", i+1, marker, escapeHTML(model))
-		if description := provider.DescribeModel(model); description != "" {
-			line += " — " + escapeHTML(description)
-		}
-		builder.WriteString(line + "\n")
-	}
-
-	builder.WriteString("\nSelect with <code>/model 2</code> or <code>/set_model &lt;name&gt;</code>.")
-
-	sendMessage(a.bot, message.Chat.ID, builder.String(), "HTML")
+	return answer, ok
 }
 
-// handleRecommend suggests a model based on how the user actually uses the bot.
-func (a *app) handleRecommend(message *tgbotapi.Message, conf *config.Config, tracker *user.UsageTracker) {
-	profile := tracker.UsageProfile()
+func (a *app) forgetAnswer(chatID int64, messageID int) {
+	a.pendingMu.Lock()
+	defer a.pendingMu.Unlock()
 
-	// Penalise backends that are currently failing.
-	for _, info := range a.chain.Status() {
-		profile.FailedRecently += info.Failures
+	if byMessage, ok := a.pending[chatID]; ok {
+		delete(byMessage, messageID)
 	}
+}
 
-	recommendation, err := a.chain.Recommend(profile)
-	if err != nil {
-		sendMessage(a.bot, message.Chat.ID, "❌ No models available to recommend.", "")
-		return
+// sweepLocked drops expired entries. Called on every access, which is cheap
+// because the map only holds recent answers.
+func (a *app) sweepLocked() {
+	cutoff := time.Now().Add(-pendingTTL)
+
+	for chatID, byMessage := range a.pending {
+		for messageID, answer := range byMessage {
+			if answer.CreatedAt.Before(cutoff) {
+				delete(byMessage, messageID)
+			}
+		}
+		if len(byMessage) == 0 {
+			delete(a.pending, chatID)
+		}
 	}
-
-	historyNote := "no history yet"
-	if profile.HistoryMessages > 0 {
-		historyNote = fmt.Sprintf("%d messages in memory", profile.HistoryMessages)
-	}
-
-	visionNote := "no"
-	if profile.UsesVision {
-		visionNote = "yes"
-	}
-
-	text := fmt.Sprintf(
-		"🔮 <b>Recommended model</b>\n\n"+
-			"<code>%s</code> on <b>%s</b>\n\n"+
-			"Why: %s\n\n"+
-			"Your usage: ~%.0f requests/day · avg prompt %.0f chars · %s · images: %s\n\n"+
-			"Apply with <code>/model %s</code>",
-		escapeHTML(recommendation.Model),
-		escapeHTML(recommendation.Provider),
-		escapeHTML(recommendation.Reason),
-		profile.RequestsPerDay,
-		profile.AvgPromptChars,
-		historyNote,
-		visionNote,
-		escapeHTML(recommendation.Model),
-	)
-
-	sendMessage(a.bot, message.Chat.ID, text, "HTML")
 }
 
 // -----------------------------------------------------------------------------
@@ -934,8 +757,26 @@ func (a *app) startHealthServer() *http.Server {
 // HELPERS
 // -----------------------------------------------------------------------------
 
-// sendMessage sends text, splitting it into Telegram sized chunks and
-// retrying without formatting if the parse mode is rejected.
+// send writes a message, splitting it into Telegram sized chunks and retrying
+// without formatting if the parse mode is rejected.
+func (a *app) send(chatID int64, text string, parseMode string) {
+	sendMessage(a.bot, chatID, text, parseMode)
+}
+
+// sendKeyboard writes a message with an inline keyboard.
+func (a *app) sendKeyboard(chatID int64, text string, keyboard tgbotapi.InlineKeyboardMarkup, quick bool) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = tgbotapi.ModeHTML
+	msg.ReplyMarkup = keyboard
+	if quick {
+		msg.ReplyMarkup = ui.QuickKeyboard()
+	}
+
+	if _, err := a.bot.Send(msg); err != nil {
+		log.Printf("Failed to send message to chat %d: %v", chatID, err)
+	}
+}
+
 func sendMessage(bot *tgbotapi.BotAPI, chatID int64, text string, parseMode string) error {
 	text = strings.TrimSpace(text)
 	if text == "" {
@@ -977,6 +818,12 @@ func senderInfo(message *tgbotapi.Message) (int64, string) {
 	}
 
 	return 0, ""
+}
+
+func senderID(message *tgbotapi.Message) int64 {
+	id, _ := senderInfo(message)
+
+	return id
 }
 
 // messageText returns the text or, for media messages, the caption.

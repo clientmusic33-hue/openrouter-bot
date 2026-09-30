@@ -240,16 +240,53 @@ func TestRecordSuccessClearsFailures(t *testing.T) {
 	}
 }
 
-func TestStatusReportsMissingKey(t *testing.T) {
+func TestStatusReportsConfiguredProviders(t *testing.T) {
 	chain := newTestChain(t)
 
 	for _, info := range chain.Status() {
-		if info.Name == "ollama" && info.Configured {
-			t.Error("ollama has no API key, Configured should be false")
-		}
 		if info.Name == "groq" && !info.Configured {
 			t.Error("groq has an API key, Configured should be true")
 		}
+		// A local endpoint needs no key, so it is usable as configured.
+		if info.Name == "ollama" && !info.Configured {
+			t.Error("ollama is a keyless local endpoint, Configured should be true")
+		}
+	}
+}
+
+// TestUnconfiguredProviderIsSkipped pins the fix for a hosted provider whose
+// key is missing: it stays visible, but the chain never spends a request on
+// something that can only fail.
+func TestUnconfiguredProviderIsSkipped(t *testing.T) {
+	chain, err := NewChain([]Config{
+		{
+			Name:        "groq",
+			BaseURL:     "https://api.groq.com/openai/v1",
+			APIKeyEnv:   "SOME_UNSET_GROQ_KEY",
+			RequiresKey: true,
+			Models:      []string{"llama-3.3-70b-versatile"},
+		},
+		{
+			Name:    "local",
+			BaseURL: "http://localhost:11434/v1",
+			Models:  []string{"llama3.2:3b"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewChain: %v", err)
+	}
+
+	for _, candidate := range chain.Candidates() {
+		if candidate.Provider == "groq" {
+			t.Fatalf("an unconfigured provider must not produce candidates, got %+v", candidate)
+		}
+	}
+
+	if !chain.HasModel("llama-3.3-70b-versatile") {
+		t.Error("the model must stay listed for /providers and the picker")
+	}
+	if len(chain.UsableNames()) != 1 || chain.UsableNames()[0] != "local" {
+		t.Errorf("UsableNames() = %v, want [local]", chain.UsableNames())
 	}
 }
 
@@ -262,11 +299,13 @@ func TestRecommendPrefersVisionWhenUsed(t *testing.T) {
 		{
 			Name:    "groq",
 			BaseURL: "https://api.groq.com/openai/v1",
+			APIKey:  "test-key",
 			Models:  []string{"llama-3.3-70b-versatile"},
 		},
 		{
 			Name:    "gemini",
 			BaseURL: "https://generativelanguage.googleapis.com/v1beta/openai/",
+			APIKey:  "test-key",
 			Models:  []string{"gemini-2.5-flash"},
 		},
 	})
@@ -296,6 +335,7 @@ func TestRecommendPrefersFastProviderForHighVolume(t *testing.T) {
 		{
 			Name:    "groq",
 			BaseURL: "https://api.groq.com/openai/v1",
+			APIKey:  "test-key",
 			Models:  []string{"llama-3.3-70b-versatile"},
 		},
 	})
