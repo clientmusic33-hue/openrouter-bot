@@ -1061,7 +1061,55 @@ func main() {
 				)
 			}
 		}
+// ---------------------------------------------------------
+// NORMAL AI CHAT
+// ---------------------------------------------------------
 
-		// ---------------------------------------------------------
-		// NORMAL AI CHAT
-		// ---------------------------
+go func(userStats *user.UsageTracker) {
+
+	if userStats.HaveAccess(conf) {
+
+		log.Printf(
+			"AI REQUEST: chat=%d sender_id=%d username=%q text=%q",
+			update.Message.Chat.ID,
+			senderID,
+			senderUsername,
+			update.Message.Text,
+		)
+
+		responseID :=
+			api.HandleChatGPTStreamResponse(
+				bot,
+				client,
+				geminiClient,
+				update.Message,
+				conf,
+				userStats,
+			)
+
+		if conf.Model.Type == "openrouter" {
+
+			userStats.GetUsageFromApi(
+				responseID,
+				conf,
+			)
+		}
+
+	} else {
+
+		msg := tgbotapi.NewMessage(
+			update.Message.Chat.ID,
+			lang.Translate(
+				"budget_out",
+				conf.Lang,
+			),
+		)
+
+		if _, err := bot.Send(msg); err != nil {
+			log.Println(err)
+		}
+	}
+
+}(userStats)
+	}
+}
