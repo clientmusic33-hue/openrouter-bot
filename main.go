@@ -748,71 +748,111 @@ func main() {
 		}
 
 		// ---------------------------------------------------------
-		// AUTOMATIC GROUP TRANSLATION
 		// ---------------------------------------------------------
+// AUTOMATIC GROUP TRANSLATION
+// ---------------------------------------------------------
 
-		if update.Message.Chat.Type == "group" ||
-			update.Message.Chat.Type == "supergroup" {
+if update.Message.Chat.Type == "group" ||
+	update.Message.Chat.Type == "supergroup" {
 
-			settings := translationManager.Get(
-				update.Message.Chat.ID,
+	settings := translationManager.Get(
+		update.Message.Chat.ID,
+	)
+
+	log.Printf(
+		"Group translation check: chat=%d enabled=%v language=%q text=%q",
+		update.Message.Chat.ID,
+		settings.Enabled,
+		settings.TargetLanguage,
+		update.Message.Text,
+	)
+
+	if settings.Enabled &&
+		strings.TrimSpace(update.Message.Text) != "" {
+
+		sourceText := strings.TrimSpace(
+			update.Message.Text,
+		)
+
+		targetLanguage := strings.TrimSpace(
+			settings.TargetLanguage,
+		)
+
+		chatID := update.Message.Chat.ID
+		messageID := update.Message.MessageID
+
+		go func(
+			chatID int64,
+			messageID int,
+			text string,
+			target string,
+		) {
+
+			log.Printf(
+				"Starting automatic translation: chat=%d message=%d target=%q",
+				chatID,
+				messageID,
+				target,
 			)
 
-			if settings.Enabled &&
-				strings.TrimSpace(update.Message.Text) != "" {
+			translatedText, err := translator.Translate(
+				context.Background(),
+				client,
+				text,
+				target,
+				conf.Model.ModelName,
+			)
 
-				sourceText := strings.TrimSpace(
-					update.Message.Text,
+			if err != nil {
+				log.Printf(
+					"Automatic translation FAILED: chat=%d message=%d error=%v",
+					chatID,
+					messageID,
+					err,
 				)
-
-				targetLanguage := settings.TargetLanguage
-
-				go func(
-					chatID int64,
-					text string,
-					target string,
-				) {
-					translatedText, err := translator.Translate(
-						context.Background(),
-						client,
-						text,
-						target,
-						conf.Model.ModelName,
-					)
-
-					if err != nil {
-						log.Printf(
-							"Automatic translation error: %v",
-							err,
-						)
-						return
-					}
-
-					msg := tgbotapi.NewMessage(
-						chatID,
-						"🌐 <b>"+target+"</b>\n\n"+translatedText,
-					)
-
-					msg.ParseMode = "HTML"
-
-					if _, err := bot.Send(msg); err != nil {
-						log.Printf(
-							"Failed to send automatic translation: %v",
-							err,
-						)
-					}
-				}(
-					update.Message.Chat.ID,
-					sourceText,
-					targetLanguage,
-				)
-
-				// Don't send the same group message to the normal AI
-				// chat handler when automatic translation is enabled.
-				continue
+				return
 			}
-		}
 
+			log.Printf(
+				"Automatic translation SUCCESS: chat=%d message=%d",
+				chatID,
+				messageID,
+			)
+
+			msg := tgbotapi.NewMessage(
+				chatID,
+				fmt.Sprintf(
+					"🌐 <b>%s</b>\n\n%s",
+					target,
+					translatedText,
+				),
+			)
+
+			msg.ParseMode = "HTML"
+
+			// Reply directly to the original message.
+			msg.ReplyToMessageID = messageID
+
+			if _, err := bot.Send(msg); err != nil {
+				log.Printf(
+					"Failed to send automatic translation: chat=%d message=%d error=%v",
+					chatID,
+					messageID,
+					err,
+				)
+			}
+
+		}(
+			chatID,
+			messageID,
+			sourceText,
+			targetLanguage,
+		)
+
+		// Don't send this group message to the normal AI handler.
+		continue
+	}
+}
 		// ---------------------------------------------------------
 		// NORMAL AI CHAT
 		// ---------------------------------------------------------
