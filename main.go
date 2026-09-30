@@ -44,11 +44,13 @@ func main() {
 		}
 	}()
 
+	// Load translations.
 	err := lang.LoadTranslations("./lang/")
 	if err != nil {
 		log.Fatalf("Error loading translations: %v", err)
 	}
 
+	// Initialize configuration.
 	manager, err := config.NewManager("./config.yaml")
 	if err != nil {
 		log.Fatalf("Error initializing config manager: %v", err)
@@ -56,25 +58,27 @@ func main() {
 
 	conf := manager.GetConfig()
 
+	// Initialize Telegram bot.
 	bot, err := tgbotapi.NewBotAPI(conf.TelegramBotToken)
 	if err != nil {
 		log.Panic(err)
 	}
+
 	bot.Debug = false
 
-	// Delete the webhook
+	// Delete webhook so long polling can work.
 	_, err = bot.Request(tgbotapi.DeleteWebhookConfig{})
 	if err != nil {
 		log.Fatalf("Failed to delete webhook: %v", err)
 	}
 
-	// Now you can safely use getUpdates
+	// Telegram long polling.
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 
 	updates := bot.GetUpdatesChan(u)
 
-	// Set bot commands
+	// Set Telegram bot commands.
 	commands := []tgbotapi.BotCommand{
 		{
 			Command:     "start",
@@ -104,23 +108,26 @@ func main() {
 			Command:     "stop",
 			Description: lang.Translate("description.stop", conf.Lang),
 		},
+		{
+			Command:     "about",
+			Description: "About this bot",
+		},
 	}
-	{
-    Command:     "about",
-    Description: "About this bot",
-},
 
 	_, err = bot.Request(tgbotapi.NewSetMyCommands(commands...))
 	if err != nil {
 		log.Fatalf("Failed to set bot commands: %v", err)
 	}
 
+	// OpenRouter/OpenAI client.
 	clientOptions := openai.DefaultConfig(conf.OpenAIApiKey)
 	clientOptions.BaseURL = conf.OpenAIBaseURL
 	client := openai.NewClientWithConfig(clientOptions)
 
+	// User manager.
 	userManager := user.NewUserManager("logs")
 
+	// Process Telegram updates.
 	for update := range updates {
 		if update.Message == nil {
 			continue
@@ -132,13 +139,16 @@ func main() {
 			conf,
 		)
 
+		// Handle commands.
 		if update.Message.IsCommand() {
 			switch update.Message.Command() {
 
+			// /start
 			case "start":
 				msgText :=
 					lang.Translate("commands.start", conf.Lang) +
 						lang.Translate("commands.help", conf.Lang) +
+						"\n\n👨‍💻 <b>Created by:</b> @Hazel21_nut" +
 						lang.Translate("commands.start_end", conf.Lang)
 
 				msg := tgbotapi.NewMessage(
@@ -147,8 +157,12 @@ func main() {
 				)
 
 				msg.ParseMode = "HTML"
-				bot.Send(msg)
 
+				if _, err := bot.Send(msg); err != nil {
+					log.Println("Failed to send /start:", err)
+				}
+
+			// /help
 			case "help":
 				msg := tgbotapi.NewMessage(
 					update.Message.Chat.ID,
@@ -156,14 +170,25 @@ func main() {
 				)
 
 				msg.ParseMode = "HTML"
-				bot.Send(msg)
 
+				if _, err := bot.Send(msg); err != nil {
+					log.Println("Failed to send /help:", err)
+				}
+
+			// /get_models
 			case "get_models":
 				models, err := api.GetFreeModels()
 
 				if err != nil {
-					fmt.Printf("Error: %v\n", err)
-					return
+					log.Printf("Error getting models: %v", err)
+
+					msg := tgbotapi.NewMessage(
+						update.Message.Chat.ID,
+						"❌ Failed to get available models. Please try again later.",
+					)
+
+					bot.Send(msg)
+					continue
 				}
 
 				text := lang.Translate(
@@ -178,15 +203,14 @@ func main() {
 
 				msg.ParseMode = tgbotapi.ModeMarkdown
 
-				_, err = bot.Send(msg)
-				if err != nil {
-					fmt.Printf("Error: %v\n", err)
-					return
+				if _, err := bot.Send(msg); err != nil {
+					log.Println("Failed to send models:", err)
 				}
 
+			// /set_model
 			case "set_model":
 				args := update.Message.CommandArguments()
-				argsArr := strings.Split(args, " ")
+				argsArr := strings.Fields(args)
 
 				msg := tgbotapi.NewMessage(
 					update.Message.Chat.ID,
@@ -227,8 +251,11 @@ func main() {
 							"`"
 				}
 
-				bot.Send(msg)
+				if _, err := bot.Send(msg); err != nil {
+					log.Println("Failed to send /set_model:", err)
+				}
 
+			// /reset
 			case "reset":
 				args := update.Message.CommandArguments()
 
@@ -265,8 +292,11 @@ func main() {
 					)
 				}
 
-				bot.Send(msg)
+				if _, err := bot.Send(msg); err != nil {
+					log.Println("Failed to send /reset:", err)
+				}
 
+			// /stats
 			case "stats":
 				userStats.CheckHistory(
 					conf.MaxHistorySize,
@@ -335,8 +365,27 @@ func main() {
 				)
 
 				msg.ParseMode = "HTML"
-				bot.Send(msg)
 
+				if _, err := bot.Send(msg); err != nil {
+					log.Println("Failed to send /stats:", err)
+				}
+
+			// /about
+			case "about":
+				msg := tgbotapi.NewMessage(
+					update.Message.Chat.ID,
+					"🤖 <b>OpenRouter AI Bot</b>\n\n"+
+						"👨‍💻 <b>Created by:</b> @Hazel21_nut\n"+
+						"⚡ <b>Powered by:</b> OpenRouter",
+				)
+
+				msg.ParseMode = "HTML"
+
+				if _, err := bot.Send(msg); err != nil {
+					log.Println("Failed to send /about:", err)
+				}
+
+			// /stop
 			case "stop":
 				if userStats.CurrentStream != nil {
 					userStats.CurrentStream.Close()
@@ -349,7 +398,9 @@ func main() {
 						),
 					)
 
-					bot.Send(msg)
+					if _, err := bot.Send(msg); err != nil {
+						log.Println("Failed to send /stop:", err)
+					}
 
 				} else {
 					msg := tgbotapi.NewMessage(
@@ -360,11 +411,14 @@ func main() {
 						),
 					)
 
-					bot.Send(msg)
+					if _, err := bot.Send(msg); err != nil {
+						log.Println("Failed to send /stop error:", err)
+					}
 				}
 			}
 
 		} else {
+			// Handle normal messages concurrently.
 			go func(userStats *user.UsageTracker) {
 
 				if userStats.HaveAccess(conf) {
@@ -395,9 +449,7 @@ func main() {
 						),
 					)
 
-					_, err := bot.Send(msg)
-
-					if err != nil {
+					if _, err := bot.Send(msg); err != nil {
 						log.Println(err)
 					}
 				}
