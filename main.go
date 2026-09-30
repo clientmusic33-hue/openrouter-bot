@@ -1,17 +1,19 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
-	"openrouter-bot/api"
-	"openrouter-bot/config"
-	"openrouter-bot/lang"
-	"openrouter-bot/user"
-	"openrouter-bot/translator"
 	"os"
 	"strconv"
 	"strings"
+
+	"openrouter-bot/api"
+	"openrouter-bot/config"
+	"openrouter-bot/lang"
+	"openrouter-bot/translator"
+	"openrouter-bot/user"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/sashabaranov/go-openai"
@@ -113,11 +115,11 @@ func main() {
 			Command:     "about",
 			Description: "About this bot",
 		},
+		{
+			Command:     "tr",
+			Description: "Translate a replied message",
+		},
 	}
-	{
-    Command:     "tr",
-    Description: "Translate a replied message",
-},
 
 	_, err = bot.Request(tgbotapi.NewSetMyCommands(commands...))
 	if err != nil {
@@ -153,7 +155,6 @@ func main() {
 				msgText :=
 					lang.Translate("commands.start", conf.Lang) +
 						lang.Translate("commands.help", conf.Lang) +
-						"\n\n👨‍💻 <b>Created by:</b> @Hazel21_nut" +
 						lang.Translate("commands.start_end", conf.Lang)
 
 				msg := tgbotapi.NewMessage(
@@ -192,7 +193,10 @@ func main() {
 						"❌ Failed to get available models. Please try again later.",
 					)
 
-					bot.Send(msg)
+					if _, err := bot.Send(msg); err != nil {
+						log.Println("Failed to send models error:", err)
+					}
+
 					continue
 				}
 
@@ -374,59 +378,78 @@ func main() {
 				if _, err := bot.Send(msg); err != nil {
 					log.Println("Failed to send /stats:", err)
 				}
-				case "tr":
-	if update.Message.ReplyToMessage == nil {
-		msg := tgbotapi.NewMessage(
-			update.Message.Chat.ID,
-			"❌ Reply to a message and use:\n\n/tr hi\n/tr en\n/tr ru",
-		)
-		bot.Send(msg)
-		continue
-	}
 
-	targetLanguage := strings.TrimSpace(update.Message.CommandArguments())
+			// /tr
+			case "tr":
+				if update.Message.ReplyToMessage == nil {
+					msg := tgbotapi.NewMessage(
+						update.Message.Chat.ID,
+						"❌ Reply to a message and use:\n\n/tr hi\n/tr en\n/tr ru",
+					)
 
-	if targetLanguage == "" {
-		targetLanguage = "English"
-	}
+					if _, err := bot.Send(msg); err != nil {
+						log.Println("Failed to send /tr help:", err)
+					}
 
-	sourceText := update.Message.ReplyToMessage.Text
+					continue
+				}
 
-	if strings.TrimSpace(sourceText) == "" {
-		msg := tgbotapi.NewMessage(
-			update.Message.Chat.ID,
-			"❌ The replied message doesn't contain text.",
-		)
-		bot.Send(msg)
-		continue
-	}
+				targetLanguage := strings.TrimSpace(
+					update.Message.CommandArguments(),
+				)
 
-	translatedText, err := translator.Translate(
-		context.Background(),
-		client,
-		sourceText,
-		targetLanguage,
-		conf.Model.ModelName,
-	)
+				if targetLanguage == "" {
+					targetLanguage = "English"
+				}
 
-	if err != nil {
-		log.Printf("Translation error: %v", err)
+				sourceText := update.Message.ReplyToMessage.Text
 
-		msg := tgbotapi.NewMessage(
-			update.Message.Chat.ID,
-			"❌ Translation failed. Please try again.",
-		)
-		bot.Send(msg)
-		continue
-	}
+				if strings.TrimSpace(sourceText) == "" {
+					msg := tgbotapi.NewMessage(
+						update.Message.Chat.ID,
+						"❌ The replied message doesn't contain text.",
+					)
 
-	msg := tgbotapi.NewMessage(
-		update.Message.Chat.ID,
-		"🌐 <b>Translation</b>\n\n"+translatedText,
-	)
+					if _, err := bot.Send(msg); err != nil {
+						log.Println("Failed to send /tr error:", err)
+					}
 
-	msg.ParseMode = "HTML"
-	bot.Send(msg)
+					continue
+				}
+
+				translatedText, err := translator.Translate(
+					context.Background(),
+					client,
+					sourceText,
+					targetLanguage,
+					conf.Model.ModelName,
+				)
+
+				if err != nil {
+					log.Printf("Translation error: %v", err)
+
+					msg := tgbotapi.NewMessage(
+						update.Message.Chat.ID,
+						"❌ Translation failed. Please try again.",
+					)
+
+					if _, err := bot.Send(msg); err != nil {
+						log.Println("Failed to send translation error:", err)
+					}
+
+					continue
+				}
+
+				msg := tgbotapi.NewMessage(
+					update.Message.Chat.ID,
+					"🌐 <b>Translation</b>\n\n"+translatedText,
+				)
+
+				msg.ParseMode = "HTML"
+
+				if _, err := bot.Send(msg); err != nil {
+					log.Println("Failed to send translation:", err)
+				}
 
 			// /about
 			case "about":
