@@ -490,7 +490,7 @@ func loadProviders() []provider.Config {
 
 // extraProviderOrder is the order in which environment-configured providers
 // join a chain that config.yaml did not define itself.
-var extraProviderOrder = []string{"groq", "gemini", "cerebras", "nvidia", "mistral", "deepseek", "together"}
+var extraProviderOrder = []string{"groq", "gemini", "cerebras", "nvidia", "huggingface", "mistral", "deepseek", "together"}
 
 // PrimaryProvider describes the endpoint of the flat BASE_URL/MODEL/API_KEY
 // variables. It is the first entry of the fallback chain.
@@ -505,8 +505,8 @@ func PrimaryProvider(c *Config) provider.Config {
 
 // ProvidersFromEnv returns the preset providers whose API key is present in
 // the environment, in a stable order. This is what makes "just set
-// GROQ_API_KEY" (or GEMINI_API_KEY, or CEREBRAS_API_KEY) enough to get a
-// failover chain.
+// GROQ_API_KEY" (or GEMINI_API_KEY, CEREBRAS_API_KEY, HF_TOKEN, or
+// MISTRAL_API_KEY) enough to get a failover chain.
 func ProvidersFromEnv() []provider.Config {
 	var out []provider.Config
 

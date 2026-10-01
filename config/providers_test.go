@@ -140,6 +140,13 @@ func TestLoadProvidersAbsent(t *testing.T) {
 }
 
 func TestFallbackProviders(t *testing.T) {
+	for _, name := range extraProviderOrder {
+		preset, ok := provider.LookupPreset(name)
+		if ok && preset.APIKeyEnv != "" {
+			t.Setenv(preset.APIKeyEnv, "")
+		}
+	}
+
 	conf := &Config{
 		OpenAIBaseURL: "https://openrouter.ai/api/v1",
 		OpenAIApiKey:  "or-key",
@@ -264,4 +271,93 @@ func TestNvidiaNeedsOnlyANameAndItsKey(t *testing.T) {
 			t.Error("Configured() = true without a key, want false")
 		}
 	})
+}
+
+func TestHuggingFaceAndMistralInitializeFromConfig(t *testing.T) {
+	const yaml = `providers:
+  - name: huggingface
+  - name: mistral
+`
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	t.Setenv("HF_TOKEN", "hf-test-token")
+	t.Setenv("MISTRAL_API_KEY", "mistral-test-key")
+
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	viper.SetConfigFile(path)
+	viper.AutomaticEnv()
+	if err := viper.ReadInConfig(); err != nil {
+		t.Fatalf("ReadInConfig: %v", err)
+	}
+
+	configs := loadProviders()
+	if len(configs) != 2 {
+		t.Fatalf("loadProviders() returned %d entries, want 2", len(configs))
+	}
+
+	want := map[string]struct {
+		baseURL string
+		keyEnv  string
+		key     string
+	}{
+		"huggingface": {"https://router.huggingface.co/v1", "HF_TOKEN", "hf-test-token"},
+		"mistral":     {"https://api.mistral.ai/v1", "MISTRAL_API_KEY", "mistral-test-key"},
+	}
+	for _, cfg := range configs {
+		expected, ok := want[cfg.Name]
+		if !ok {
+			t.Fatalf("unexpected provider %q", cfg.Name)
+		}
+		if cfg.BaseURL != expected.baseURL || cfg.APIKeyEnv != expected.keyEnv || cfg.APIKey != expected.key {
+			t.Errorf("%s configuration has incorrect endpoint or key resolution", cfg.Name)
+		}
+		if !cfg.Configured() || len(cfg.Models) == 0 {
+			t.Errorf("%s is not ready with a key and preset model", cfg.Name)
+		}
+		if _, err := provider.NewProvider(cfg); err != nil {
+			t.Errorf("NewProvider(%s): %v", cfg.Name, err)
+		}
+	}
+
+	chain, err := provider.NewChain(configs)
+	if err != nil {
+		t.Fatalf("NewChain: %v", err)
+	}
+	candidates := chain.Candidates()
+	found := make(map[string]bool, len(candidates))
+	for _, candidate := range candidates {
+		found[candidate.Provider] = true
+	}
+	for name := range want {
+		if !found[name] {
+			t.Errorf("%s has no selectable candidate", name)
+		}
+	}
+}
+
+func TestProvidersFromEnvIncludesHuggingFaceAndMistral(t *testing.T) {
+	for _, name := range extraProviderOrder {
+		preset, ok := provider.LookupPreset(name)
+		if ok && preset.APIKeyEnv != "" {
+			t.Setenv(preset.APIKeyEnv, "")
+		}
+	}
+	t.Setenv("HF_TOKEN", "hf-test-token")
+	t.Setenv("MISTRAL_API_KEY", "mistral-test-key")
+
+	configs := ProvidersFromEnv()
+	found := make(map[string]provider.Config, len(configs))
+	for _, cfg := range configs {
+		found[cfg.Name] = cfg
+	}
+	for _, name := range []string{"huggingface", "mistral"} {
+		cfg, ok := found[name]
+		if !ok || !cfg.Configured() {
+			t.Errorf("%s was not included as a configured environment fallback", name)
+		}
+	}
 }

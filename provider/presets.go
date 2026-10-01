@@ -94,6 +94,13 @@ var presets = []Preset{
 		Docs: "https://build.nvidia.com/models",
 	},
 	{
+		Name:      "huggingface",
+		BaseURL:   "https://router.huggingface.co/v1",
+		APIKeyEnv: "HF_TOKEN",
+		Models:    []string{"openai/gpt-oss-120b"},
+		Docs:      "https://huggingface.co/settings/tokens",
+	},
+	{
 		Name:      "mistral",
 		BaseURL:   "https://api.mistral.ai/v1",
 		APIKeyEnv: "MISTRAL_API_KEY",

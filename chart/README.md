@@ -30,9 +30,10 @@ Secrets are kept out of the ConfigMap:
 
 - `secrets.TELEGRAM_BOT_TOKEN` and `secrets.API_KEY` are required.
 - Every other `secrets.*` key is rendered into the Secret as-is, so
-  `secrets.GROQ_API_KEY`, `secrets.GEMINI_API_KEY`, `secrets.CEREBRAS_API_KEY`
-  and friends join the failover chain without editing the chart. Empty values
-  are skipped, and a provider without a key never receives a request.
+  `secrets.GROQ_API_KEY`, `secrets.GEMINI_API_KEY`, `secrets.CEREBRAS_API_KEY`,
+  `secrets.HF_TOKEN`, `secrets.MISTRAL_API_KEY` and friends join the failover
+  chain without editing the chart. Empty values are skipped, and a provider
+  without a key never receives a request.
 - Everything under `config.*` becomes a plain environment variable; the full
   list of supported names lives in the [main README](../README.md).
 

@@ -29,7 +29,7 @@ This project allows you to launch your Telegram bot in a few minutes to communic
 | Feature | Notes |
 |---|---|
 | Streaming responses | Tokens are edited into the message as they arrive, with a 🛑 Stop button |
-| Provider chain with failover | OpenRouter, Groq, Gemini, Cerebras, NVIDIA, Mistral, DeepSeek, Together, Ollama — EWMA latency tracking, circuit breakers, exponential backoff, and mid-stream failover |
+| Provider chain with failover | OpenRouter, Groq, Gemini, Cerebras, NVIDIA, Hugging Face, Mistral, DeepSeek, Together, Ollama — EWMA latency tracking, circuit breakers, exponential backoff, and mid-stream failover |
 | Provider → model picker | Inline buttons with live status (`🟢 available`, `🟡 degraded`, `🔴 unavailable`) and capability badges (`⚡ fast`, `🧠 reasoning`, `👁 vision`, `💻 coding`) |
 | Smart task routing | Automatically classifies prompts (`CHAT`, `CODING`, `REASONING`, `VISION`, `TRANSLATION`, `SUMMARIZATION`, `RESEARCH`, `FAST`, `LONG_CONTEXT`) and selects the optimal healthy model |
 | `/fast` & `/race` modes | Low-latency single-model routing (`/fast`) or concurrent 2–3 model racing (`/race`, `/race judge`) cancelling slower candidates on first completion |
@@ -161,15 +161,16 @@ providers:
   - name: gemini            # GEMINI_API_KEY
   - name: cerebras          # CEREBRAS_API_KEY
   - name: nvidia            # NVIDIA_API_KEY
-  #- name: mistral          # MISTRAL_API_KEY
+  - name: huggingface       # HF_TOKEN
+  - name: mistral           # MISTRAL_API_KEY
   #- name: deepseek         # DEEPSEEK_API_KEY
   #- name: together         # TOGETHER_API_KEY
   #- name: ollama           # local, no key
 ```
 
 Built-in presets: `openrouter`, `groq`, `gemini`, `cerebras`, `nvidia`,
-`mistral`, `deepseek`, `together`, `ollama`, `lmstudio`. Anything can be
-overridden per entry:
+`huggingface`, `mistral`, `deepseek`, `together`, `ollama`, `lmstudio`. Anything
+can be overridden per entry:
 
 ```yaml
   - name: groq
@@ -275,6 +276,12 @@ Every value can be set as a real environment variable **or** in `.env`. `config.
 | `GEMINI_API_KEY` | Google Gemini |
 | `CEREBRAS_API_KEY` | Cerebras |
 | `NVIDIA_API_KEY` | NVIDIA NIM |
+| `HF_TOKEN` | Hugging Face Inference Providers |
+| `MISTRAL_API_KEY` | Mistral AI |
+
+Hugging Face tokens need the **Make calls to Inference Providers** permission.
+The default model is `openai/gpt-oss-120b`; override it with `models:` in
+`config.yaml` like any other provider.
 
 Every extra provider with a key set joins the chain automatically; a matching
 preset entry in `config.yaml` is the only other thing needed (a name alone is

@@ -126,8 +126,8 @@ storage_type: json
 # (marked "no key") but never costs a request - nothing has to be commented
 # out when a key is absent.
 #
-# Built-in presets: openrouter, groq, gemini, cerebras, nvidia, mistral,
-# deepseek, together, ollama, lmstudio.
+# Built-in presets: openrouter, groq, gemini, cerebras, nvidia, huggingface,
+# mistral, deepseek, together, ollama, lmstudio.
 #
 # Remove this block entirely to fall back to the flat BASE_URL/MODEL/API_KEY
 # variables plus every preset whose key is set in the environment.
@@ -148,15 +148,18 @@ providers:
   # Key: GEMINI_API_KEY from https://aistudio.google.com/apikey
   - name: gemini
 
-  # Cerebras, NVIDIA NIM, Mistral, DeepSeek and Together all work the same
-  # way - add the name and set the matching key.
+  # Cerebras, NVIDIA NIM, Hugging Face, Mistral, DeepSeek and Together all
+  # work the same way - add the name and set the matching key.
   # Key: CEREBRAS_API_KEY from https://cloud.cerebras.ai
   - name: cerebras
   # NVIDIA NIM: the hosted model catalogue, with a free tier.
   # Key: NVIDIA_API_KEY from https://build.nvidia.com
   - name: nvidia
+  # Hugging Face Inference Providers (OpenAI-compatible router).
+  # Key: HF_TOKEN with Inference Providers permission.
+  - name: huggingface
   # Key: MISTRAL_API_KEY from https://console.mistral.ai
-  #- name: mistral
+  - name: mistral
   # Key: DEEPSEEK_API_KEY from https://platform.deepseek.com
   #- name: deepseek
 
