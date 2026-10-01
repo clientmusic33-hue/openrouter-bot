@@ -75,7 +75,7 @@ type entry struct {
 func New() *Catalog {
 	return &Catalog{
 		ttl:      DefaultTTL,
-		entries:   make(map[string]entry),
+		entries:  make(map[string]entry),
 		inflight: make(map[string]struct{}),
 	}
 }
