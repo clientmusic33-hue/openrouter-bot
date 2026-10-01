@@ -390,7 +390,7 @@ func (a *app) adminScreen(conf *config.Config) screen {
 		switch {
 		case !info.Configured:
 			icon = "🔴 unavailable"
-		case info.Cooldown > 0 || info.CircuitState == "open":
+		case info.Cooldown > 0 || info.Circuit == provider.CircuitOpen:
 			icon = "🟡 degraded"
 		case info.Failures > 0:
 			icon = "🟡 degraded"
