@@ -1,0 +1,84 @@
+# ---------------------------------------------------------------------------
+# Render Blueprint - https://render.com/docs/blueprint-spec
+#
+# Deploys this repository's Dockerfile. Use it with New > Blueprint, or
+# connect the repo and let Render read this file.
+#
+# Every entry marked `sync: false` is a secret: Render asks for it when the
+# blueprint is applied and never stores it in git. Entries with a `value` are
+# ordinary settings - edit them here or override them in the dashboard.
+# ---------------------------------------------------------------------------
+
+services:
+  - type: web
+    name: openrouter-bot
+    runtime: docker
+    branch: main
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: starter
+    region: oregon
+    healthCheckPath: /healthz
+
+    # One instance only. The bot reads updates with long polling, and two
+    # instances would fight over the same update stream.
+    numInstances: 1
+
+    envVars:
+      # The only setting the bot cannot start without.
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+
+      # Telegram user id of the owner, who can always use the bot and open
+      # the admin panels.
+      - key: ADMIN_IDS
+        sync: false
+
+      # Provider keys. Set the ones you have; a provider whose key is
+      # missing is skipped and the request fails over to the next one, so
+      # an empty field costs nothing.
+      - key: NVIDIA_API_KEY
+        sync: false
+      - key: API_KEY            # OpenRouter
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: CEREBRAS_API_KEY
+        sync: false
+      - key: MISTRAL_API_KEY
+        sync: false
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: TOGETHER_API_KEY
+        sync: false
+
+      # Behaviour. PUBLIC_MODE removes every limit, which is what a free
+      # public bot wants; set it to false when the keys are metered.
+      - key: PUBLIC_MODE
+        value: "true"
+      - key: PRIVATE_ACCESS
+        value: everyone
+      - key: GROUP_ACCESS
+        value: everyone
+      - key: GROUP_CHAT_MODE
+        value: mention
+      - key: LANG
+        value: EN
+      - key: RENDER_MARKDOWN
+        value: "false"
+      - key: LOGS_DIR
+        value: /openrouter-bot/data/logs
+
+      # Render injects PORT; the bot listens on it and serves /healthz there.
+      - key: PORT
+        value: "10000"
+
+    # Preferences, favourites and spend live in LOGS_DIR. Without a disk
+    # they are lost on every deploy. Disks need a paid plan - on the free
+    # plan delete this block and set LOGS_DIR back to "logs".
+    disk:
+      name: openrouter-bot-data
+      mountPath: /openrouter-bot/data
+      sizeGB: 1
