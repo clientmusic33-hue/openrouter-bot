@@ -560,7 +560,7 @@ func (a *app) startProviderFlow(query *tgbotapi.CallbackQuery, conf *config.Conf
 
 // showChainModels renders one chain provider's models and remembers the view,
 // so a background refresh knows the message still shows that provider.
-func (a *app) showChainModels(chatID, messageID int64, conf *config.Config, tracker *user.UsageTracker, index, page int) {
+func (a *app) showChainModels(chatID int64, messageID int, conf *config.Config, tracker *user.UsageTracker, index, page int) {
 	a.rememberModelsView(chatID, messageID, modelsView{index: index, page: page})
 	a.editScreen(chatID, messageID, a.modelsScreen(conf, tracker, index, page))
 	a.refreshChainModels(index, chatID, messageID, conf, tracker)
@@ -568,7 +568,7 @@ func (a *app) showChainModels(chatID, messageID int64, conf *config.Config, trac
 
 // showUserProviderModels renders one of the user's own providers and remembers
 // the view the same way.
-func (a *app) showUserProviderModels(chatID, messageID int64, userID int64, tracker *user.UsageTracker, index, page int) {
+func (a *app) showUserProviderModels(chatID int64, messageID int, userID int64, tracker *user.UsageTracker, index, page int) {
 	a.rememberModelsView(chatID, messageID, modelsView{index: index, page: page, user: true})
 	a.editScreen(chatID, messageID, a.userProviderModelsScreen(userID, tracker, index, page))
 	a.refreshUserProviderModels(userID, chatID, messageID, tracker, index, page, false)
@@ -667,7 +667,7 @@ func (a *app) fetchUserProviderModels(query *tgbotapi.CallbackQuery, conf *confi
 // chain provider is stale, the live list is fetched in the background and the
 // screen is updated in place. The user is never blocked by the request, and a
 // screen they already left is never overwritten.
-func (a *app) refreshChainModels(index int, chatID, messageID int64, conf *config.Config, tracker *user.UsageTracker) {
+func (a *app) refreshChainModels(index int, chatID int64, messageID int, conf *config.Config, tracker *user.UsageTracker) {
 	if a.modelCatalog == nil || index < 0 {
 		return
 	}
@@ -703,7 +703,8 @@ func (a *app) refreshChainModels(index int, chatID, messageID int64, conf *confi
 // providers, using that user's key.
 func (a *app) refreshUserProviderModels(
 	userID int64,
-	chatID, messageID int64,
+	chatID int64,
+	messageID int,
 	tracker *user.UsageTracker,
 	index, page int,
 	force bool,
@@ -749,12 +750,12 @@ func (a *app) refreshUserProviderModels(
 	})
 }
 
-func (a *app) rememberModelsView(chatID, messageID int64, view modelsView) {
+func (a *app) rememberModelsView(chatID int64, messageID int, view modelsView) {
 	a.modelViews.Store(viewKey{chatID: chatID, messageID: messageID}, view)
 }
 
 // modelsView returns the provider screen a message currently shows.
-func (a *app) modelsView(chatID, messageID int64) (modelsView, bool) {
+func (a *app) modelsView(chatID int64, messageID int) (modelsView, bool) {
 	value, ok := a.modelViews.Load(viewKey{chatID: chatID, messageID: messageID})
 	if !ok {
 		return modelsView{}, false
@@ -766,7 +767,7 @@ func (a *app) modelsView(chatID, messageID int64) (modelsView, bool) {
 }
 
 // showingModels reports whether a message still displays the given view.
-func (a *app) showingModels(chatID, messageID int64, want modelsView) bool {
+func (a *app) showingModels(chatID int64, messageID int, want modelsView) bool {
 	view, ok := a.modelsView(chatID, messageID)
 
 	return ok && view == want

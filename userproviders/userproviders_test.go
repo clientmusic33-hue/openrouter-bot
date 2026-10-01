@@ -74,7 +74,7 @@ func TestOwnershipIsolation(t *testing.T) {
 	if removed, err := store.Remove(ctx, 222, first[0].ID); err != nil || removed {
 		t.Fatalf("Remove across users = %v, %v; want false, nil", removed, err)
 	}
-	if _, err := store.APIKey(ctx, 222, first[0].ID); err == nil {
+	if _, _, err := store.APIKey(ctx, 222, first[0].ID); err == nil {
 		t.Fatal("another user must not be able to open the key")
 	}
 
