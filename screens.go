@@ -142,7 +142,7 @@ func (a *app) modelsScreen(conf *config.Config, tracker *user.UsageTracker, prov
 		for _, ref := range models[offset:end] {
 			info := provider.LookupModel(ref.Model)
 			var badges []string
-			if info.Fast || info.Speed >= 4 {
+			if info.Fast || info.Throughput >= 4 {
 				badges = append(badges, "⚡ fast")
 			}
 			if info.Reasoning >= 5 {
