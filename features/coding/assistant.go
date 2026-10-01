@@ -11,17 +11,17 @@ import (
 type Task string
 
 const (
-	TaskNone            Task = ""
-	TaskBugExplanation  Task = "bug_explanation"
-	TaskErrorAnalysis   Task = "error_analysis"
-	TaskRefactoring     Task = "refactoring"
-	TaskCodeReview      Task = "code_review"
-	TaskTestGeneration  Task = "test_generation"
-	TaskDockerfile      Task = "dockerfile"
-	TaskDeployment      Task = "deployment"
-	TaskStackTrace      Task = "stack_trace"
-	TaskPatchDiff       Task = "patch_diff"
-	TaskGeneralCoding   Task = "general_coding"
+	TaskNone           Task = ""
+	TaskBugExplanation Task = "bug_explanation"
+	TaskErrorAnalysis  Task = "error_analysis"
+	TaskRefactoring    Task = "refactoring"
+	TaskCodeReview     Task = "code_review"
+	TaskTestGeneration Task = "test_generation"
+	TaskDockerfile     Task = "dockerfile"
+	TaskDeployment     Task = "deployment"
+	TaskStackTrace     Task = "stack_trace"
+	TaskPatchDiff      Task = "patch_diff"
+	TaskGeneralCoding  Task = "general_coding"
 )
 
 // Analysis holds the detected language, coding task, and tailored instructions.

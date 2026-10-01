@@ -33,14 +33,14 @@ const maxPromptContentChars = 12000
 type Kind string
 
 const (
-	KindText     Kind = "text"
-	KindCode     Kind = "code"
-	KindCSV      Kind = "csv"
-	KindJSON     Kind = "json"
-	KindDOCX     Kind = "docx"
-	KindPDF      Kind = "pdf"
-	KindImage    Kind = "image"
-	KindUnknown  Kind = "unknown"
+	KindText    Kind = "text"
+	KindCode    Kind = "code"
+	KindCSV     Kind = "csv"
+	KindJSON    Kind = "json"
+	KindDOCX    Kind = "docx"
+	KindPDF     Kind = "pdf"
+	KindImage   Kind = "image"
+	KindUnknown Kind = "unknown"
 )
 
 // ExtractedFile holds the structured representation of an uploaded file.
