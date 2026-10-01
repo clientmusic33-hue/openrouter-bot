@@ -371,7 +371,7 @@ func (a *app) adminScreen(conf *config.Config) screen {
 	var cacheHits, cacheMisses int64
 	var cacheEntries int
 	if a.cache != nil {
-		cacheHits, cacheMisses, cacheEntries = a.cache.Stats()
+		cacheEntries, cacheHits, cacheMisses = a.cache.Stats()
 	}
 
 	builder.WriteString("👑 <b>Admin Observability Panel</b>\n\n")
