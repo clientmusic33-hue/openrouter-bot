@@ -178,6 +178,20 @@ func messageText(message *tgbotapi.Message) string {
 // VISION MESSAGE
 // -----------------------------------------------------------------------------
 
+// hasImageAttachment reports whether message carries a photo or an image document.
+func hasImageAttachment(message *tgbotapi.Message) bool {
+	if message == nil {
+		return false
+	}
+	if len(message.Photo) > 0 {
+		return true
+	}
+	if message.Document != nil && strings.HasPrefix(strings.ToLower(message.Document.MimeType), "image/") {
+		return true
+	}
+	return false
+}
+
 func addVisionMessage(
 	bot *tgbotapi.BotAPI,
 	message *tgbotapi.Message,
@@ -185,17 +199,23 @@ func addVisionMessage(
 ) (openai.ChatCompletionMessage, string) {
 	plainText := strings.TrimSpace(messageText(message))
 
-	if len(message.Photo) == 0 {
+	fileID := ""
+	if len(message.Photo) > 0 {
+		// Use the largest available photo size.
+		photoSize := message.Photo[len(message.Photo)-1]
+		fileID = photoSize.FileID
+	} else if message.Document != nil && strings.HasPrefix(strings.ToLower(message.Document.MimeType), "image/") {
+		fileID = message.Document.FileID
+	}
+
+	if fileID == "" || bot == nil {
 		return openai.ChatCompletionMessage{
 			Role:    openai.ChatMessageRoleUser,
 			Content: plainText,
 		}, plainText
 	}
 
-	// Use the largest available photo size.
-	photoSize := message.Photo[len(message.Photo)-1]
-
-	file, err := bot.GetFile(tgbotapi.FileConfig{FileID: photoSize.FileID})
+	file, err := bot.GetFile(tgbotapi.FileConfig{FileID: fileID})
 	if err != nil {
 		log.Printf("Error getting file: %v", err)
 
@@ -210,7 +230,7 @@ func addVisionMessage(
 		prompt = cfg.VisionPrompt
 	}
 	if prompt == "" {
-		prompt = "Describe this image."
+		prompt = "Describe this image, extract any visible text (OCR), and summarize key details."
 	}
 
 	visionMessage := openai.ChatCompletionMessage{

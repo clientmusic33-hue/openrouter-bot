@@ -6,7 +6,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"regexp"
 	"strings"
+	"unicode"
 
 	"openrouter-bot/provider"
 
@@ -16,6 +18,8 @@ import (
 // maxOutputTokens bounds the translation so that a pathological input cannot
 // produce an enormous (and expensive) response.
 const maxOutputTokens = 2000
+
+var preserveTokenRe = regexp.MustCompile("(?s)```.*?```|`[^`\n]+`|https?://[^\\s<>()]+|@[A-Za-z0-9_]{3,32}")
 
 // Translate translates text into the requested target language.
 //
@@ -42,6 +46,8 @@ func Translate(
 		return "", fmt.Errorf("target language is empty")
 	}
 
+	shieldedText, tokens := shieldTokens(text)
+
 	req := openai.ChatCompletionRequest{
 		Messages: []openai.ChatCompletionMessage{
 			{
@@ -50,7 +56,7 @@ func Translate(
 			},
 			{
 				Role:    openai.ChatMessageRoleUser,
-				Content: buildPrompt(text, targetLanguage),
+				Content: buildPrompt(shieldedText, targetLanguage),
 			},
 		},
 		Temperature: 0,
@@ -92,7 +98,8 @@ func Translate(
 
 		chain.RecordSuccess(candidate.Provider)
 
-		return strings.TrimSpace(resp.Choices[0].Message.Content), nil
+		out := strings.TrimSpace(resp.Choices[0].Message.Content)
+		return restoreTokens(out, tokens), nil
 	}
 
 	return "", fmt.Errorf("translation request failed: %w", lastErr)
@@ -108,10 +115,68 @@ func buildPrompt(text, targetLanguage string) string {
 			"- Do not explain anything.\n"+
 			"- Preserve emojis.\n"+
 			"- Preserve formatting.\n"+
+			"- Preserve code snippets, URLs, @usernames, and __KEEP_N__ placeholders verbatim.\n"+
 			"- Do not answer questions contained in the text.\n"+
 			"- Do not add comments.\n\n"+
 			"Text:\n%s",
 		targetLanguage,
 		text,
 	)
+}
+
+func shieldTokens(text string) (string, []string) {
+	var tokens []string
+	shielded := preserveTokenRe.ReplaceAllStringFunc(text, func(match string) string {
+		idx := len(tokens)
+		tokens = append(tokens, match)
+		return fmt.Sprintf("__KEEP_%d__", idx)
+	})
+	return shielded, tokens
+}
+
+func restoreTokens(text string, tokens []string) string {
+	for i, tok := range tokens {
+		placeholder := fmt.Sprintf("__KEEP_%d__", i)
+		text = strings.ReplaceAll(text, placeholder, tok)
+	}
+	return text
+}
+
+// DetectLanguage estimates the dominant language/script of text without an API
+// round-trip.
+func DetectLanguage(text string) string {
+	var cyrillic, devanagari, arabic, han, hangul, latin int
+	for _, r := range text {
+		switch {
+		case unicode.Is(unicode.Cyrillic, r):
+			cyrillic++
+		case unicode.Is(unicode.Devanagari, r):
+			devanagari++
+		case unicode.Is(unicode.Arabic, r):
+			arabic++
+		case unicode.Is(unicode.Hangul, r):
+			hangul++
+		case unicode.Is(unicode.Han, r) || unicode.Is(unicode.Hiragana, r) || unicode.Is(unicode.Katakana, r):
+			han++
+		case unicode.Is(unicode.Latin, r):
+			latin++
+		}
+	}
+
+	switch {
+	case cyrillic > latin && cyrillic > 0:
+		return "Russian"
+	case devanagari > latin && devanagari > 0:
+		return "Hindi"
+	case arabic > latin && arabic > 0:
+		return "Arabic"
+	case hangul > latin && hangul > 0:
+		return "Korean"
+	case han > 0 && han*2 >= latin:
+		return "Chinese/Japanese"
+	case latin > 0:
+		return "English"
+	default:
+		return "Unknown"
+	}
 }

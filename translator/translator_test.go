@@ -133,3 +133,28 @@ func TestTranslatePromptIsStrict(t *testing.T) {
 		}
 	}
 }
+
+func TestShieldAndRestoreTokensAndDetectLanguage(t *testing.T) {
+	orig := "Hello @alice_dev check `go test ./...` at https://example.com/docs 🚀"
+	shielded, tokens := shieldTokens(orig)
+	if len(tokens) != 3 {
+		t.Fatalf("expected 3 shielded tokens, got %d (%v)", len(tokens), tokens)
+	}
+	if strings.Contains(shielded, "@alice_dev") || strings.Contains(shielded, "https://example.com/docs") {
+		t.Errorf("tokens were not shielded: %q", shielded)
+	}
+	restored := restoreTokens(shielded, tokens)
+	if restored != orig {
+		t.Errorf("restoreTokens() = %q, want %q", restored, orig)
+	}
+
+	if got := DetectLanguage("Привет мир"); got != "Russian" {
+		t.Errorf("DetectLanguage(Russian) = %q", got)
+	}
+	if got := DetectLanguage("नमस्ते दुनिया"); got != "Hindi" {
+		t.Errorf("DetectLanguage(Hindi) = %q", got)
+	}
+	if got := DetectLanguage("Hello world"); got != "English" {
+		t.Errorf("DetectLanguage(English) = %q", got)
+	}
+}

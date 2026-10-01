@@ -126,7 +126,7 @@ func Generate(
 	tracker.ChatMu.Lock()
 	defer tracker.ChatMu.Unlock()
 
-	hasImages := cfg.Vision && prompt.Message != nil && len(prompt.Message.Photo) > 0
+	hasImages := cfg.Vision && hasImageAttachment(prompt.Message)
 	var profileVal provider.UsageProfile
 	if opts.Profile != nil {
 		profileVal = *opts.Profile

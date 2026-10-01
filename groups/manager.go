@@ -68,7 +68,24 @@ type Settings struct {
 	// BotIsAdmin records whether the bot is an administrator of the chat,
 	// which is what allows it to read every message in strict privacy mode.
 	BotIsAdmin bool `json:"bot_is_admin"`
+
+	// Group AI settings (Phase 11).
+	Model              string `json:"model,omitempty"`
+	Provider           string `json:"provider,omitempty"`
+	Persona            string `json:"persona,omitempty"`
+	SystemPrompt       string `json:"system_prompt,omitempty"`
+	MemoryDisabled     bool   `json:"memory_disabled,omitempty"`
+	RateLimitPerMinute int    `json:"rate_limit_per_minute,omitempty"`
 }
+
+// GroupMessage is one recent message buffered in memory for /summarize.
+type GroupMessage struct {
+	Sender string
+	Text   string
+	At     time.Time
+}
+
+const maxBufferedGroupMessages = 80
 
 // DefaultSettings returns the settings a new chat starts with.
 func DefaultSettings() Settings {
@@ -105,6 +122,7 @@ type Manager struct {
 	filePath string
 	groups   map[int64]Settings
 	members  map[int64]map[int64]memberRole
+	recent   map[int64][]GroupMessage
 }
 
 // NewManager loads the settings from filePath, falling back to the legacy
@@ -114,6 +132,7 @@ func NewManager(filePath string) *Manager {
 		filePath: filePath,
 		groups:   make(map[int64]Settings),
 		members:  make(map[int64]map[int64]memberRole),
+		recent:   make(map[int64][]GroupMessage),
 	}
 
 	if err := m.load(); err != nil {
@@ -375,4 +394,82 @@ func (m *Manager) Count() int {
 	defer m.mu.RUnlock()
 
 	return len(m.groups)
+}
+
+// SetModel pins a default model for the group.
+func (m *Manager) SetModel(chatID int64, model, providerName string) error {
+	return m.update(chatID, func(settings *Settings) {
+		settings.Model = strings.TrimSpace(model)
+		settings.Provider = strings.TrimSpace(providerName)
+	})
+}
+
+// SetPersona sets the group's persona preset.
+func (m *Manager) SetPersona(chatID int64, persona string) error {
+	return m.update(chatID, func(settings *Settings) {
+		settings.Persona = strings.TrimSpace(persona)
+	})
+}
+
+// SetSystemPrompt sets a custom system prompt for the group.
+func (m *Manager) SetSystemPrompt(chatID int64, prompt string) error {
+	return m.update(chatID, func(settings *Settings) {
+		settings.SystemPrompt = strings.TrimSpace(prompt)
+	})
+}
+
+// SetRateLimit sets a per-group rate limit override (requests per minute).
+func (m *Manager) SetRateLimit(chatID int64, rpm int) error {
+	if rpm < 0 {
+		rpm = 0
+	}
+	return m.update(chatID, func(settings *Settings) {
+		settings.RateLimitPerMinute = rpm
+	})
+}
+
+// RecordMessage appends a group message to the bounded ring buffer used by
+// /summarize.
+func (m *Manager) RecordMessage(chatID int64, sender, text string) {
+	text = strings.TrimSpace(text)
+	if text == "" || strings.HasPrefix(text, "/") {
+		return
+	}
+	if sender == "" {
+		sender = "User"
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.recent == nil {
+		m.recent = make(map[int64][]GroupMessage)
+	}
+	buf := append(m.recent[chatID], GroupMessage{
+		Sender: sender,
+		Text:   text,
+		At:     time.Now(),
+	})
+	if len(buf) > maxBufferedGroupMessages {
+		buf = buf[len(buf)-maxBufferedGroupMessages:]
+	}
+	m.recent[chatID] = buf
+}
+
+// RecentMessages returns a copy of up to limit recent messages in chatID.
+func (m *Manager) RecentMessages(chatID int64, limit int) []GroupMessage {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	buf := m.recent[chatID]
+	if len(buf) == 0 {
+		return nil
+	}
+	if limit <= 0 || limit > len(buf) {
+		limit = len(buf)
+	}
+	start := len(buf) - limit
+	out := make([]GroupMessage, limit)
+	copy(out, buf[start:])
+	return out
 }
