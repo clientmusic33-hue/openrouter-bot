@@ -52,9 +52,11 @@ func TestValidateKeepsValidGroupAccess(t *testing.T) {
 	}
 }
 
-// TestSystemPromptCarriesPersona pins the response contract: plain text, no
-// Markdown, short answers. Telegram rejects a message whose markup does not
-// parse, so this is a reliability feature rather than a style choice.
+// TestSystemPromptCarriesPersona pins the response contract: structured
+// answers in Telegram-safe Markdown, never HTML or LaTeX, and short answers.
+// Telegram rejects a message whose markup does not parse, so the persona has to
+// ask only for markup the renderer can fall back from - that is the reliability
+// feature, not the plain-text rule it used to be.
 func TestSystemPromptCarriesPersona(t *testing.T) {
 	c := &Config{
 		Lang:          "EN",
@@ -68,7 +70,8 @@ func TestSystemPromptCarriesPersona(t *testing.T) {
 	for _, want := range []string{
 		"Always answer in English language.",
 		"You are a test assistant.",
-		"plain text",
+		"Format for Telegram Markdown",
+		"Never emit HTML",
 		"Explain in plain words first",
 		"Write maths the way a phone shows it",
 		"Never emit LaTeX",
