@@ -368,7 +368,7 @@ func (a *app) adminScreen(conf *config.Config) screen {
 		storageBackend = a.store.Type()
 	}
 
-	var cacheHits, cacheMisses uint64
+	var cacheHits, cacheMisses int64
 	var cacheEntries int
 	if a.cache != nil {
 		cacheHits, cacheMisses, cacheEntries = a.cache.Stats()
