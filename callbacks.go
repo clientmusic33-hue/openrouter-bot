@@ -19,6 +19,13 @@ func (a *app) handleCallback(query *tgbotapi.CallbackQuery, conf *config.Config)
 		return
 	}
 
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Recovered from panic in handleCallback: %v", r)
+			a.send(query.Message.Chat.ID, "❌ Action failed. Please try again.", "")
+		}
+	}()
+
 	// Telegram keeps a spinner on the button until the query is answered, so
 	// every path has to answer it. The deferred call covers the early returns.
 	answered := false
@@ -298,6 +305,12 @@ func (a *app) regenerateCallback(query *tgbotapi.CallbackQuery, conf *config.Con
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Recovered from panic in regenerateCallback: %v", r)
+				a.send(chatID, "❌ Regeneration failed. Please try again.", "")
+			}
+		}()
 
 		select {
 		case a.semaphore <- struct{}{}:
@@ -312,6 +325,9 @@ func (a *app) regenerateCallback(query *tgbotapi.CallbackQuery, conf *config.Con
 		}, conf, tracker, a.chatOptions(conf, tracker))
 		if err != nil {
 			log.Printf("Regeneration failed for user %s: %v", tracker.UserID, err)
+			if len(result.Messages) == 0 {
+				a.send(chatID, "❌ Regeneration failed. Please try again.", "")
+			}
 			return
 		}
 
