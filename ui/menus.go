@@ -39,6 +39,10 @@ const (
 	ActionRegenerate  = "regen"
 	ActionFeedback    = "fb"
 	ActionStop        = "stop"
+	ActionPersonas    = "pers"
+	ActionPersona     = "per"
+	ActionMemory      = "mem"
+	ActionReminders   = "rem"
 	ActionNoop        = "noop"
 )
 
@@ -157,6 +161,10 @@ func MainMenu(settingsLabel string) tgbotapi.InlineKeyboardMarkup {
 			button("⚙️ Settings", ActionSettings),
 		),
 		tgbotapi.NewInlineKeyboardRow(
+			button("🎭 Persona", ActionPersonas),
+			button("🗂 Memory", ActionMemory),
+		),
+		tgbotapi.NewInlineKeyboardRow(
 			button("📊 My usage", ActionStats),
 			button("🔮 Best for me", ActionRecommend),
 		),
@@ -165,6 +173,7 @@ func MainMenu(settingsLabel string) tgbotapi.InlineKeyboardMarkup {
 			button("⭐ Favourites", ActionFavourites),
 		),
 		tgbotapi.NewInlineKeyboardRow(
+			button("⏰ Reminders & Notes", ActionReminders),
 			button("❓ Help", ActionHelp),
 		),
 	)

@@ -6,6 +6,7 @@ import (
 
 	"openrouter-bot/api"
 	"openrouter-bot/config"
+	"openrouter-bot/features/personas"
 	"openrouter-bot/ui"
 	"openrouter-bot/user"
 
@@ -105,6 +106,23 @@ func (a *app) handleCallback(query *tgbotapi.CallbackQuery, conf *config.Config)
 	case ui.ActionSettings:
 		a.editScreen(chatID, messageID, a.settingsScreen(conf, tracker))
 
+	case ui.ActionPersonas:
+		a.editScreen(chatID, messageID, a.personasScreen(tracker))
+
+	case ui.ActionPersona:
+		key := firstArg(callback.Args, "default")
+		if p, ok := personas.Lookup(key); ok {
+			tracker.SetPersona(p.Key, "")
+			a.toast(query, p.Emoji+" "+p.Name+" persona selected")
+		}
+		a.editScreen(chatID, messageID, a.personasScreen(tracker))
+
+	case ui.ActionMemory:
+		a.editScreen(chatID, messageID, a.memoryScreen(tracker))
+
+	case ui.ActionReminders:
+		a.editScreen(chatID, messageID, a.remindersScreen(tracker))
+
 	case ui.ActionToggle:
 		switch firstArg(callback.Args, "") {
 		case "auto":
@@ -117,6 +135,18 @@ func (a *app) handleCallback(query *tgbotapi.CallbackQuery, conf *config.Config)
 			tracker.SetShowFooter(!tracker.Settings().ShowFooter)
 		case "stream":
 			tracker.SetStreaming(!tracker.Settings().Streaming)
+		case "mem_on":
+			if a.memory != nil {
+				_ = a.memory.SetEnabled(tracker.UserID, true)
+			}
+			a.editScreen(chatID, messageID, a.memoryScreen(tracker))
+			return
+		case "mem_off":
+			if a.memory != nil {
+				_ = a.memory.SetEnabled(tracker.UserID, false)
+			}
+			a.editScreen(chatID, messageID, a.memoryScreen(tracker))
+			return
 		}
 		a.editScreen(chatID, messageID, a.settingsScreen(conf, tracker))
 
@@ -381,15 +411,14 @@ func (a *app) modelAt(providerIndex, modelIndex int) string {
 // helpText is shared by /help and the help button.
 func helpText(group bool) string {
 	text := "❓ <b>How to use me</b>\n\n" +
-		"Just send a message — I answer with the best available model. ✨\n\n" +
+		"Just send a message, photo, voice note, or document — I answer with the best available model. ✨\n\n" +
 		"<b>Buttons</b>\n" +
-		"🧠 Model — pick a provider, then a model, or stay on auto\n" +
-		"⚙️ Settings — your preferences\n" +
-		"📊 Usage — your statistics\n" +
-		"🔮 Best for me — a model suggestion for your usage\n\n" +
+		"🧠 Model · 🎭 Persona · 🗂 Memory · ⚙️ Settings\n\n" +
 		"<b>Commands</b>\n" +
-		"/menu · /model · /provider · /auto · /reset · /stop\n\n" +
-		"Everything is free, no limits. 🤝"
+		"/menu · /model · /fast · /race · /research · /agent\n" +
+		"/persona · /memory · /remind · /note · /task · /summarize\n" +
+		"/code · /review · /explain · /testgen · /tr · /reset · /stop\n\n" +
+		"Everything is free, fast, and resilient. 🤝"
 
 	if group {
 		text += "\n\nIn groups I answer when you mention me or reply to me."

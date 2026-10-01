@@ -58,19 +58,22 @@ func (a *app) providersScreen(conf *config.Config, tracker *user.UsageTracker, p
 
 	rows := make([]string, 0, len(status))
 	for _, info := range status {
-		icon := "🟢"
+		icon := "🟢 available"
 		switch {
 		case !info.Configured:
-			icon = "🔑"
+			icon = "🔴 unavailable"
 		case info.Cooldown > 0:
-			icon = "⏳"
+			icon = "🟡 degraded"
 		case info.Failures > 0:
-			icon = "🟡"
+			icon = "🟡 degraded"
 		case info.Local:
-			icon = "🏠"
+			icon = "🏠 local"
 		}
 
-		line := fmt.Sprintf("%s <b>%s</b> · %d model(s)", icon, escapeHTML(info.Name), len(info.Models))
+		line := fmt.Sprintf("<b>%s</b> · %s · %d model(s)", escapeHTML(info.Name), icon, len(info.Models))
+		if info.AvgLatency > 0 {
+			line += fmt.Sprintf(" · ⚡ %dms", info.AvgLatency.Milliseconds())
+		}
 		if info.Cooldown > 0 {
 			line += fmt.Sprintf(" · cooling down %s", info.Cooldown)
 		}
@@ -128,11 +131,47 @@ func (a *app) modelsScreen(conf *config.Config, tracker *user.UsageTracker, prov
 		page = 0
 	}
 
+	offset := page * modelsPageSize
+	end := offset + modelsPageSize
+	if end > len(models) {
+		end = len(models)
+	}
+
+	var modelLines []string
+	if offset < len(models) {
+		for _, ref := range models[offset:end] {
+			info := provider.LookupModel(ref.Model)
+			var badges []string
+			if info.Fast || info.Speed >= 4 {
+				badges = append(badges, "⚡ fast")
+			}
+			if info.Reasoning >= 5 {
+				badges = append(badges, "🧠 reasoning")
+			}
+			if info.Vision {
+				badges = append(badges, "👁 vision")
+			}
+			if info.Coding >= 4 {
+				badges = append(badges, "💻 coding")
+			}
+			badgeStr := ""
+			if len(badges) > 0 {
+				badgeStr = " · " + strings.Join(badges, " · ")
+			}
+			modelLines = append(modelLines, fmt.Sprintf("• <code>%s</code>%s", escapeHTML(ref.Model), badgeStr))
+		}
+	}
+
+	details := ""
+	if len(modelLines) > 0 {
+		details = "\n\n" + strings.Join(modelLines, "\n")
+	}
+
 	text := fmt.Sprintf(
 		"🧠 <b>%s</b> · %d model(s)\n\n"+
 			"Tap a model to pin it, or keep <b>✨ auto</b> and let the bot choose.\n"+
-			"Current: <b>%s</b>",
-		escapeHTML(providerName), len(models), escapeHTML(tracker.SettingsSummary()),
+			"Current: <b>%s</b>%s",
+		escapeHTML(providerName), len(models), escapeHTML(tracker.SettingsSummary()), details,
 	)
 
 	// The marker follows the model this user actually uses, not the
@@ -320,28 +359,59 @@ func (a *app) groupScreen(conf *config.Config, chat *tgbotapi.Chat) screen {
 func (a *app) adminScreen(conf *config.Config) screen {
 	var builder strings.Builder
 
-	builder.WriteString("👑 <b>Owner panel</b>\n\n")
-	builder.WriteString(fmt.Sprintf("Uptime: <b>%s</b>\n", time.Since(a.started).Round(time.Second)))
-	builder.WriteString(fmt.Sprintf("Users seen: <b>%d</b>\n", a.users.ActiveUsers()))
-	builder.WriteString(fmt.Sprintf("Group chats configured: <b>%d</b>\n", a.groups.Count()))
-	builder.WriteString(fmt.Sprintf("Default model: <code>%s</code>\n", escapeHTML(a.chain.Model())))
-	builder.WriteString("\n<b>Providers</b>\n")
+	snap := a.metrics.Snapshot()
+	queueUsed := len(a.semaphore)
+	queueCap := cap(a.semaphore)
 
+	storageBackend := "json"
+	if a.store != nil {
+		storageBackend = a.store.Backend()
+	}
+
+	var cacheHits, cacheMisses uint64
+	var cacheEntries int
+	if a.cache != nil {
+		cacheHits, cacheMisses, cacheEntries = a.cache.Stats()
+	}
+
+	builder.WriteString("👑 <b>Admin Observability Panel</b>\n\n")
+	builder.WriteString(fmt.Sprintf("Uptime: <b>%s</b>\n", time.Since(a.started).Round(time.Second)))
+	builder.WriteString(fmt.Sprintf("Active requests: <b>%d</b> (queue %d/%d)\n", snap.ActiveRequests, queueUsed, queueCap))
+	builder.WriteString(fmt.Sprintf("Total requests: <b>%d</b> · Errors: <b>%d</b> (%.1f%%)\n", snap.TotalRequests, snap.ErrorCount, snap.ErrorRatePct))
+	builder.WriteString(fmt.Sprintf("Est. tokens used: <b>%d</b> · Cost: <b>$%s</b>\n", snap.TokensUsed, formatMoney(snap.TotalCostUSD)))
+	builder.WriteString(fmt.Sprintf("Users seen: <b>%d</b> · Groups: <b>%d</b>\n", a.users.ActiveUsers(), a.groups.Count()))
+	builder.WriteString(fmt.Sprintf("Memory: <b>%.1f MB</b> · Goroutines: <b>%d</b>\n", snap.HeapAllocMB, snap.Goroutines))
+	builder.WriteString(fmt.Sprintf("Storage: <b>%s</b> · Cache: <b>%d entries</b> (hits %d / miss %d)\n", escapeHTML(storageBackend), cacheEntries, cacheHits, cacheMisses))
+	builder.WriteString(fmt.Sprintf("Default model: <code>%s</code>\n", escapeHTML(a.chain.Model())))
+
+	builder.WriteString("\n<b>Providers &amp; Latency</b>\n")
 	for _, info := range a.chain.Status() {
-		icon := "🟢"
+		icon := "🟢 available"
 		switch {
 		case !info.Configured:
-			icon = "🔑"
-		case info.Cooldown > 0:
-			icon = "⏳"
+			icon = "🔴 unavailable"
+		case info.Cooldown > 0 || info.CircuitState == "open":
+			icon = "🟡 degraded"
 		case info.Failures > 0:
-			icon = "🟡"
+			icon = "🟡 degraded"
+		}
+
+		lat := "—"
+		if info.AvgLatency > 0 {
+			lat = fmt.Sprintf("%dms", info.AvgLatency.Milliseconds())
 		}
 
 		builder.WriteString(fmt.Sprintf(
-			"%s <b>%s</b> · ok %d · fail %d\n",
-			icon, escapeHTML(info.Name), info.Successes, info.Failures,
+			"• <b>%s</b> (%s) · ok %d · fail %d · to %d · lat %s\n",
+			escapeHTML(info.Name), icon, info.Successes, info.Failures, info.Timeouts, lat,
 		))
+	}
+
+	if len(snap.TopModels) > 0 {
+		builder.WriteString("\n<b>Top Models Used</b>\n")
+		for _, m := range snap.TopModels {
+			builder.WriteString(fmt.Sprintf("• <code>%s</code>: <b>%d</b> req\n", escapeHTML(m.Model), m.Count))
+		}
 	}
 
 	return screen{
