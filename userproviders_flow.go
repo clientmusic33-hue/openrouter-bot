@@ -35,7 +35,7 @@ const (
 	flowStepName    = "name"
 	flowStepBaseURL = "base_url"
 	flowStepKey     = "key"
-	flowStepModel  = "model"
+	flowStepModel   = "model"
 )
 
 // flowTTL is how long a started flow waits for the next answer.

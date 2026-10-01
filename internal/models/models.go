@@ -74,9 +74,9 @@ type entry struct {
 // New returns an empty catalogue with the default TTL.
 func New() *Catalog {
 	return &Catalog{
-		ttl:       DefaultTTL,
+		ttl:      DefaultTTL,
 		entries:   make(map[string]entry),
-		inflight:  make(map[string]struct{}),
+		inflight: make(map[string]struct{}),
 	}
 }
 

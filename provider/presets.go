@@ -222,18 +222,18 @@ func ApplyPreset(cfg Config) Config {
 // providerSpeed hints how quickly a provider answers. Used to favour fast
 // backends for chatty users. 0..1, higher is faster.
 var providerSpeed = map[string]float64{
-	"groq":         1.0,
-	"cerebras":     0.95,
-	"gemini":       0.7,
-	"mistral":      0.7,
-	"huggingface":  0.6,
-	"openrouter":   0.5,
-	"nvidia":       0.5,
-	"deepseek":     0.5,
-	"together":     0.5,
-	"ollama":       0.3,
-	"lmstudio":     0.3,
-	"local":        0.3,
+	"groq":        1.0,
+	"cerebras":    0.95,
+	"gemini":      0.7,
+	"mistral":     0.7,
+	"huggingface": 0.6,
+	"openrouter":  0.5,
+	"nvidia":      0.5,
+	"deepseek":    0.5,
+	"together":    0.5,
+	"ollama":      0.3,
+	"lmstudio":    0.3,
+	"local":       0.3,
 }
 
 // Speed returns the relative speed hint for a provider, defaulting to a
