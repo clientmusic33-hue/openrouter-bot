@@ -365,7 +365,7 @@ func (a *app) adminScreen(conf *config.Config) screen {
 
 	storageBackend := "json"
 	if a.store != nil {
-		storageBackend = a.store.Backend()
+		storageBackend = a.store.Type()
 	}
 
 	var cacheHits, cacheMisses uint64
