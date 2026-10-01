@@ -38,7 +38,7 @@ type langHint struct {
 }
 
 var langHints = []langHint{
-	{"Go", []string{"package main", "func ", "go.mod", "goroutine", "chan ", "fmt.", "err != nil", "golang"}},
+	{"Go", []string{"package main", "func ", "go.mod", "goroutine", "chan ", "fmt.", "err != nil", "golang", " go "}},
 	{"Python", []string{"def ", "import ", "traceback (most recent call last)", "pytest", "pip install", "python", "__init__"}},
 	{"TypeScript", []string{"interface ", "typescript", ": string", ": number", "tsconfig", "readonly "}},
 	{"JavaScript", []string{"const ", "let ", "=>", "console.log", "npm ", "node.js", "javascript"}},

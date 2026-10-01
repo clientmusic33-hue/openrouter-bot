@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -92,6 +93,9 @@ func TestRaceReturnsFastestAndCancelsRest(t *testing.T) {
 	var slowCanceled atomic.Bool
 
 	fastSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		_ = r.Body.Close()
+		time.Sleep(15 * time.Millisecond)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"id": "fast-1",
@@ -103,6 +107,8 @@ func TestRaceReturnsFastestAndCancelsRest(t *testing.T) {
 	defer fastSrv.Close()
 
 	slowSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		_ = r.Body.Close()
 		select {
 		case <-r.Context().Done():
 			slowCanceled.Store(true)
