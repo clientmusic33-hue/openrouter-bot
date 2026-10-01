@@ -150,6 +150,23 @@ type Candidate struct {
 	client *openai.Client
 }
 
+// NewCandidate wraps a provider that was built outside the chain, which is how
+// a backend a user added themselves joins the walk. The chain keeps ownership
+// of health, ordering and failover; this only supplies the client to call.
+func NewCandidate(p *Provider, model string) Candidate {
+	var timeout time.Duration
+	if cfg := p.Config(); cfg.TimeoutSeconds > 0 {
+		timeout = time.Duration(cfg.TimeoutSeconds) * time.Second
+	}
+
+	return Candidate{
+		Provider: p.Name(),
+		Model:    model,
+		Timeout:  timeout,
+		client:   p.Client(),
+	}
+}
+
 // Stream opens a streaming completion against this candidate.
 func (c Candidate) Stream(
 	ctx context.Context,
@@ -345,6 +362,21 @@ func (c *Chain) ActiveAPIKey() string {
 	defer c.mu.RUnlock()
 
 	return c.providers[c.active].config.APIKey
+}
+
+// EndpointOf returns the base URL and the key of a named provider. Model
+// discovery needs the endpoint to ask for the catalogue; the key is handed to
+// that request only.
+func (c *Chain) EndpointOf(name string) (string, string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	p := c.providerNamed(name)
+	if p == nil {
+		return "", "", false
+	}
+
+	return p.BaseURL(), p.config.APIKey, true
 }
 
 // ModelsOf returns the models configured for a provider.
@@ -832,7 +864,10 @@ type ModelRef struct {
 	Provider    string
 	Model       string
 	Description string
-	Current     bool
+	// ContextLength is the context window in tokens when the provider
+	// reported one during discovery. Zero means unknown.
+	ContextLength int
+	Current       bool
 }
 
 // ModelCatalog lists every (provider, model) pair, providers in chain order.

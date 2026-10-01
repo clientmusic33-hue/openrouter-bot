@@ -114,6 +114,10 @@ Commands still work for power users; nothing is hidden behind them.
 | `/model` | Open the model picker |
 | `/model <n\|name>` | Pin a model by catalogue number or id |
 | `/model default`, `/auto` | Back to automatic model choice |
+| `/addprovider` | Store your own provider and API key (encrypted), then pick one of its models |
+| `/myproviders` | List the providers you added |
+| `/useprovider <n\|name>` | Switch to one of your own providers |
+| `/removeprovider <n\|name>` | Delete one of your own providers |
 | `/provider` | Open the provider list |
 | `/provider <n\|name>` | Pin a provider, keep auto model choice inside it |
 | `/models [provider]` | Numbered model list for one provider |
@@ -275,6 +279,8 @@ Every value can be set as a real environment variable **or** in `.env`. `config.
 | `GEMINI_API_KEY` | Google Gemini |
 | `CEREBRAS_API_KEY` | Cerebras |
 | `NVIDIA_API_KEY` | NVIDIA NIM |
+| `MISTRAL_API_KEY` | Mistral |
+| `HF_TOKEN` | Hugging Face inference providers |
 
 Every extra provider with a key set joins the chain automatically; a matching
 preset entry in `config.yaml` is the only other thing needed (a name alone is
@@ -285,6 +291,21 @@ enough).
 > `PUBLIC_MODE=true` removes every limit for everyone — anyone who finds your
 > bot can spend your provider credits. Set a hard spending cap on the provider
 > side as well. With a non-zero guest budget, anyone who finds your bot can spend against your OpenRouter key.
+
+### User owned providers
+
+Users can bring their own key: `/addprovider` walks through name, endpoint and
+key, then lists the models that key can use (`🔎 Fetch models`). Keys are sealed
+with AES-256-GCM before they touch the disk, are only decrypted for the request
+that needs them, and are scoped to the Telegram user who added them.
+
+| Variable | Description |
+|---|---|
+| `USER_PROVIDER_ENCRYPTION_KEY` | Master key that seals user API keys (`openssl rand -hex 32`). Without it `/addprovider` is disabled rather than storing keys in plaintext |
+
+Model lists are discovered from each provider's own model-list endpoint and
+cached for five minutes, so the picker shows what the provider serves right now
+instead of a hardcoded list. `🔄 Refresh models` forces a fresh lookup.
 
 ### Model and responses
 

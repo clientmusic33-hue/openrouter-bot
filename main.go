@@ -28,7 +28,9 @@ import (
 	"openrouter-bot/features/reminders"
 	"openrouter-bot/groups"
 	"openrouter-bot/internal/cache"
+	"openrouter-bot/internal/models"
 	"openrouter-bot/internal/ratelimit"
+	"openrouter-bot/internal/security"
 	"openrouter-bot/internal/telemetry"
 	"openrouter-bot/lang"
 	"openrouter-bot/provider"
@@ -37,6 +39,7 @@ import (
 	"openrouter-bot/translator"
 	"openrouter-bot/ui"
 	"openrouter-bot/user"
+	"openrouter-bot/userproviders"
 	"openrouter-bot/workers"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -134,25 +137,40 @@ func main() {
 	aiAgent := agent.New(chain, toolReg)
 	metrics := telemetry.NewCollector()
 
+	// The master key that seals user API keys lives in the environment only.
+	// Without it the "bring your own key" feature stays off rather than
+	// storing anything in plaintext.
+	userProviderStore := userproviders.NewStore(store, security.MasterKeyFromEnv())
+	if !userProviderStore.Enabled() {
+		log.Printf(
+			"User providers disabled: set %s to let users add their own API keys",
+			security.EncryptionKeyEnv,
+		)
+	}
+
 	app := &app{
-		ctx:       ctx,
-		bot:       bot,
-		manager:   manager,
-		chain:     chain,
-		users:     user.NewUserManager(logsDir()),
-		groups:    groups.NewManager("data/groups.json"),
-		store:     store,
-		cache:     respCache,
-		limiter:   limiter,
-		memory:    memMgr,
-		optimizer: optimizer,
-		reminders: remMgr,
-		agent:     aiAgent,
-		metrics:   metrics,
-		semaphore: make(chan struct{}, conf.MaxConcurrentRequests),
-		pending:   make(map[int64]map[int]pendingAnswer),
-		warned:    make(map[warnKey]time.Time),
-		started:   time.Now(),
+		ctx:           ctx,
+		bot:           bot,
+		manager:       manager,
+		chain:         chain,
+		users:         user.NewUserManager(logsDir()),
+		groups:        groups.NewManager("data/groups.json"),
+		store:         store,
+		cache:         respCache,
+		limiter:       limiter,
+		memory:        memMgr,
+		optimizer:     optimizer,
+		reminders:     remMgr,
+		agent:         aiAgent,
+		metrics:       metrics,
+		userProviders: userProviderStore,
+		modelCatalog:  models.New(),
+		semaphore:     make(chan struct{}, conf.MaxConcurrentRequests),
+		pending:       make(map[int64]map[int]pendingAnswer),
+		warned:        make(map[warnKey]time.Time),
+		flows:         make(map[int64]*providerFlow),
+		fetched:       make(map[int64][]string),
+		started:       time.Now(),
 	}
 
 	workers.StartReminderScheduler(ctx, remMgr, 5*time.Second, app.deliverReminder)
@@ -255,6 +273,26 @@ type app struct {
 	reminders *reminders.Manager
 	agent     *agent.Agent
 	metrics   *telemetry.Collector
+
+	// userProviders holds the providers users bring themselves, with their
+	// API keys sealed under the server master key.
+	userProviders *userproviders.Store
+	// modelCatalog caches the model lists discovered from the providers.
+	modelCatalog *models.Catalog
+
+	// flowMu guards the in progress /addprovider conversations.
+	flowMu sync.Mutex
+	flows  map[int64]*providerFlow
+
+	// fetchedMu guards the numbered model lists a user is choosing from
+	// while adding a provider. Only the update loop touches the flows
+	// themselves, so the two are kept apart on purpose.
+	fetchedMu sync.Mutex
+	fetched   map[int64][]string
+
+	// modelViews remembers which provider screen a message shows, so a
+	// background model refresh never overwrites a different menu.
+	modelViews sync.Map
 
 	// semaphore caps concurrent AI requests so that a burst of group
 	// messages cannot exhaust the upstream rate limit.
@@ -374,13 +412,19 @@ func (a *app) processUpdate(update tgbotapi.Update) {
 
 	tracker := a.users.GetUser(update.Message.Chat.ID, senderID, senderUsername, conf)
 
+	logText := update.Message.Text
+	if a.flowAwaitingSecret(senderID) {
+		// A user typing their API key must never have it land in the log.
+		logText = "[REDACTED_API_KEY]"
+	}
+
 	log.Printf(
 		"INCOMING MESSAGE: chat=%d type=%s sender_id=%d username=%q text=%q",
 		update.Message.Chat.ID,
 		update.Message.Chat.Type,
 		senderID,
 		senderUsername,
-		update.Message.Text,
+		logText,
 	)
 
 	if isGroupChat(update.Message.Chat) {
@@ -429,6 +473,12 @@ func (a *app) processUpdate(update tgbotapi.Update) {
 	// -----------------------------------------------------------------
 	// AUTOMATIC GROUP TRANSLATION
 	// -----------------------------------------------------------------
+
+	// A started /addprovider conversation owns the next message: the answer
+	// is a name, a URL, a key or a model, never a prompt for the AI.
+	if a.consumeProviderFlow(update.Message, conf, tracker) {
+		return
+	}
 
 	if isGroupChat(update.Message.Chat) {
 		settings := a.groups.Get(update.Message.Chat.ID)
@@ -577,6 +627,9 @@ func (a *app) chatOptions(conf *config.Config, tracker *user.UsageTracker) api.O
 		Markdown:   conf.RenderMarkdown,
 		MaxChars:   conf.MaxReplyChars,
 		Buttons:    true,
+		// A provider the user brought themselves leads the walk. Its key is
+		// decrypted for this request only.
+		UserCandidates: a.userCandidate(tracker),
 	}
 }
 

@@ -45,6 +45,10 @@ type Options struct {
 	// SystemSupplement appends extra context (persona, memory, summary) to the
 	// system prompt for this request without mutating the stored prompt.
 	SystemSupplement string
+	// UserCandidates leads the walk with a backend the user brought
+	// themselves. It is built per request from a key that is decrypted for
+	// that request only, and it never enters any cache.
+	UserCandidates []provider.Candidate
 }
 
 // Prompt is one generation request. It is either derived from an incoming
@@ -144,6 +148,7 @@ func Generate(
 	} else {
 		candidates = chain.CandidatesFor(opts.Preference, opts.Profile)
 	}
+	candidates = withUserCandidates(candidates, opts.UserCandidates)
 	if len(candidates) == 0 {
 		return Result{}, errors.New("no usable models in the provider chain")
 	}
@@ -498,6 +503,35 @@ func Generate(
 			}
 		}
 	}
+}
+
+// withUserCandidates puts a user's own backend in front of the chain without
+// duplicating a pair the chain already offers. The rest of the walk is
+// untouched, so a failing user provider simply fails over to the operator's
+// chain exactly like any other backend.
+func withUserCandidates(chain, own []provider.Candidate) []provider.Candidate {
+	if len(own) == 0 {
+		return chain
+	}
+
+	all := make([]provider.Candidate, 0, len(chain)+len(own))
+	all = append(all, own...)
+	all = append(all, chain...)
+
+	seen := make(map[string]struct{}, len(all))
+	out := make([]provider.Candidate, 0, len(all))
+
+	for _, candidate := range all {
+		key := strings.ToLower(candidate.Provider) + "\x00" + strings.ToLower(candidate.Model)
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+
+		seen[key] = struct{}{}
+		out = append(out, candidate)
+	}
+
+	return out
 }
 
 // openNext tries every candidate from start onwards and returns the first

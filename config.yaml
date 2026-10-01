@@ -22,9 +22,11 @@ max_tokens: 2000
 # safety margin and matches what the assistant is told to produce.
 max_reply_chars: 3500
 
-# Render final answers as Markdown. Off by default: the assistant is asked for
-# plain text, and Telegram rejects the whole message when markup is malformed.
-render_markdown: false
+# Render final answers as Markdown, so headings, bullets, tables and code
+# blocks come out the way the model wrote them. Telegram rejects a message
+# whose markup does not parse, so the renderer falls back to legacy Markdown
+# and then to plain text: nothing is ever lost.
+render_markdown: true
 
 # Occasionally suggest a model that suits the user's usage better.
 suggest_models: true
@@ -148,15 +150,18 @@ providers:
   # Key: GEMINI_API_KEY from https://aistudio.google.com/apikey
   - name: gemini
 
-  # Cerebras, NVIDIA NIM, Mistral, DeepSeek and Together all work the same
-  # way - add the name and set the matching key.
+  # Cerebras, NVIDIA NIM, Mistral, Hugging Face, DeepSeek and Together all
+  # work the same way - add the name and set the matching key.
   # Key: CEREBRAS_API_KEY from https://cloud.cerebras.ai
   - name: cerebras
   # NVIDIA NIM: the hosted model catalogue, with a free tier.
   # Key: NVIDIA_API_KEY from https://build.nvidia.com
   - name: nvidia
   # Key: MISTRAL_API_KEY from https://console.mistral.ai
-  #- name: mistral
+  - name: mistral
+  # Hugging Face inference providers: one token, hundreds of open models.
+  # Key: HF_TOKEN from https://huggingface.co/settings/tokens
+  - name: huggingface
   # Key: DEEPSEEK_API_KEY from https://platform.deepseek.com
   #- name: deepseek
 

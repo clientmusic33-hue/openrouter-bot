@@ -44,6 +44,15 @@ const (
 	ActionMemory      = "mem"
 	ActionReminders   = "rem"
 	ActionNoop        = "noop"
+
+	// The "your own provider" flow: a user brings an API key, the bot stores
+	// it sealed and lists what that key can use.
+	ActionUserProviders       = "uprovs"
+	ActionUserProvider        = "uprov"
+	ActionUserModel           = "umdl"
+	ActionUserProviderRefresh = "uprfr"
+	ActionUserProviderAdd     = "upradd"
+	ActionUserProviderFetch   = "upfetch"
 )
 
 // Callback is a decoded button press.
@@ -282,6 +291,97 @@ func offsetOf(models []provider.ModelRef, model string) int {
 	}
 
 	return 0
+}
+
+// UserProviderList lets the user pick one of their own providers, then a model
+// inside it. It mirrors ProviderList so the two pickers feel the same.
+func UserProviderList(names []string, page, pageSize int) tgbotapi.InlineKeyboardMarkup {
+	rows := [][]tgbotapi.InlineKeyboardButton{
+		tgbotapi.NewInlineKeyboardRow(
+			button("➕ Add provider", ActionUserProviderAdd),
+		),
+	}
+
+	start := page * pageSize
+	end := start + pageSize
+	if start > len(names) {
+		start = len(names)
+	}
+	if end > len(names) {
+		end = len(names)
+	}
+
+	for i := start; i < end; i++ {
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+			button(truncate(names[i], 40), ActionUserProvider, indexArgs(i)...),
+		))
+	}
+
+	if nav := Navigation(page, pageSize, len(names), ActionUserProviders); len(nav) > 0 {
+		rows = append(rows, nav)
+	}
+
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		button("⬅️ Providers", ActionProviders),
+		button("🏠 Menu", ActionMenu),
+	))
+
+	return tgbotapi.NewInlineKeyboardMarkup(rows...)
+}
+
+// UserProviderModels shows the models of one of the user's own providers, with
+// a manual refresh because that list comes from the user's own key.
+func UserProviderModels(
+	providerIndex int,
+	modelIDs []string,
+	current string,
+	offset, pageSize int,
+) tgbotapi.InlineKeyboardMarkup {
+	rows := [][]tgbotapi.InlineKeyboardButton{
+		tgbotapi.NewInlineKeyboardRow(
+			button("🔄 Refresh models", ActionUserProviderRefresh, indexArgs(providerIndex)...),
+		),
+	}
+
+	end := offset + pageSize
+	if offset > len(modelIDs) {
+		offset = len(modelIDs)
+	}
+	if end > len(modelIDs) {
+		end = len(modelIDs)
+	}
+
+	for i := offset; i < end; i++ {
+		label := modelIDs[i]
+		if current != "" && strings.EqualFold(label, current) {
+			label = "▶ " + label
+		}
+
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+			button(truncate(label, 44), ActionUserModel, indexArgs(providerIndex, i)...),
+		))
+	}
+
+	if nav := Navigation(offset/pageSize, pageSize, len(modelIDs), ActionUserProvider, indexArgs(providerIndex)...); len(nav) > 0 {
+		rows = append(rows, nav)
+	}
+
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		button("⬅️ Your providers", ActionUserProviders),
+		button("🏠 Menu", ActionMenu),
+	))
+
+	return tgbotapi.NewInlineKeyboardMarkup(rows...)
+}
+
+// FetchModelsButton offers live discovery while a user is adding a provider
+// and has not chosen a model yet.
+func FetchModelsButton(providerID string) tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			button("🔎 Fetch models", ActionUserProviderFetch, providerID),
+		),
+	)
 }
 
 // Favourites lists bookmarked models, in catalogue order.

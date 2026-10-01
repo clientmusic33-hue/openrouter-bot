@@ -80,7 +80,7 @@ func (a *app) handleCallback(query *tgbotapi.CallbackQuery, conf *config.Config)
 	case ui.ActionProvider:
 		index := firstIndex(callback.Args, 0)
 		page := secondIndex(callback.Args, 0)
-		a.editScreen(chatID, messageID, a.modelsScreen(conf, tracker, index, page))
+		a.showChainModels(chatID, messageID, conf, tracker, index, page)
 
 	case ui.ActionModel:
 		providerIndex := firstIndex(callback.Args, -1)
@@ -176,6 +176,32 @@ func (a *app) handleCallback(query *tgbotapi.CallbackQuery, conf *config.Config)
 
 	case ui.ActionFavourites:
 		a.editScreen(chatID, messageID, a.favouritesScreen(conf, tracker))
+
+	case ui.ActionUserProviders:
+		page := firstIndex(callback.Args, 0)
+		a.editScreen(chatID, messageID, a.userProvidersScreen(query.From.ID, page))
+
+	case ui.ActionUserProvider:
+		index := firstIndex(callback.Args, 0)
+		page := secondIndex(callback.Args, 0)
+		a.showUserProviderModels(chatID, messageID, query.From.ID, tracker, index, page)
+
+	case ui.ActionUserModel:
+		providerIndex := firstIndex(callback.Args, -1)
+		modelIndex := secondIndex(callback.Args, -1)
+		a.selectUserProviderModel(query, tracker, providerIndex, modelIndex)
+
+	case ui.ActionUserProviderRefresh:
+		index := firstIndex(callback.Args, 0)
+		page := secondIndex(callback.Args, 0)
+		a.refreshUserProviderModels(query.From.ID, chatID, messageID, tracker, index, page, true)
+		a.toast(query, "Refreshing models 🔄")
+
+	case ui.ActionUserProviderAdd:
+		a.startProviderFlow(query, conf, tracker)
+
+	case ui.ActionUserProviderFetch:
+		a.fetchUserProviderModels(query, conf, tracker, firstArg(callback.Args, ""))
 
 	case ui.ActionFavourite:
 		answer, ok := a.pendingAnswer(chatID, messageID)
@@ -434,6 +460,8 @@ func helpText(group bool) string {
 		"/menu · /model · /fast · /race · /research · /agent\n" +
 		"/persona · /memory · /remind · /note · /task · /summarize\n" +
 		"/code · /review · /explain · /testgen · /tr · /reset · /stop\n\n" +
+		"<b>🔐 Your own providers</b>\n" +
+		"/addprovider · /myproviders · /useprovider · /removeprovider\n\n" +
 		"Everything is free, fast, and resilient. 🤝"
 
 	if group {

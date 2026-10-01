@@ -105,6 +105,22 @@ func (a *app) handleCommand(message *tgbotapi.Message, conf *config.Config, trac
 	case "models":
 		a.handleModels(message, conf, tracker)
 
+	case "addprovider":
+		a.handleAddProvider(message, conf, tracker)
+
+	case "myproviders":
+		a.handleMyProviders(message, conf, tracker)
+
+	case "useprovider":
+		a.handleUseProvider(message, conf, tracker)
+
+	case "removeprovider":
+		a.handleRemoveProvider(message, conf, tracker)
+
+	case "cancel":
+		a.clearFlow(senderID(message))
+		a.send(chatID, "❌ Cancelled. Nothing was saved.", "")
+
 	case "auto":
 		tracker.ResetPreference()
 		a.send(chatID, "✨ Automatic mode on — I'll pick the best model for your usage.", "")
@@ -219,6 +235,10 @@ func (a *app) handleHelp(message *tgbotapi.Message, conf *config.Config) {
 		"/summarize — summarize conversation &amp; action items\n" +
 		"/tr &lt;lang&gt; — translate replied message or text\n" +
 		"/model · /provider · /auto · /reset · /stop · /group\n\n" +
+		"<b>🔐 Your own providers</b>\n" +
+		"/addprovider — store your own API key (encrypted) and pick its models\n" +
+		"/myproviders — list what you added · /useprovider &lt;name&gt; — switch to it\n" +
+		"/removeprovider &lt;name&gt; — delete it again\n\n" +
 		"Everything is free, fast, and resilient. 🤝"
 
 	if isGroupChat(message.Chat) {
@@ -541,6 +561,10 @@ func (a *app) setCommands(conf *config.Config) {
 	private := []tgbotapi.BotCommand{
 		{Command: "menu", Description: "Main panel with buttons"},
 		{Command: "model", Description: "Pick a provider and a model"},
+		{Command: "addprovider", Description: "Add your own AI provider and API key"},
+		{Command: "myproviders", Description: "List your own providers"},
+		{Command: "useprovider", Description: "Switch to one of your providers"},
+		{Command: "removeprovider", Description: "Remove one of your providers"},
 		{Command: "fast", Description: "Fast low-latency AI response"},
 		{Command: "race", Description: "Race multiple AI models concurrently"},
 		{Command: "research", Description: "Web research with cited sources"},
