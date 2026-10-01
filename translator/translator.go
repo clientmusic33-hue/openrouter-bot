@@ -71,10 +71,13 @@ func Translate(
 	var lastErr error
 
 	for _, candidate := range candidates {
+		if !chain.CanAttempt(candidate) {
+			continue
+		}
 		resp, err := candidate.Complete(ctx, req)
 		if err != nil {
 			lastErr = err
-			chain.RecordFailure(candidate.Provider, err)
+			chain.RecordModelFailure(candidate.Provider, candidate.Model, err)
 
 			log.Printf(
 				"Translation attempt failed | provider=%s model=%s error=%v",
@@ -91,14 +94,20 @@ func Translate(
 
 		if len(resp.Choices) == 0 {
 			lastErr = fmt.Errorf("translation returned no response")
-			chain.RecordFailure(candidate.Provider, lastErr)
+			chain.RecordModelFailure(candidate.Provider, candidate.Model, lastErr)
 
 			continue
 		}
 
-		chain.RecordSuccess(candidate.Provider)
-
 		out := strings.TrimSpace(resp.Choices[0].Message.Content)
+		if out == "" {
+			lastErr = fmt.Errorf("translation returned an empty response")
+			chain.RecordModelFailure(candidate.Provider, candidate.Model, lastErr)
+
+			continue
+		}
+
+		chain.RecordModelSuccess(candidate.Provider, candidate.Model, 0)
 		return restoreTokens(out, tokens), nil
 	}
 

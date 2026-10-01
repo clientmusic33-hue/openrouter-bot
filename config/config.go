@@ -471,8 +471,16 @@ func loadProviders() []provider.Config {
 			continue
 		}
 
-		// A provider may be listed by name only: the preset supplies the
-		// endpoint, the models and the name of the key variable.
+		if len(entry.Models) == 0 && strings.EqualFold(entry.Name, "openrouter") {
+			// Keep only the configured default as a cold-start/failure
+			// fallback. The picker replaces it with the complete live list.
+			if model := strings.TrimSpace(viper.GetString("MODEL")); model != "" {
+				entry.Models = []string{model}
+			}
+		}
+
+		// A provider may be listed by name only: the preset supplies its
+		// endpoint, fallback models (when maintained) and key variable.
 		entry = provider.ApplyPreset(entry)
 
 		if entry.APIKeyEnv != "" {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -25,8 +26,8 @@ func TestDiscoverNormalisesAndCaches(t *testing.T) {
 
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"data":[
-			{"id":"models/gemini-2.5-flash","name":"Gemini","context_length":1048576},
-			{"id":"gpt-oss-120b","context_length":131072},
+			{"id":"models/gemini-2.5-flash","name":"Gemini Flash","context_length":1048576,"pricing":{"prompt":"0","completion":"0"},"top_provider":{"name":"Google"}},
+			{"id":"gpt-oss-120b","context_length":131072,"pricing":{"prompt":"0.0000002","completion":"0.0000006"}},
 			{"id":"gpt-oss-120b"}
 		]}`))
 	}))
@@ -48,8 +49,17 @@ func TestDiscoverNormalisesAndCaches(t *testing.T) {
 	if list[0].ContextLength != 1048576 {
 		t.Errorf("context length = %d, want 1048576", list[0].ContextLength)
 	}
-	if list[0].DisplayName != "Gemini" {
-		t.Errorf("display name = %q, want Gemini", list[0].DisplayName)
+	if list[0].DisplayName != "Gemini Flash" {
+		t.Errorf("display name = %q, want Gemini Flash", list[0].DisplayName)
+	}
+	if list[0].SourceProvider != "Google" {
+		t.Errorf("source provider = %q, want Google", list[0].SourceProvider)
+	}
+	if !list[0].PriceKnown || !list[0].Free {
+		t.Errorf("free pricing was not retained: %+v", list[0])
+	}
+	if !list[1].PriceKnown || list[1].Free {
+		t.Errorf("paid pricing was not retained: %+v", list[1])
 	}
 
 	again, err := catalog.Discover(ctx, "provider:test", server.URL, "test-key")
@@ -116,5 +126,68 @@ func TestCacheKeyIsolatesUserProviders(t *testing.T) {
 	}
 	if CacheKey("groq", "") != CacheKey("Groq", "") {
 		t.Fatal("provider keys must be case insensitive")
+	}
+}
+
+func TestDiscoverKeepsCompleteCatalogue(t *testing.T) {
+	var payload strings.Builder
+	payload.WriteString(`{"data":[`)
+	for i := 0; i < 350; i++ {
+		if i > 0 {
+			payload.WriteByte(',')
+		}
+		payload.WriteString(`{"id":"vendor/model-`)
+		payload.WriteString(strconv.Itoa(i))
+		payload.WriteString(`"}`)
+	}
+	payload.WriteString(`]}`)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(payload.String()))
+	}))
+	defer server.Close()
+
+	catalog := New()
+	list, err := catalog.Discover(context.Background(), "provider:full", server.URL, "")
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if len(list) != 350 {
+		t.Fatalf("Discover returned %d models, want the complete 350", len(list))
+	}
+}
+
+func TestDiscoverBacksOffAfterRateLimit(t *testing.T) {
+	calls := 0
+	limited := true
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if limited {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":[{"id":"live-model"}]}`))
+	}))
+	defer server.Close()
+
+	catalog := New()
+	key := "provider:rate-limited"
+	if _, err := catalog.Discover(context.Background(), key, server.URL, ""); err == nil {
+		t.Fatal("expected the first rate-limited request to fail")
+	}
+	if _, err := catalog.Discover(context.Background(), key, server.URL, ""); err == nil {
+		t.Fatal("expected a recent failure to suppress another request")
+	}
+	if calls != 1 {
+		t.Fatalf("made %d requests during backoff, want 1", calls)
+	}
+
+	limited = false
+	catalog.Invalidate(key)
+	if _, err := catalog.Discover(context.Background(), key, server.URL, ""); err != nil {
+		t.Fatalf("Discover after explicit invalidation: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("made %d requests after invalidation, want 2", calls)
 	}
 }

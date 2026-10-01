@@ -235,6 +235,33 @@ func ProviderList(infos []provider.Info, active string, page, pageSize int) tgbo
 	return tgbotapi.NewInlineKeyboardMarkup(rows...)
 }
 
+func modelPickerLabel(ref provider.ModelRef) string {
+	status := "⚪"
+	switch ref.Availability {
+	case provider.ModelAvailable:
+		status = "🟢"
+	case provider.ModelLimited:
+		status = "🟡"
+	case provider.ModelUnavailable:
+		status = "🔴"
+	}
+
+	price := "❔"
+	if ref.PriceKnown {
+		price = "💰"
+		if ref.Free {
+			price = "🆓"
+		}
+	}
+
+	name := strings.TrimSpace(ref.DisplayName)
+	if name == "" {
+		name = ref.Model
+	}
+
+	return status + " " + price + " " + name
+}
+
 // ModelList shows the models of one provider.
 func ModelList(providerIndex int, providerName string, models []provider.ModelRef, current string, offset, pageSize int, favourite func(string) bool) tgbotapi.InlineKeyboardMarkup {
 	rows := [][]tgbotapi.InlineKeyboardButton{
@@ -257,7 +284,7 @@ func ModelList(providerIndex int, providerName string, models []provider.ModelRe
 		// "current" is the model this user effectively uses (their pin, or
 		// the configured default), while ref.Current only reflects the
 		// bot-wide default. Marking both means a pin is always visible.
-		label := ref.Model
+		label := modelPickerLabel(ref)
 		if ref.Current || (current != "" && strings.EqualFold(ref.Model, current)) {
 			label = "▶ " + label
 		} else if favourite != nil && favourite(ref.Model) {
@@ -333,7 +360,7 @@ func UserProviderList(names []string, page, pageSize int) tgbotapi.InlineKeyboar
 // a manual refresh because that list comes from the user's own key.
 func UserProviderModels(
 	providerIndex int,
-	modelIDs []string,
+	models []provider.ModelRef,
 	current string,
 	offset, pageSize int,
 ) tgbotapi.InlineKeyboardMarkup {
@@ -344,16 +371,17 @@ func UserProviderModels(
 	}
 
 	end := offset + pageSize
-	if offset > len(modelIDs) {
-		offset = len(modelIDs)
+	if offset > len(models) {
+		offset = len(models)
 	}
-	if end > len(modelIDs) {
-		end = len(modelIDs)
+	if end > len(models) {
+		end = len(models)
 	}
 
 	for i := offset; i < end; i++ {
-		label := modelIDs[i]
-		if current != "" && strings.EqualFold(label, current) {
+		ref := models[i]
+		label := modelPickerLabel(ref)
+		if current != "" && strings.EqualFold(ref.Model, current) {
 			label = "▶ " + label
 		}
 
@@ -362,7 +390,7 @@ func UserProviderModels(
 		))
 	}
 
-	if nav := Navigation(offset/pageSize, pageSize, len(modelIDs), ActionUserProvider, indexArgs(providerIndex)...); len(nav) > 0 {
+	if nav := Navigation(offset/pageSize, pageSize, len(models), ActionUserProvider, indexArgs(providerIndex)...); len(nav) > 0 {
 		rows = append(rows, nav)
 	}
 

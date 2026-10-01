@@ -17,7 +17,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,14 +30,28 @@ import (
 // Model is the normalised form of one entry of a provider's model list. Only
 // what the provider actually returned is kept: nothing is invented.
 type Model struct {
-	// Provider is the bot side name of the backend that listed the model.
-	Provider string `json:"provider"`
+	// Provider is the bot-side name of the backend that listed the model.
+	Provider       string `json:"provider"`
 	// ModelID is the id to send in a completion request.
-	ModelID string `json:"model_id"`
+	ModelID        string `json:"model_id"`
 	// DisplayName is the human label, when the provider supplies one.
-	DisplayName string `json:"display_name,omitempty"`
+	DisplayName    string `json:"display_name,omitempty"`
+	// SourceProvider is the upstream publisher/provider, usually the
+	// namespace before '/' in an OpenRouter model id.
+	SourceProvider string `json:"source_provider,omitempty"`
 	// ContextLength is the context window in tokens, when reported.
-	ContextLength int `json:"context_length,omitempty"`
+	ContextLength  int    `json:"context_length,omitempty"`
+	// Pricing is copied from the model catalogue. Missing fields remain empty
+	// so callers never mistake missing pricing for a free model.
+	Pricing    Pricing `json:"pricing,omitempty"`
+	PriceKnown bool    `json:"price_known,omitempty"`
+	Free       bool    `json:"free,omitempty"`
+}
+
+// Pricing contains per-token prompt and completion prices in USD.
+type Pricing struct {
+	Prompt     string `json:"prompt,omitempty"`
+	Completion string `json:"completion,omitempty"`
 }
 
 const (
@@ -43,17 +59,28 @@ const (
 	DefaultTTL = 5 * time.Minute
 	// fetchTimeout bounds one discovery request.
 	fetchTimeout = 12 * time.Second
-	// maxModels caps a list so one huge catalogue cannot flood the picker.
-	maxModels = 300
+	// failedFetchTTL dampens repeated requests after an upstream error or
+	// rate limit. An explicit refresh can bypass it.
+	failedFetchTTL = 30 * time.Second
 )
 
 // listResponse is the OpenAI-compatible model list envelope. Providers that
-// add fields simply leave them unread here.
+// add fields simply leave them unread here. OpenRouter's model list also
+// supplies pricing and publisher information, so those fields are retained.
 type listResponse struct {
 	Data []struct {
-		ID            string `json:"id"`
-		Name          string `json:"name"`
-		ContextLength int    `json:"context_length"`
+		ID            string          `json:"id"`
+		Name          string          `json:"name"`
+		ContextLength int             `json:"context_length"`
+		Provider      json.RawMessage `json:"provider"`
+		ProviderName  string          `json:"provider_name"`
+		Pricing       struct {
+			Prompt     json.RawMessage `json:"prompt"`
+			Completion json.RawMessage `json:"completion"`
+		} `json:"pricing"`
+		TopProvider struct {
+			Name string `json:"name"`
+		} `json:"top_provider"`
 	} `json:"data"`
 }
 
@@ -61,9 +88,10 @@ type listResponse struct {
 type Catalog struct {
 	ttl time.Duration
 
-	mu       sync.Mutex
-	entries  map[string]entry
-	inflight map[string]struct{}
+	mu          sync.Mutex
+	entries     map[string]entry
+	failedUntil map[string]time.Time
+	inflight    map[string]struct{}
 }
 
 type entry struct {
@@ -74,9 +102,10 @@ type entry struct {
 // New returns an empty catalogue with the default TTL.
 func New() *Catalog {
 	return &Catalog{
-		ttl:      DefaultTTL,
-		entries:  make(map[string]entry),
-		inflight: make(map[string]struct{}),
+		ttl:         DefaultTTL,
+		entries:     make(map[string]entry),
+		failedUntil: make(map[string]time.Time),
+		inflight:    make(map[string]struct{}),
 	}
 }
 
@@ -109,12 +138,36 @@ func (c *Catalog) Cached(key string) ([]Model, bool) {
 	}
 
 	if time.Now().Before(item.expiresAt) {
-		return item.models, true
+		return cloneModels(item.models), true
 	}
 
-	delete(c.entries, key)
-
+	// Keep the last good response for stale-while-refresh fallback. Expired
+	// metadata is not presented as fresh, but is safer than an empty picker
+	// while the upstream is unavailable.
 	return nil, false
+}
+
+// LastKnown returns the most recent successful catalogue even when its TTL
+// has elapsed. It is used only as a display fallback while a refresh runs or
+// after a temporary upstream error.
+func (c *Catalog) LastKnown(key string) ([]Model, bool) {
+	if c == nil || key == "" {
+		return nil, false
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	item, ok := c.entries[key]
+	if !ok {
+		return nil, false
+	}
+
+	return cloneModels(item.models), true
+}
+
+func cloneModels(source []Model) []Model {
+	return append([]Model(nil), source...)
 }
 
 // Invalidate drops a cached list so the next lookup fetches again. This is
@@ -126,13 +179,14 @@ func (c *Catalog) Invalidate(key string) {
 
 	c.mu.Lock()
 	delete(c.entries, key)
+	delete(c.failedUntil, key)
 	c.mu.Unlock()
 }
 
 // Discover returns a provider's live model list, fetching it at most once per
 // key while a request for the same key is already running. A failure is
 // reported without any part of the credential in it, so the caller can fall
-// back to a maintained list.
+// back to its last known catalogue or configured models.
 func (c *Catalog) Discover(ctx context.Context, key, baseURL, apiKey string) ([]Model, error) {
 	if c == nil {
 		return nil, fmt.Errorf("model catalogue is not configured")
@@ -151,6 +205,10 @@ func (c *Catalog) Discover(ctx context.Context, key, baseURL, apiKey string) ([]
 
 		return c.awaitInflight(ctx, key)
 	}
+	if c.failedRecentlyLocked(key, time.Now()) {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("model discovery temporarily paused after a recent failure")
+	}
 	c.inflight[key] = struct{}{}
 	c.mu.Unlock()
 
@@ -164,23 +222,39 @@ func (c *Catalog) Discover(ctx context.Context, key, baseURL, apiKey string) ([]
 }
 
 // RefreshAsync refreshes a stale entry in the background and reports the
-// result through done. A fresh entry, or a fetch that is already running, is
-// left alone.
+// result through done. A fresh entry, a recent failure, or a fetch that is
+// already running is left alone.
 //
 // apiKey is a function so that a user's credential is only materialised for
 // the request itself and never parked in a closure that outlives it.
 func (c *Catalog) RefreshAsync(key, baseURL string, apiKey func() string, done func([]Model, error)) {
-	if c == nil || key == "" || strings.TrimSpace(baseURL) == "" {
+	c.refreshAsync(key, baseURL, apiKey, done, false)
+}
+
+// RefreshNowAsync bypasses freshness and failure backoff while keeping the
+// last good catalogue available if the forced request fails.
+func (c *Catalog) RefreshNowAsync(key, baseURL string, apiKey func() string, done func([]Model, error)) {
+	c.refreshAsync(key, baseURL, apiKey, done, true)
+}
+
+func (c *Catalog) refreshAsync(key, baseURL string, apiKey func() string, done func([]Model, error), force bool) {
+	if c == nil || key == "" || strings.TrimSpace(baseURL) == "" || apiKey == nil {
 		return
 	}
-	if _, fresh := c.Cached(key); fresh {
-		return
+	if !force {
+		if _, fresh := c.Cached(key); fresh {
+			return
+		}
 	}
 
 	c.mu.Lock()
 	if _, running := c.inflight[key]; running {
 		c.mu.Unlock()
 
+		return
+	}
+	if !force && c.failedRecentlyLocked(key, time.Now()) {
+		c.mu.Unlock()
 		return
 	}
 	c.inflight[key] = struct{}{}
@@ -237,15 +311,42 @@ func (c *Catalog) awaitInflight(ctx context.Context, key string) ([]Model, error
 
 func (c *Catalog) fetchAndStore(ctx context.Context, key, baseURL, apiKey string) ([]Model, error) {
 	list, err := fetchModels(ctx, baseURL, apiKey)
+	if err == nil && len(list) == 0 {
+		err = fmt.Errorf("model list contained no models")
+	}
 	if err != nil {
+		c.mu.Lock()
+		c.failedUntil[key] = time.Now().Add(failedFetchTTL)
+		c.mu.Unlock()
 		return nil, err
 	}
 
+	if strings.HasPrefix(key, "provider:") {
+		name := strings.TrimPrefix(key, "provider:")
+		for i := range list {
+			list[i].Provider = name
+		}
+	}
+
 	c.mu.Lock()
-	c.entries[key] = entry{models: list, expiresAt: time.Now().Add(c.ttl)}
+	c.entries[key] = entry{models: cloneModels(list), expiresAt: time.Now().Add(c.ttl)}
+	delete(c.failedUntil, key)
 	c.mu.Unlock()
 
 	return list, nil
+}
+
+func (c *Catalog) failedRecentlyLocked(key string, now time.Time) bool {
+	until, ok := c.failedUntil[key]
+	if !ok {
+		return false
+	}
+	if now.Before(until) {
+		return true
+	}
+
+	delete(c.failedUntil, key)
+	return false
 }
 
 // fetchModels calls the provider's official OpenAI-compatible model list
@@ -275,7 +376,7 @@ func fetchModels(ctx context.Context, baseURL, apiKey string) ([]Model, error) {
 		return nil, fmt.Errorf("model list returned %s", resp.Status)
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if err != nil {
 		return nil, fmt.Errorf("reading model list: %w", err)
 	}
@@ -288,8 +389,9 @@ func fetchModels(ctx context.Context, baseURL, apiKey string) ([]Model, error) {
 	return normalise(parsed), nil
 }
 
-// normalise turns a provider specific payload into the common form, dropping
-// duplicates and capping the size so the picker stays usable.
+// normalise turns a provider-specific payload into the common form and drops
+// duplicate ids. It deliberately does not cap the list: OpenRouter's endpoint
+// is the source of truth for the complete model picker.
 func normalise(parsed listResponse) []Model {
 	out := make([]Model, 0, len(parsed.Data))
 	seen := make(map[string]struct{}, len(parsed.Data))
@@ -316,12 +418,78 @@ func normalise(parsed listResponse) []Model {
 			model.ContextLength = item.ContextLength
 		}
 
-		out = append(out, model)
-
-		if len(out) >= maxModels {
-			break
+		model.SourceProvider = firstNonEmpty(
+			providerName(item.Provider),
+			item.ProviderName,
+			item.TopProvider.Name,
+		)
+		if model.SourceProvider == "" {
+			if namespace, _, found := strings.Cut(id, "/"); found {
+				model.SourceProvider = namespace
+			}
 		}
+
+		prompt, promptOK := parsePrice(item.Pricing.Prompt)
+		completion, completionOK := parsePrice(item.Pricing.Completion)
+		model.Pricing = Pricing{Prompt: prompt, Completion: completion}
+		model.PriceKnown = promptOK && completionOK
+		model.Free = model.PriceKnown && isZeroPrice(prompt) && isZeroPrice(completion)
+
+		out = append(out, model)
 	}
 
 	return out
+}
+
+func providerName(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+
+	var name string
+	if json.Unmarshal(raw, &name) == nil {
+		return strings.TrimSpace(name)
+	}
+
+	var details struct {
+		Name string `json:"name"`
+	}
+	if json.Unmarshal(raw, &details) == nil {
+		return strings.TrimSpace(details.Name)
+	}
+
+	return ""
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+
+	return ""
+}
+
+func parsePrice(raw json.RawMessage) (string, bool) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", false
+	}
+
+	var value string
+	if json.Unmarshal(raw, &value) != nil {
+		value = string(raw)
+	}
+	value = strings.TrimSpace(value)
+	price, err := strconv.ParseFloat(value, 64)
+	if err != nil || math.IsNaN(price) || math.IsInf(price, 0) || price < 0 {
+		return "", false
+	}
+
+	return value, true
+}
+
+func isZeroPrice(raw string) bool {
+	value, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	return err == nil && value == 0
 }

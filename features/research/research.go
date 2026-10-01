@@ -349,11 +349,14 @@ func Research(
 
 	var lastErr error
 	for _, cand := range candidates {
+		if !chain.CanAttempt(cand) {
+			continue
+		}
 		start := time.Now()
 		resp, err := cand.Complete(ctx, req)
 		if err != nil {
 			lastErr = err
-			chain.RecordFailure(cand.Provider, err)
+			chain.RecordModelFailure(cand.Provider, cand.Model, err)
 			if ctx.Err() != nil {
 				break
 			}
@@ -361,11 +364,11 @@ func Research(
 		}
 		if len(resp.Choices) == 0 || strings.TrimSpace(resp.Choices[0].Message.Content) == "" {
 			lastErr = errors.New("empty research completion")
-			chain.RecordFailure(cand.Provider, lastErr)
+			chain.RecordModelFailure(cand.Provider, cand.Model, lastErr)
 			continue
 		}
 
-		chain.RecordSuccessLatency(cand.Provider, cand.Model, time.Since(start))
+		chain.RecordModelSuccess(cand.Provider, cand.Model, time.Since(start))
 		return Report{
 			Topic:    topic,
 			Summary:  strings.TrimSpace(resp.Choices[0].Message.Content),

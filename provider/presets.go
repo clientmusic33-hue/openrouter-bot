@@ -33,14 +33,11 @@ var presets = []Preset{
 		Name:      "openrouter",
 		BaseURL:   "https://openrouter.ai/api/v1",
 		APIKeyEnv: "API_KEY",
-		Models: []string{
-			"deepseek/deepseek-r1:free",
-			"openrouter/free",
-			"meta-llama/llama-3.3-70b-instruct:free",
-			"google/gemma-3-27b-it:free",
-			"qwen/qwen3-coder:free",
-		},
-		Docs: "https://openrouter.ai/models?max_price=0",
+		// The selectable catalogue is fetched from OpenRouter's live /models
+		// endpoint; this one model only keeps direct NewChain callers working
+		// before discovery completes.
+		Models: []string{"deepseek/deepseek-r1:free"},
+		Docs:   "https://openrouter.ai/models",
 	},
 	{
 		Name:      "groq",

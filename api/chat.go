@@ -254,6 +254,7 @@ func Generate(
 	// ---------------------------------------------------------------------
 
 	idx := 0
+	attempted := 0
 	failovers := 0
 	requestStart := time.Now()
 
@@ -263,19 +264,23 @@ func Generate(
 
 	for ; idx < len(candidates); idx++ {
 		candidate := candidates[idx]
+		if !chain.CanAttempt(candidate) {
+			continue
+		}
+		attempted++
 		attemptStart := time.Now()
 
 		stream, streamErr = candidate.Stream(ctx, req)
 		if streamErr == nil {
-			if idx > 0 {
-				failovers = idx
+			if attempted > 1 {
+				failovers = attempted - 1
 			}
 			current = candidate
 			chain.RecordSuccessLatency(candidate.Provider, candidate.Model, time.Since(attemptStart))
 			break
 		}
 
-		chain.RecordFailure(candidate.Provider, streamErr)
+		chain.RecordModelFailure(candidate.Provider, candidate.Model, streamErr)
 		log.Printf(
 			"Stream creation failed | provider=%s model=%s error=%v",
 			candidate.Provider, candidate.Model, streamErr,
@@ -283,6 +288,9 @@ func Generate(
 	}
 
 	if stream == nil {
+		if streamErr == nil {
+			streamErr = errors.New("no healthy models available right now")
+		}
 		stopLoading(stopAnimation)
 		<-animationDone
 
@@ -383,7 +391,7 @@ func Generate(
 			// as a failure lets the next candidate answer instead of leaving
 			// the user with a blank message.
 			if strings.TrimSpace(messageText) == "" {
-				chain.RecordFailure(current.Provider, errors.New("empty completion"))
+				chain.RecordModelFailure(current.Provider, current.Model, errors.New("empty completion"))
 
 				if next, nextCandidate, nextIdx, ok := openNext(ctx, chain, candidates, idx+1, req); ok {
 					_ = currentStream.Close()
@@ -402,7 +410,9 @@ func Generate(
 				current.Provider, current.Model, responseID,
 			)
 
-			chain.RecordSuccessLatency(current.Provider, current.Model, time.Since(requestStart))
+			if strings.TrimSpace(messageText) != "" {
+				chain.RecordModelSuccess(current.Provider, current.Model, time.Since(requestStart))
+			}
 
 			tracker.AddMessage(openai.ChatMessageRoleUser, userText)
 			tracker.AddMessage(openai.ChatMessageRoleAssistant, messageText)
@@ -432,7 +442,7 @@ func Generate(
 				current.Provider, current.Model, recvErr,
 			)
 
-			chain.RecordFailure(current.Provider, recvErr)
+			chain.RecordModelFailure(current.Provider, current.Model, recvErr)
 
 			// ---------------------------------------------------------
 			// FAILOVER TO THE NEXT MODEL / PROVIDER
@@ -545,6 +555,9 @@ func openNext(
 ) (*openai.ChatCompletionStream, provider.Candidate, int, bool) {
 	for i := start; i < len(candidates); i++ {
 		candidate := candidates[i]
+		if !chain.CanAttempt(candidate) {
+			continue
+		}
 
 		stream, err := candidate.Stream(ctx, req)
 		if err == nil {
@@ -553,7 +566,7 @@ func openNext(
 			return stream, candidate, i, true
 		}
 
-		chain.RecordFailure(candidate.Provider, err)
+		chain.RecordModelFailure(candidate.Provider, candidate.Model, err)
 		log.Printf(
 			"Failover attempt failed | provider=%s model=%s error=%v",
 			candidate.Provider, candidate.Model, err,

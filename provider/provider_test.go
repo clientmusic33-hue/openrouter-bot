@@ -187,9 +187,9 @@ func TestResetModel(t *testing.T) {
 // Health and cooldown
 // -----------------------------------------------------------------------------
 
-// TestCooldownDemotesFailingProvider is the core failover guarantee: a
-// provider that keeps failing must stop being tried first.
-func TestCooldownDemotesFailingProvider(t *testing.T) {
+// TestCooldownSkipsFailingProvider is the core failover guarantee: a
+// provider in an active cooldown must not be retried on every request.
+func TestCooldownSkipsFailingProvider(t *testing.T) {
 	chain := newTestChain(t)
 
 	for i := 0; i < cooldownAfter; i++ {
@@ -198,19 +198,13 @@ func TestCooldownDemotesFailingProvider(t *testing.T) {
 
 	candidates := chain.Candidates()
 
-	if candidates[0].Provider == "openrouter" {
-		t.Fatalf("a cooled-down provider must not lead the chain, got %+v", candidates[0])
+	if len(candidates) == 0 || candidates[0].Provider == "openrouter" {
+		t.Fatalf("a cooled-down provider must not lead the chain, got %+v", candidates)
 	}
-
-	// It must still be present so the chain never runs out of options.
-	found := false
 	for _, candidate := range candidates {
 		if candidate.Provider == "openrouter" {
-			found = true
+			t.Errorf("cooled-down provider was retried: %+v", candidate)
 		}
-	}
-	if !found {
-		t.Error("the failing provider disappeared from the chain")
 	}
 
 	// Recovery restores the original ordering.
@@ -451,5 +445,81 @@ func TestClassifyErrorAndCircuitBreaker(t *testing.T) {
 	lat, ok := chain.ModelLatency("deepseek/deepseek-r1:free")
 	if !ok || lat != 250*time.Millisecond {
 		t.Errorf("expected 250ms model latency, got %v (ok=%v)", lat, ok)
+	}
+}
+
+func TestDiscoveredModelIsSelectableWithoutExpandingFallbacks(t *testing.T) {
+	chain := newTestChain(t)
+	models := []string{"anthropic/claude-test", "google/gemini-test"}
+	if !chain.SetDiscoveredModels("openrouter", models) {
+		t.Fatal("SetDiscoveredModels did not find openrouter")
+	}
+
+	if name, ok := chain.ProviderOf(models[0]); !ok || name != "openrouter" {
+		t.Fatalf("ProviderOf(dynamic model) = %q, %v", name, ok)
+	}
+	if got := chain.ModelAvailability("openrouter", models[0]); got != ModelUnknown {
+		t.Errorf("unobserved model status = %q, want unknown", got)
+	}
+
+	candidates := chain.CandidatesFor(Preference{Provider: "openrouter", Model: models[0]}, nil)
+	if len(candidates) == 0 || candidates[0].Model != models[0] {
+		t.Fatalf("selected live model did not lead the candidate walk: %+v", candidates)
+	}
+	if len(candidates) > len(testConfigs())+3 {
+		t.Fatalf("discovered catalogue expanded the request fallback list: %d candidates", len(candidates))
+	}
+
+	chain.RecordModelFailure("openrouter", models[0], errors.New("429 rate limit exceeded"))
+	if got := chain.ModelAvailability("openrouter", models[0]); got != ModelLimited {
+		t.Errorf("rate-limited model status = %q, want limited", got)
+	}
+	for _, candidate := range chain.CandidatesFor(Preference{Provider: "openrouter", Model: models[0]}, nil) {
+		if candidate.Model == models[0] {
+			t.Error("a temporarily limited model was retried")
+		}
+	}
+
+	chain.RecordModelSuccess("openrouter", models[0], 100*time.Millisecond)
+	if got := chain.ModelAvailability("openrouter", models[0]); got != ModelAvailable {
+		t.Errorf("successful model status = %q, want available", got)
+	}
+}
+
+func TestModelHealthExpiresToUnknown(t *testing.T) {
+	chain := newTestChain(t)
+	model := "deepseek/deepseek-r1:free"
+	chain.RecordModelSuccess("openrouter", model, 0)
+	if got := chain.ModelAvailability("openrouter", model); got != ModelAvailable {
+		t.Fatalf("status after real success = %q, want available", got)
+	}
+
+	chain.mu.Lock()
+	entry := chain.modelHealth[key("openrouter", model)]
+	entry.expiresAt = time.Now().Add(-time.Second)
+	chain.modelHealth[key("openrouter", model)] = entry
+	chain.mu.Unlock()
+
+	if got := chain.ModelAvailability("openrouter", model); got != ModelUnknown {
+		t.Errorf("expired health status = %q, want unknown", got)
+	}
+}
+
+func TestSingleModelFailureDoesNotMarkEveryProviderModelUnavailable(t *testing.T) {
+	chain := newTestChain(t)
+
+	chain.RecordModelFailure("openrouter", "model-a", errors.New("temporary upstream error"))
+	if got := chain.ModelAvailability("openrouter", "model-a"); got != ModelUnavailable {
+		t.Fatalf("failed model status = %q, want unavailable", got)
+	}
+	if got := chain.ModelAvailability("openrouter", "model-b"); got != ModelUnknown {
+		t.Fatalf("unobserved sibling model status = %q, want unknown", got)
+	}
+
+	for i := 1; i < cooldownAfter; i++ {
+		chain.RecordFailure("openrouter", errors.New("temporary upstream error"))
+	}
+	if got := chain.ModelAvailability("openrouter", "model-b"); got != ModelUnavailable {
+		t.Errorf("model status during provider cooldown = %q, want unavailable", got)
 	}
 }

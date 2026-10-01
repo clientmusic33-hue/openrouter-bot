@@ -136,11 +136,9 @@ storage_type: json
 
 providers:
   # OpenRouter: https://openrouter.ai/settings/keys  (API_KEY)
+  # Models are loaded from the live OpenRouter catalogue; MODEL is the
+  # cold-start fallback if catalogue discovery is temporarily unavailable.
   - name: openrouter
-    models:
-      - deepseek/deepseek-r1:free
-      - openrouter/free
-      - meta-llama/llama-3.3-70b-instruct:free
 
   # Groq: fast and free, the best default for a busy public bot.
   # Key: GROQ_API_KEY from https://console.groq.com/keys

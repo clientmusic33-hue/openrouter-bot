@@ -589,16 +589,20 @@ func (a *app) runSummaryCompletion(chatID int64, transcript string, conf *config
 		}
 
 		for _, cand := range candidates {
+			if !a.chain.CanAttempt(cand) {
+				continue
+			}
 			resp, err := cand.Complete(ctx, req)
 			if err != nil {
-				a.chain.RecordFailure(cand.Provider, err)
+				a.chain.RecordModelFailure(cand.Provider, cand.Model, err)
 				continue
 			}
 			if len(resp.Choices) > 0 && strings.TrimSpace(resp.Choices[0].Message.Content) != "" {
-				a.chain.RecordSuccess(cand.Provider)
+				a.chain.RecordModelSuccess(cand.Provider, cand.Model, 0)
 				a.send(chatID, "📋 <b>Conversation Summary &amp; Action Items</b>\n\n"+escapeHTML(strings.TrimSpace(resp.Choices[0].Message.Content)), "HTML")
 				return
 			}
+			a.chain.RecordModelFailure(cand.Provider, cand.Model, errors.New("empty summary completion"))
 		}
 
 		a.send(chatID, "❌ Could not generate summary right now.", "")
