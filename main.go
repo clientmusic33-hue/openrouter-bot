@@ -132,10 +132,7 @@ func main() {
 	// ---------------------------------------------------------------------
 
 	redisClient := cache.NewRedisFromEnv()
-	store, err := storage.Open(conf.StorageType, "data", conf.PostgresDSN)
-	if err != nil {
-		log.Printf("Warning: storage fallback initialization error: %v", err)
-	}
+	store := storage.Open(conf.StorageType, "data", conf.PostgresDSN)
 	respCache := cache.NewResponseCache(512, 15*time.Minute, redisClient)
 	limiter := ratelimit.New(redisClient)
 	memMgr := memory.NewManager(store)
