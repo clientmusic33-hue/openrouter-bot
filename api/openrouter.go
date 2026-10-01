@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -133,8 +134,12 @@ func isFreeModel(model Model) bool {
 
 func isZeroPrice(price string) bool {
 	price = strings.TrimSpace(price)
+	if price == "" {
+		return false
+	}
 
-	return price == "" || price == "0" || strings.Trim(price, "0.") == ""
+	value, err := strconv.ParseFloat(price, 64)
+	return err == nil && value == 0
 }
 
 // -----------------------------------------------------------------------------

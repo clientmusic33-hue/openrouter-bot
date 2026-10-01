@@ -35,6 +35,29 @@ const cooldownDuration = 60 * time.Second
 // cooldownMax caps the growing backoff.
 const cooldownMax = 10 * time.Minute
 
+const (
+	modelAvailableTTL = 2 * time.Minute
+	modelLimitedTTL   = 45 * time.Second
+	modelFailedTTL    = 90 * time.Second
+)
+
+// ModelAvailability is based only on real request outcomes. The bot never
+// generates test prompts; a model without a recent successful/failed user
+// request remains unknown.
+type ModelAvailability string
+
+const (
+	ModelUnknown     ModelAvailability = "unknown"
+	ModelAvailable   ModelAvailability = "available"
+	ModelLimited     ModelAvailability = "limited"
+	ModelUnavailable ModelAvailability = "unavailable"
+)
+
+type modelHealth struct {
+	availability ModelAvailability
+	expiresAt    time.Time
+}
+
 // Config describes one provider as written in config.yaml.
 //
 // APIKeyEnv names the environment variable holding the key; APIKey is the
@@ -147,7 +170,8 @@ type Candidate struct {
 	Model    string
 	Timeout  time.Duration
 
-	client *openai.Client
+	client        *openai.Client
+	healthTracked bool
 }
 
 // NewCandidate wraps a provider that was built outside the chain, which is how
@@ -244,10 +268,13 @@ type health struct {
 // Chain is the ordered set of providers plus the bot wide default model.
 // All exported methods are safe for concurrent use.
 type Chain struct {
-	mu           sync.RWMutex
-	providers    []*Provider
-	health       map[string]*health
-	modelLatency map[string]*LatencyStats
+	mu               sync.RWMutex
+	providers        []*Provider
+	health           map[string]*health
+	modelLatency     map[string]*LatencyStats
+	discoveredModels map[string][]string
+	discoveredSets   map[string]map[string]struct{}
+	modelHealth      map[string]modelHealth
 
 	active int    // index of the preferred provider (admin default)
 	model  string // admin default model, may belong to any provider
@@ -262,8 +289,11 @@ func NewChain(cfgs []Config) (*Chain, error) {
 	}
 
 	chain := &Chain{
-		health:       make(map[string]*health),
-		modelLatency: make(map[string]*LatencyStats),
+		health:           make(map[string]*health),
+		modelLatency:     make(map[string]*LatencyStats),
+		discoveredModels: make(map[string][]string),
+		discoveredSets:   make(map[string]map[string]struct{}),
+		modelHealth:      make(map[string]modelHealth),
 	}
 
 	for _, cfg := range cfgs {
@@ -327,7 +357,7 @@ func (c *Chain) ActiveModels() []string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	return c.providers[c.active].Models()
+	return c.modelsForLocked(c.providers[c.active])
 }
 
 // Model returns the bot wide default model.
@@ -386,11 +416,66 @@ func (c *Chain) ModelsOf(name string) ([]string, bool) {
 
 	for _, p := range c.providers {
 		if strings.EqualFold(p.Name(), name) {
-			return p.Models(), true
+			return c.modelsForLocked(p), true
 		}
 	}
 
 	return nil, false
+}
+
+// SetDiscoveredModels replaces the live catalogue for a provider. The full
+// list is kept separate from configured fallback models, so menu discovery
+// does not make every generation walk thousands of candidates.
+func (c *Chain) SetDiscoveredModels(name string, modelIDs []string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	p := c.providerNamed(name)
+	if p == nil {
+		return false
+	}
+
+	models := make([]string, 0, len(modelIDs))
+	seen := make(map[string]struct{}, len(modelIDs))
+	for _, id := range modelIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		key := strings.ToLower(id)
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+		seen[key] = struct{}{}
+		models = append(models, id)
+	}
+
+	c.discoveredModels[p.Name()] = models
+	c.discoveredSets[p.Name()] = seen
+	return true
+}
+
+func (c *Chain) modelsForLocked(p *Provider) []string {
+	models := append([]string(nil), p.Models()...)
+	seen := make(map[string]struct{}, len(models)+len(c.discoveredModels[p.Name()]))
+	for _, id := range models {
+		seen[strings.ToLower(id)] = struct{}{}
+	}
+	for _, id := range c.discoveredModels[p.Name()] {
+		key := strings.ToLower(id)
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+		seen[key] = struct{}{}
+		models = append(models, id)
+	}
+	return models
+}
+
+func (c *Chain) hasDiscoveredModel(name, model string) bool {
+	models := c.discoveredSets[name]
+	_, ok := models[strings.ToLower(strings.TrimSpace(model))]
+	return ok
 }
 
 // SetActive switches the bot wide preferred provider.
@@ -425,7 +510,7 @@ func (c *Chain) SetModel(model string) error {
 	c.model = model
 
 	for i, p := range c.providers {
-		if p.HasModel(model) {
+		if p.HasModel(model) || c.hasDiscoveredModel(p.Name(), model) {
 			c.active = i
 			break
 		}
@@ -471,16 +556,11 @@ func (c *Chain) Candidates() []Candidate {
 	return c.CandidatesFor(Preference{}, nil)
 }
 
-// CandidatesFor builds the ordered candidate list for one user.
-//
-// Ordering rules:
-//  1. the model the user pinned always leads, unless its provider is cooling
-//     down - a degraded backend must not be kept alive by a pin
-//  2. the user's pinned provider comes first, the rest follow in chain order
-//  3. providers without a key and providers in cooldown sink to the bottom,
-//     so an unusable backend costs no latency
-//  4. with a usage profile (and no pin) every model is scored, which is what
-//     makes automatic routing pick the best model for how the user works
+// CandidatesFor builds the ordered candidate list for one user. Known failed
+// models and providers in an active cooldown are omitted instead of being
+// retried at the end of the list. A dynamically discovered pinned model is
+// inserted as the first candidate without expanding every discovered model
+// into every request's fallback walk.
 func (c *Chain) CandidatesFor(pref Preference, profile *UsageProfile) []Candidate {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -488,7 +568,6 @@ func (c *Chain) CandidatesFor(pref Preference, profile *UsageProfile) []Candidat
 	now := time.Now()
 	count := len(c.providers)
 
-	// Rotation starting at the bot wide active provider, then health sorted.
 	order := make([]*Provider, 0, count)
 	for i := 0; i < count; i++ {
 		order = append(order, c.providers[(c.active+i)%count])
@@ -500,35 +579,21 @@ func (c *Chain) CandidatesFor(pref Preference, profile *UsageProfile) []Candidat
 		})
 	}
 
-	sort.SliceStable(order, func(i, j int) bool {
-		return rankProvider(order[i], c, now) < rankProvider(order[j], c, now)
-	})
-
-	// One model group per usable provider.
 	groups := make([][]Candidate, 0, count)
 	for _, p := range order {
-		if !p.Configured() {
-			// Without a key the request can only fail, so it is not worth a
-			// round trip. The provider stays visible in /providers.
+		if !p.Configured() || c.inCooldown(p.Name(), now) {
+			// A keyless or open-circuit provider cannot answer right now. Do
+			// not spend this request walking its models; it stays visible in
+			// the provider picker and becomes eligible after cooldown.
 			continue
-		}
-
-		var timeout time.Duration
-		if p.config.TimeoutSeconds > 0 {
-			timeout = time.Duration(p.config.TimeoutSeconds) * time.Second
 		}
 
 		group := make([]Candidate, 0, len(p.Models()))
 		for _, model := range p.Models() {
-			if strings.TrimSpace(model) == "" {
+			if strings.TrimSpace(model) == "" || c.modelCoolingDown(p.Name(), model, now) {
 				continue
 			}
-			group = append(group, Candidate{
-				Provider: p.Name(),
-				Model:    model,
-				Timeout:  timeout,
-				client:   p.Client(),
-			})
+			group = append(group, c.candidateLocked(p, model))
 		}
 		groups = append(groups, group)
 	}
@@ -547,31 +612,67 @@ func (c *Chain) CandidatesFor(pref Preference, profile *UsageProfile) []Candidat
 
 	candidates := flatten(groups)
 
-	// The pinned model leads. Without an explicit choice the chain default
-	// keeps leading, which is what a zero value Preference means.
 	pinned := strings.TrimSpace(pref.Model)
 	if pinned == "" && !pref.Auto && strings.TrimSpace(pref.Provider) == "" {
 		pinned = c.model
 	}
 
-	if pinned != "" {
-		if p := c.ownerOfUsable(pinned, now); p != nil {
-			candidates = hoist(candidates, p.Name(), pinned)
+	if pinned != "" && !c.modelCoolingDown(pref.Provider, pinned, now) {
+		var owner *Provider
+		if pref.Provider != "" {
+			p := c.providerNamed(pref.Provider)
+			ownsModel := p != nil && (p.HasModel(pinned) || c.hasDiscoveredModel(p.Name(), pinned))
+			if ownsModel && p.Configured() && !c.inCooldown(p.Name(), now) {
+				owner = p
+			}
+		}
+		if owner == nil {
+			owner = c.ownerOfUsable(pinned, now)
+		}
+		if owner != nil && !c.modelCoolingDown(owner.Name(), pinned, now) {
+			found := false
+			for _, candidate := range candidates {
+				if strings.EqualFold(candidate.Provider, owner.Name()) && strings.EqualFold(candidate.Model, pinned) {
+					found = true
+					break
+				}
+			}
+			if found {
+				candidates = hoist(candidates, owner.Name(), pinned)
+			} else {
+				candidates = append([]Candidate{c.candidateLocked(owner, pinned)}, candidates...)
+			}
 		}
 	}
 
 	return candidates
 }
 
-// ownerOfUsable returns the provider owning a model when it can answer right
+// candidateLocked builds a candidate while the chain's read or write lock is held.
+func (c *Chain) candidateLocked(p *Provider, model string) Candidate {
+	var timeout time.Duration
+	if p.config.TimeoutSeconds > 0 {
+		timeout = time.Duration(p.config.TimeoutSeconds) * time.Second
+	}
+
+	return Candidate{
+		Provider:      p.Name(),
+		Model:         model,
+		Timeout:       timeout,
+		client:        p.Client(),
+		healthTracked: true,
+	}
+}
+
+// ownerOfUsable returns a provider that claims the model and can answer right
 // now. Callers must hold at least a read lock.
 func (c *Chain) ownerOfUsable(model string, now time.Time) *Provider {
 	for _, p := range c.providers {
-		if !p.HasModel(model) {
+		if !p.HasModel(model) && !c.hasDiscoveredModel(p.Name(), model) {
 			continue
 		}
-		if !p.Configured() || c.inCooldown(p.Name(), now) {
-			return nil
+		if !p.Configured() || c.inCooldown(p.Name(), now) || c.modelCoolingDown(p.Name(), model, now) {
+			continue
 		}
 
 		return p
@@ -634,19 +735,6 @@ func (c *Chain) providerNamed(name string) *Provider {
 	}
 
 	return nil
-}
-
-// rankProvider orders providers for the candidate walk: usable and healthy
-// first, keyless last, cooling down last of all.
-func rankProvider(p *Provider, c *Chain, now time.Time) int {
-	switch {
-	case !p.Configured():
-		return 3
-	case c.inCooldown(p.Name(), now):
-		return 2
-	default:
-		return 0
-	}
 }
 
 func key(provider, model string) string {
@@ -715,9 +803,129 @@ func (c *Chain) RecordFailure(name string, err error) {
 	}
 }
 
+// RecordModelFailure caches a real generation failure for that exact model.
+// Rate limits expire quickly; other failures are held briefly to prevent
+// repeated attempts. Permanent model errors do not trip the whole provider's
+// circuit breaker.
+func (c *Chain) RecordModelFailure(name, model string, err error) {
+	if err == nil {
+		return
+	}
+
+	class := ClassifyError(err)
+	if class == ErrClassCanceled {
+		return
+	}
+
+	model = strings.TrimSpace(model)
+	if model != "" {
+		availability := ModelUnavailable
+		ttl := modelFailedTTL
+		if class == ErrClassRateLimit {
+			availability = ModelLimited
+			ttl = modelLimitedTTL
+		}
+
+		c.mu.Lock()
+		if c.modelHealth == nil {
+			c.modelHealth = make(map[string]modelHealth)
+		}
+		c.modelHealth[key(name, model)] = modelHealth{
+			availability: availability,
+			expiresAt:    time.Now().Add(ttl),
+		}
+		c.mu.Unlock()
+	}
+
+	if class != ErrClassPermanent {
+		c.RecordFailure(name, err)
+	}
+}
+
 // RecordSuccess notes that a provider answered, clearing its failure streak.
 func (c *Chain) RecordSuccess(name string) {
 	c.RecordSuccessLatency(name, "", 0)
+}
+
+// RecordModelSuccess records a successful real completion for a model and
+// its short-lived availability observation. The status expires to unknown.
+func (c *Chain) RecordModelSuccess(name, model string, latency time.Duration) {
+	c.RecordSuccessLatency(name, model, latency)
+	if model == "" {
+		return
+	}
+
+	c.mu.Lock()
+	if c.modelHealth == nil {
+		c.modelHealth = make(map[string]modelHealth)
+	}
+	c.modelHealth[key(name, model)] = modelHealth{
+		availability: ModelAvailable,
+		expiresAt:    time.Now().Add(modelAvailableTTL),
+	}
+	c.mu.Unlock()
+}
+
+// ModelAvailability reports recent request health without probing the model.
+// Missing credentials and an open provider circuit are conclusive; otherwise
+// a model with no fresh real-request result is unknown.
+func (c *Chain) ModelAvailability(name, model string) ModelAvailability {
+	if c == nil {
+		return ModelUnknown
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.modelAvailabilityLocked(name, model, time.Now())
+}
+
+func (c *Chain) modelAvailabilityLocked(name, model string, now time.Time) ModelAvailability {
+	p := c.providerNamed(name)
+	if p != nil {
+		name = p.Name()
+		if !p.Configured() {
+			return ModelUnavailable
+		}
+	}
+
+	if h := c.health[name]; h != nil && now.Before(h.cooldownUntil) {
+		if ClassifyError(fmt.Errorf("%s", h.lastErr)) == ErrClassRateLimit {
+			return ModelLimited
+		}
+		return ModelUnavailable
+	}
+
+	if observed, ok := c.modelHealth[key(name, model)]; ok && now.Before(observed.expiresAt) {
+		return observed.availability
+	}
+
+	return ModelUnknown
+}
+
+// CanAttempt is checked immediately before a request as well as while
+// building candidates, so concurrent requests stop reusing a model/provider
+// that another request has just placed in cooldown.
+func (c *Chain) CanAttempt(candidate Candidate) bool {
+	if c == nil || !candidate.healthTracked {
+		return true
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	p := c.providerNamed(candidate.Provider)
+	if p == nil {
+		return true
+	}
+	now := time.Now()
+	return p.Configured() && !c.inCooldown(p.Name(), now) && !c.modelCoolingDown(p.Name(), candidate.Model, now)
+}
+
+func (c *Chain) modelCoolingDown(name, model string, now time.Time) bool {
+	observed, ok := c.modelHealth[key(name, model)]
+	return ok && now.Before(observed.expiresAt) &&
+		(observed.availability == ModelLimited || observed.availability == ModelUnavailable)
 }
 
 // RecordSuccessLatency notes that a provider/model answered and records its
@@ -806,9 +1014,9 @@ func (c *Chain) Status() []Info {
 		info := Info{
 			Name:        p.Name(),
 			BaseURL:     p.BaseURL(),
-			Models:      p.Models(),
+			Models:      c.modelsForLocked(p),
 			Active:      i == c.active,
-			Current:     p.HasModel(c.model),
+			Current:     p.HasModel(c.model) || c.hasDiscoveredModel(p.Name(), c.model),
 			Configured:  p.Configured(),
 			RequiresKey: p.RequiresKey(),
 			Local:       p.Keyless(),
@@ -843,7 +1051,7 @@ func (c *Chain) ProviderOf(model string) (string, bool) {
 	defer c.mu.RUnlock()
 
 	for _, p := range c.providers {
-		if p.HasModel(model) {
+		if p.HasModel(model) || c.hasDiscoveredModel(p.Name(), model) {
 			return p.Name(), true
 		}
 	}
@@ -861,9 +1069,14 @@ func (c *Chain) HasModel(model string) bool {
 // ModelRef is one selectable model in the UI: its id plus the provider that
 // owns it and a short capability description.
 type ModelRef struct {
-	Provider    string
-	Model       string
-	Description string
+	Provider       string
+	Model          string
+	Description    string
+	DisplayName    string
+	SourceProvider string
+	Availability   ModelAvailability
+	Free           bool
+	PriceKnown     bool
 	// ContextLength is the context window in tokens when the provider
 	// reported one during discovery. Zero means unknown.
 	ContextLength int
@@ -878,13 +1091,15 @@ func (c *Chain) ModelCatalog() []ModelRef {
 	defer c.mu.RUnlock()
 
 	var refs []ModelRef
+	now := time.Now()
 	for _, p := range c.providers {
-		for _, model := range p.Models() {
+		for _, model := range c.modelsForLocked(p) {
 			refs = append(refs, ModelRef{
-				Provider:    p.Name(),
-				Model:       model,
-				Description: DescribeModel(model),
-				Current:     strings.EqualFold(model, c.model),
+				Provider:     p.Name(),
+				Model:        model,
+				Description:  DescribeModel(model),
+				Availability: c.modelAvailabilityLocked(p.Name(), model, now),
+				Current:      strings.EqualFold(model, c.model),
 			})
 		}
 	}

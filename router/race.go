@@ -43,6 +43,16 @@ type RaceResult struct {
 // SelectRaceCandidates picks up to maxModels distinct, healthy candidates
 // preferring diversity across providers when possible.
 func SelectRaceCandidates(chain *provider.Chain, candidates []provider.Candidate, maxModels int) []provider.Candidate {
+	if chain != nil {
+		eligible := make([]provider.Candidate, 0, len(candidates))
+		for _, candidate := range candidates {
+			if chain.CanAttempt(candidate) {
+				eligible = append(eligible, candidate)
+			}
+		}
+		candidates = eligible
+	}
+
 	if maxModels <= 0 {
 		maxModels = DefaultRaceConcurrency
 	}
@@ -153,13 +163,17 @@ func Race(
 		wg.Add(1)
 		go func(cand provider.Candidate) {
 			defer wg.Done()
+			if chain != nil && !chain.CanAttempt(cand) {
+				outcomes <- outcome{candidate: cand, err: errors.New("candidate temporarily unavailable")}
+				return
+			}
 			start := time.Now()
 			resp, err := cand.Complete(raceCtx, reqCopy)
 			elapsed := time.Since(start)
 
 			if err != nil {
 				if chain != nil && !errors.Is(err, context.Canceled) {
-					chain.RecordFailure(cand.Provider, err)
+					chain.RecordModelFailure(cand.Provider, cand.Model, err)
 				}
 				outcomes <- outcome{candidate: cand, latency: elapsed, err: err}
 				return
@@ -172,14 +186,14 @@ func Race(
 			if text == "" {
 				err = errors.New("empty race completion")
 				if chain != nil {
-					chain.RecordFailure(cand.Provider, err)
+					chain.RecordModelFailure(cand.Provider, cand.Model, err)
 				}
 				outcomes <- outcome{candidate: cand, latency: elapsed, err: err}
 				return
 			}
 
 			if chain != nil {
-				chain.RecordSuccessLatency(cand.Provider, cand.Model, elapsed)
+				chain.RecordModelSuccess(cand.Provider, cand.Model, elapsed)
 			}
 			outcomes <- outcome{candidate: cand, text: text, latency: elapsed}
 		}(racer)

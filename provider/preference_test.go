@@ -100,7 +100,7 @@ func TestAutoRoutingAvoidsDislikedModel(t *testing.T) {
 }
 
 // TestCooldownBeatsPinnedModel makes sure a pin cannot keep a broken backend
-// first in line.
+// in the request walk while its circuit is open.
 func TestCooldownBeatsPinnedModel(t *testing.T) {
 	chain := routingChain(t)
 
@@ -109,18 +109,14 @@ func TestCooldownBeatsPinnedModel(t *testing.T) {
 	}
 
 	candidates := chain.CandidatesFor(Preference{Model: "gemini-2.5-flash"}, nil)
-	if candidates[0].Provider == "gemini" {
-		t.Fatalf("a cooling down provider must not lead, got %+v", candidates[0])
+	if len(candidates) == 0 || candidates[0].Provider == "gemini" {
+		t.Fatalf("a cooling down provider must not lead, got %+v", candidates)
 	}
 
-	found := false
 	for _, candidate := range candidates {
 		if candidate.Provider == "gemini" {
-			found = true
+			t.Errorf("the pinned model's cooled-down provider was retried: %+v", candidate)
 		}
-	}
-	if !found {
-		t.Error("the pinned model disappeared from the fallback list")
 	}
 }
 

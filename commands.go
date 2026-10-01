@@ -93,6 +93,9 @@ func (a *app) handleCommand(message *tgbotapi.Message, conf *config.Config, trac
 	case "get_models":
 		a.handleFreeModels(message, conf)
 
+	case "refresh_models":
+		a.handleRefreshModels(message, conf)
+
 	case "set_model", "model":
 		a.handleSetModel(message, conf, tracker)
 
@@ -443,6 +446,16 @@ func (a *app) handleAdmin(message *tgbotapi.Message, conf *config.Config) {
 	a.sendScreen(message.Chat.ID, a.adminScreen(conf))
 }
 
+func (a *app) handleRefreshModels(message *tgbotapi.Message, conf *config.Config) {
+	if !conf.IsAdmin(senderID(message)) {
+		a.send(message.Chat.ID, "👑 Only the bot owner can refresh the model catalogue.", "")
+		return
+	}
+	if !a.refreshOpenRouterModels(message.Chat.ID) {
+		a.send(message.Chat.ID, "⚠️ No OpenRouter provider is configured.", "")
+	}
+}
+
 // handleTranslateReply translates the message a user replied to, or inline text
 // passed as `/tr <lang> <text>`.
 func (a *app) handleTranslateReply(message *tgbotapi.Message, conf *config.Config) {
@@ -561,6 +574,7 @@ func (a *app) setCommands(conf *config.Config) {
 	private := []tgbotapi.BotCommand{
 		{Command: "menu", Description: "Main panel with buttons"},
 		{Command: "model", Description: "Pick a provider and a model"},
+		{Command: "refresh_models", Description: "Refresh the OpenRouter model catalogue (admin)"},
 		{Command: "addprovider", Description: "Add your own AI provider and API key"},
 		{Command: "myproviders", Description: "List your own providers"},
 		{Command: "useprovider", Description: "Switch to one of your providers"},

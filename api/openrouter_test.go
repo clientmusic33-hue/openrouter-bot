@@ -91,8 +91,10 @@ func TestIsFreeModel(t *testing.T) {
 		want  bool
 	}{
 		{"zero strings", Model{Pricing: Pricing{Prompt: "0", Completion: "0"}}, true},
-		{"empty means free", Model{Pricing: Pricing{}}, true},
+		{"missing price is not assumed free", Model{Pricing: Pricing{}}, false},
 		{"decimal zero", Model{Pricing: Pricing{Prompt: "0.0", Completion: "0.0"}}, true},
+		{"scientific zero", Model{Pricing: Pricing{Prompt: "0e0", Completion: "0.0"}}, true},
+		{"missing completion price", Model{Pricing: Pricing{Prompt: "0", Completion: ""}}, false},
 		{"paid completion", Model{Pricing: Pricing{Prompt: "0", Completion: "0.000002"}}, false},
 		{"paid prompt", Model{Pricing: Pricing{Prompt: "0.000001", Completion: "0"}}, false},
 	}

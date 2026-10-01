@@ -11,6 +11,7 @@ import (
 	"openrouter-bot/provider"
 	"openrouter-bot/ui"
 	"openrouter-bot/user"
+	"openrouter-bot/userproviders"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -123,34 +124,75 @@ func (a *app) modelsForProvider(providerIndex int) (string, []provider.ModelRef)
 // configured list keeps the screen instant and doubles as the fallback for a
 // provider that does not expose a model list.
 func (a *app) providerModels(name string) []provider.ModelRef {
-	refs := make([]provider.ModelRef, 0, 8)
+	if a.modelCatalog != nil {
+		key := models.CacheKey(name, "")
+		discovered, ok := a.modelCatalog.Cached(key)
+		if !ok {
+			discovered, ok = a.modelCatalog.LastKnown(key)
+		}
+		if ok && len(discovered) > 0 {
+			a.setChainModelCatalog(name, discovered)
+			current := a.chain.Model()
+			out := make([]provider.ModelRef, 0, len(discovered)+1)
+			seen := make(map[string]struct{}, len(discovered))
+			for _, model := range discovered {
+				seen[strings.ToLower(model.ModelID)] = struct{}{}
+				out = append(out, provider.ModelRef{
+					Provider:       name,
+					Model:          model.ModelID,
+					Description:    provider.DescribeModel(model.ModelID),
+					DisplayName:    model.DisplayName,
+					SourceProvider: model.SourceProvider,
+					Availability:   a.chain.ModelAvailability(name, model.ModelID),
+					Free:           model.Free,
+					PriceKnown:     model.PriceKnown,
+					ContextLength:  model.ContextLength,
+					Current:        strings.EqualFold(model.ModelID, current),
+				})
+			}
+			for _, ref := range a.chain.ModelCatalog() {
+				if !strings.EqualFold(ref.Provider, name) {
+					continue
+				}
+				if _, exists := seen[strings.ToLower(ref.Model)]; exists {
+					continue
+				}
+				out = append(out, ref)
+			}
+			return out
+		}
+	}
 
+	refs := make([]provider.ModelRef, 0, 8)
 	for _, ref := range a.chain.ModelCatalog() {
 		if strings.EqualFold(ref.Provider, name) {
 			refs = append(refs, ref)
 		}
 	}
+	return refs
+}
 
-	if a.modelCatalog == nil {
-		return refs
+func modelAvailabilityLabel(status provider.ModelAvailability) string {
+	switch status {
+	case provider.ModelAvailable:
+		return "🟢 AVAILABLE"
+	case provider.ModelLimited:
+		return "🟡 LIMITED"
+	case provider.ModelUnavailable:
+		return "🔴 UNAVAILABLE"
+	default:
+		return "⚪ UNKNOWN"
 	}
+}
 
-	discovered, ok := a.modelCatalog.Cached(models.CacheKey(name, ""))
-	if !ok || len(discovered) == 0 {
-		return refs
+func modelPriceLabel(ref provider.ModelRef) string {
+	if !ref.PriceKnown {
+		return "❔ PRICE UNKNOWN"
 	}
-
-	out := make([]provider.ModelRef, 0, len(discovered))
-	for _, model := range discovered {
-		out = append(out, provider.ModelRef{
-			Provider:      name,
-			Model:         model.ModelID,
-			Description:   provider.DescribeModel(model.ModelID),
-			ContextLength: model.ContextLength,
-		})
+	if ref.Free {
+		return "🆓 FREE"
 	}
-
-	return out
+	return "💰 PAID"
 }
 
 // modelsScreen lists one provider's models.
@@ -187,11 +229,21 @@ func (a *app) modelsScreen(conf *config.Config, tracker *user.UsageTracker, prov
 			if info.Coding {
 				badges = append(badges, "💻 coding")
 			}
-			badgeStr := ""
-			if len(badges) > 0 {
-				badgeStr = " · " + strings.Join(badges, " · ")
+
+			name := ref.DisplayName
+			if strings.TrimSpace(name) == "" {
+				name = ref.Model
 			}
-			line := fmt.Sprintf("• <code>%s</code>%s", escapeHTML(ref.Model), badgeStr)
+			line := fmt.Sprintf("• %s · %s · <b>%s</b> · <code>%s</code>",
+				modelAvailabilityLabel(ref.Availability), modelPriceLabel(ref),
+				escapeHTML(name), escapeHTML(ref.Model),
+			)
+			if ref.SourceProvider != "" {
+				line += " · " + escapeHTML(ref.SourceProvider)
+			}
+			if len(badges) > 0 {
+				line += " · " + strings.Join(badges, " · ")
+			}
 			if ref.ContextLength > 0 {
 				line += fmt.Sprintf(" · %dk ctx", ref.ContextLength/1000)
 			}
@@ -291,6 +343,41 @@ func (a *app) userProvidersScreen(userID int64, page int) screen {
 	return screen{Text: text, Keyboard: ui.UserProviderList(names, page, providersPageSize)}
 }
 
+func (a *app) userProviderModelRefs(record userproviders.Provider, ids []string) []provider.ModelRef {
+	metadata := make(map[string]models.Model, len(ids))
+	if a.modelCatalog != nil {
+		key := models.CacheKey("", record.ID)
+		discovered, ok := a.modelCatalog.Cached(key)
+		if !ok {
+			discovered, ok = a.modelCatalog.LastKnown(key)
+		}
+		if ok {
+			for _, model := range discovered {
+				metadata[strings.ToLower(model.ModelID)] = model
+			}
+		}
+	}
+
+	refs := make([]provider.ModelRef, 0, len(ids))
+	for _, id := range ids {
+		ref := provider.ModelRef{
+			Provider:     record.Name,
+			Model:        id,
+			Availability: provider.ModelUnknown,
+		}
+		if model, ok := metadata[strings.ToLower(id)]; ok {
+			ref.DisplayName = model.DisplayName
+			ref.SourceProvider = model.SourceProvider
+			ref.ContextLength = model.ContextLength
+			ref.Free = model.Free
+			ref.PriceKnown = model.PriceKnown
+		}
+		refs = append(refs, ref)
+	}
+
+	return refs
+}
+
 // userProviderModelsScreen lists the models of one of the user's own
 // providers, discovered with that user's key and cached under their record.
 func (a *app) userProviderModelsScreen(userID int64, tracker *user.UsageTracker, index, page int) screen {
@@ -301,6 +388,7 @@ func (a *app) userProviderModelsScreen(userID int64, tracker *user.UsageTracker,
 
 	record := list[index]
 	modelIDs := a.userProviderModelIDs(record)
+	modelRefs := a.userProviderModelRefs(record, modelIDs)
 	current := tracker.Preference().Model
 
 	if len(modelIDs) == 0 {
@@ -326,12 +414,24 @@ func (a *app) userProviderModelsScreen(userID int64, tracker *user.UsageTracker,
 	var lines []string
 	if offset < len(modelIDs) {
 		for i := offset; i < end; i++ {
+			ref := modelRefs[i]
 			marker := "•"
-			if strings.EqualFold(modelIDs[i], current) {
+			if strings.EqualFold(ref.Model, current) {
 				marker = "▶"
 			}
+			name := ref.DisplayName
+			if strings.TrimSpace(name) == "" {
+				name = ref.Model
+			}
 
-			lines = append(lines, fmt.Sprintf("%s <code>%s</code>", marker, escapeHTML(modelIDs[i])))
+			line := fmt.Sprintf("%s %s · %s · <b>%s</b> · <code>%s</code>", marker,
+				modelAvailabilityLabel(ref.Availability), modelPriceLabel(ref),
+				escapeHTML(name), escapeHTML(ref.Model),
+			)
+			if ref.SourceProvider != "" {
+				line += " · " + escapeHTML(ref.SourceProvider)
+			}
+			lines = append(lines, line)
 		}
 	}
 
@@ -347,7 +447,7 @@ func (a *app) userProviderModelsScreen(userID int64, tracker *user.UsageTracker,
 
 	return screen{
 		Text:     text,
-		Keyboard: ui.UserProviderModels(index, modelIDs, current, offset, modelsPageSize),
+		Keyboard: ui.UserProviderModels(index, modelRefs, current, offset, modelsPageSize),
 	}
 }
 

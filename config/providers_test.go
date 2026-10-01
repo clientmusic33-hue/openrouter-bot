@@ -265,3 +265,33 @@ func TestNvidiaNeedsOnlyANameAndItsKey(t *testing.T) {
 		}
 	})
 }
+
+func TestLoadProvidersUsesOnlyConfiguredOpenRouterFallbackModel(t *testing.T) {
+	t.Setenv("MODEL", "")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	yaml := `
+model: configured/default
+providers:
+  - name: openrouter
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	viper.SetConfigFile(path)
+	viper.AutomaticEnv()
+	if err := viper.ReadInConfig(); err != nil {
+		t.Fatalf("ReadInConfig: %v", err)
+	}
+
+	providers := loadProviders()
+	if len(providers) != 1 {
+		t.Fatalf("loadProviders returned %d entries, want 1", len(providers))
+	}
+	if len(providers[0].Models) != 1 || providers[0].Models[0] != "configured/default" {
+		t.Fatalf("OpenRouter cold-start models = %v, want only the configured MODEL", providers[0].Models)
+	}
+}

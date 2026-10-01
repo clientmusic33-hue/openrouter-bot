@@ -131,16 +131,19 @@ func TestProviderListMarksState(t *testing.T) {
 // pinned, which is what makes the picker feel like it responded.
 func TestModelListMarksThePinnedModel(t *testing.T) {
 	models := []provider.ModelRef{
-		{Provider: "groq", Model: "llama-3.3-70b-versatile"},
-		{Provider: "groq", Model: "openai/gpt-oss-120b"},
+		{Provider: "groq", Model: "llama-3.3-70b-versatile", Availability: provider.ModelUnknown},
+		{Provider: "groq", Model: "openai/gpt-oss-120b", Availability: provider.ModelUnknown, PriceKnown: true},
 	}
 
 	keyboard := ModelList(0, "groq", models, "openai/gpt-oss-120b", 0, 10, nil)
 
-	if got := buttonLabels(keyboard); !contains(got, "▶ openai/gpt-oss-120b") {
-		t.Errorf("pinned model is not marked: %v", got)
+	if got := buttonLabels(keyboard); !contains(got, "▶ ⚪ 💰 openai/gpt-oss-120b") {
+		t.Errorf("pinned model is not marked with unknown/paid badges: %v", got)
 	}
-	if got := buttonLabels(keyboard); contains(got, "▶ llama-3.3-70b-versatile") {
+	if got := buttonLabels(keyboard); !contains(got, "⚪ ❔ llama-3.3-70b-versatile") {
+		t.Errorf("missing pricing is not marked unknown: %v", got)
+	}
+	if got := buttonLabels(keyboard); contains(got, "▶ ⚪ ❔ llama-3.3-70b-versatile") {
 		t.Errorf("an unpinned model is marked as current: %v", got)
 	}
 }
@@ -148,13 +151,13 @@ func TestModelListMarksThePinnedModel(t *testing.T) {
 // TestModelListMarksTheConfiguredDefault covers the case with no pin at all.
 func TestModelListMarksTheConfiguredDefault(t *testing.T) {
 	models := []provider.ModelRef{
-		{Provider: "groq", Model: "llama-3.3-70b-versatile", Current: true},
+		{Provider: "groq", Model: "llama-3.3-70b-versatile", Current: true, Availability: provider.ModelAvailable, Free: true, PriceKnown: true, DisplayName: "Llama 3.3"},
 	}
 
 	keyboard := ModelList(0, "groq", models, "", 0, 10, nil)
 
-	if got := buttonLabels(keyboard); !contains(got, "▶ llama-3.3-70b-versatile") {
-		t.Errorf("the configured model is not marked: %v", got)
+	if got := buttonLabels(keyboard); !contains(got, "▶ 🟢 🆓 Llama 3.3") {
+		t.Errorf("the configured model is not marked with availability and price: %v", got)
 	}
 }
 

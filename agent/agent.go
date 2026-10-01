@@ -139,11 +139,14 @@ func (a *Agent) completeStep(
 
 	var lastErr error
 	for _, cand := range candidates {
+		if !a.chain.CanAttempt(cand) {
+			continue
+		}
 		start := time.Now()
 		resp, err := cand.Complete(ctx, req)
 		if err != nil {
 			lastErr = err
-			a.chain.RecordFailure(cand.Provider, err)
+			a.chain.RecordModelFailure(cand.Provider, cand.Model, err)
 			if ctx.Err() != nil {
 				return "", "", "", ctx.Err()
 			}
@@ -151,11 +154,11 @@ func (a *Agent) completeStep(
 		}
 		if len(resp.Choices) == 0 || strings.TrimSpace(resp.Choices[0].Message.Content) == "" {
 			lastErr = errors.New("empty agent step completion")
-			a.chain.RecordFailure(cand.Provider, lastErr)
+			a.chain.RecordModelFailure(cand.Provider, cand.Model, lastErr)
 			continue
 		}
 
-		a.chain.RecordSuccessLatency(cand.Provider, cand.Model, time.Since(start))
+		a.chain.RecordModelSuccess(cand.Provider, cand.Model, time.Since(start))
 		return strings.TrimSpace(resp.Choices[0].Message.Content), cand.Provider, cand.Model, nil
 	}
 

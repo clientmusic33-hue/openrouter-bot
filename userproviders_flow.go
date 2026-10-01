@@ -433,7 +433,12 @@ func (a *app) userProviderList(userID int64) ([]userproviders.Provider, error) {
 // providers: the live catalogue when it is cached, the stored model otherwise.
 func (a *app) userProviderModelIDs(record userproviders.Provider) []string {
 	if a.modelCatalog != nil {
-		if discovered, ok := a.modelCatalog.Cached(models.CacheKey("", record.ID)); ok && len(discovered) > 0 {
+		key := models.CacheKey("", record.ID)
+		discovered, ok := a.modelCatalog.Cached(key)
+		if !ok {
+			discovered, ok = a.modelCatalog.LastKnown(key)
+		}
+		if ok && len(discovered) > 0 {
 			ids := make([]string, 0, len(discovered))
 			for _, model := range discovered {
 				ids = append(ids, model.ModelID)
@@ -645,7 +650,23 @@ func (a *app) fetchUserProviderModels(query *tgbotapi.CallbackQuery, conf *confi
 			ids = append(ids, model.ModelID)
 
 			if i < modelsPageLimit {
-				lines = append(lines, fmt.Sprintf("%d. <code>%s</code>", i+1, escapeHTML(model.ModelID)))
+				price := "❔ PRICE UNKNOWN"
+				if model.PriceKnown {
+					price = "💰 PAID"
+					if model.Free {
+						price = "🆓 FREE"
+					}
+				}
+				name := model.DisplayName
+				if strings.TrimSpace(name) == "" {
+					name = model.ModelID
+				}
+				line := fmt.Sprintf("%d. ⚪ UNKNOWN · %s · <b>%s</b> · <code>%s</code>",
+					i+1, price, escapeHTML(name), escapeHTML(model.ModelID))
+				if model.SourceProvider != "" {
+					line += " · " + escapeHTML(model.SourceProvider)
+				}
+				lines = append(lines, line)
 			}
 		}
 
@@ -662,6 +683,47 @@ func (a *app) fetchUserProviderModels(query *tgbotapi.CallbackQuery, conf *confi
 // -----------------------------------------------------------------------------
 // BACKGROUND DISCOVERY
 // -----------------------------------------------------------------------------
+
+func (a *app) setChainModelCatalog(name string, fetched []models.Model) {
+	ids := make([]string, 0, len(fetched))
+	for _, model := range fetched {
+		ids = append(ids, model.ModelID)
+	}
+	a.chain.SetDiscoveredModels(name, ids)
+}
+
+// refreshOpenRouterModels forces a background catalogue refresh for the
+// configured OpenRouter endpoint. It never sends a generation request.
+func (a *app) refreshOpenRouterModels(chatID int64) bool {
+	if a.modelCatalog == nil {
+		return false
+	}
+
+	for _, name := range a.chain.Names() {
+		baseURL, apiKey, ok := a.chain.EndpointOf(name)
+		if !ok || (!strings.EqualFold(name, "openrouter") && !strings.Contains(strings.ToLower(baseURL), "openrouter.ai")) {
+			continue
+		}
+
+		key := models.CacheKey(name, "")
+		a.modelCatalog.RefreshNowAsync(key, baseURL, func() string { return apiKey },
+			func(fetched []models.Model, err error) {
+				if err != nil || len(fetched) == 0 {
+					log.Printf("OpenRouter model catalogue refresh failed")
+					a.send(chatID, "⚠️ Could not refresh the OpenRouter model list. The last known catalogue is still available.", "")
+					return
+				}
+
+				a.setChainModelCatalog(name, fetched)
+				a.send(chatID, fmt.Sprintf("✅ Refreshed %d OpenRouter models. Reopen /model to browse them.", len(fetched)), "")
+			},
+		)
+		a.send(chatID, "🔄 Refreshing the OpenRouter model list in the background…", "")
+		return true
+	}
+
+	return false
+}
 
 // refreshChainModels keeps the picker honest: when the cached catalogue of a
 // chain provider is stale, the live list is fetched in the background and the
@@ -689,6 +751,7 @@ func (a *app) refreshChainModels(index int, chatID int64, messageID int, conf *c
 			if err != nil || len(fetched) == 0 {
 				return
 			}
+			a.setChainModelCatalog(name, fetched)
 
 			view, showing := a.modelsView(chatID, messageID)
 			if !showing || view.user || view.index != index {
@@ -722,12 +785,13 @@ func (a *app) refreshUserProviderModels(
 	view := modelsView{index: index, page: page, user: true}
 	key := models.CacheKey("", record.ID)
 
+	refresh := a.modelCatalog.RefreshAsync
 	if force {
-		// The refresh button drops the cached list on purpose.
-		a.modelCatalog.Invalidate(key)
+		// Force an upstream request without discarding the last good list.
+		refresh = a.modelCatalog.RefreshNowAsync
 	}
 
-	a.modelCatalog.RefreshAsync(key, record.BaseURL, func() string {
+	refresh(key, record.BaseURL, func() string {
 		// The key is opened here, used for this one request and dropped.
 		apiKey, _, err := a.userProviders.APIKey(a.ctx, userID, record.ID)
 		if err != nil {
