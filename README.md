@@ -148,7 +148,7 @@ providers:
   - name: groq              # GROQ_API_KEY
   - name: gemini            # GEMINI_API_KEY
   - name: cerebras          # CEREBRAS_API_KEY
-  #- name: nvidia           # NVIDIA_API_KEY
+  - name: nvidia            # NVIDIA_API_KEY
   #- name: mistral          # MISTRAL_API_KEY
   #- name: deepseek         # DEEPSEEK_API_KEY
   #- name: together         # TOGETHER_API_KEY

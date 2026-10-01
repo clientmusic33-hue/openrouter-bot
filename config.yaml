@@ -146,8 +146,9 @@ providers:
   # way - add the name and set the matching key.
   # Key: CEREBRAS_API_KEY from https://cloud.cerebras.ai
   - name: cerebras
+  # NVIDIA NIM: the hosted model catalogue, with a free tier.
   # Key: NVIDIA_API_KEY from https://build.nvidia.com
-  #- name: nvidia
+  - name: nvidia
   # Key: MISTRAL_API_KEY from https://console.mistral.ai
   #- name: mistral
   # Key: DEEPSEEK_API_KEY from https://platform.deepseek.com

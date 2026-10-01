@@ -79,11 +79,19 @@ var presets = []Preset{
 		Name:      "nvidia",
 		BaseURL:   "https://integrate.api.nvidia.com/v1",
 		APIKeyEnv: "NVIDIA_API_KEY",
+		// The catalogue at build.nvidia.com holds more than a hundred
+		// models; these are the ones a Telegram bot reaches for. Any other
+		// model id from the catalogue can be listed under models: in
+		// config.yaml, and the failover walks them top to bottom.
 		Models: []string{
+			"nvidia/nemotron-3.5-lightning-30b-a3b",
 			"meta/llama-3.3-70b-instruct",
-			"nvidia/llama-3.3-nemotron-super-49b-v1",
+			"deepseek-ai/deepseek-v4-pro",
+			"openai/gpt-oss-120b",
+			"google/gemma-4-31b-it",
+			"moonshotai/kimi-k3",
 		},
-		Docs: "https://build.nvidia.com",
+		Docs: "https://build.nvidia.com/models",
 	},
 	{
 		Name:      "mistral",

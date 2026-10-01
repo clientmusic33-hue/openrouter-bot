@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/spf13/viper"
+
+	"openrouter-bot/provider"
 )
 
 // TestLoadProvidersFromYAML is the check that matters for the provider chain:
@@ -187,4 +189,79 @@ func TestPublicModeOpensEverything(t *testing.T) {
 	if c.GroupChatMode != GroupModeAll {
 		t.Errorf("GroupChatMode = %q, want %q", c.GroupChatMode, GroupModeAll)
 	}
+}
+
+// TestNvidiaNeedsOnlyANameAndItsKey pins the NVIDIA NIM contract: the preset
+// name and NVIDIA_API_KEY are all a user has to provide, because the endpoint
+// and the models come from the built-in catalogue. It also pins the other
+// half of the deal - without a key the provider stays listed, so /providers
+// can explain why it is skipped, but never serves a request.
+func TestNvidiaNeedsOnlyANameAndItsKey(t *testing.T) {
+	const yaml = "providers:\n  - name: nvidia\n"
+
+	load := func(t *testing.T, key string) []provider.Config {
+		t.Helper()
+
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
+			t.Fatalf("writing config: %v", err)
+		}
+
+		t.Setenv("NVIDIA_API_KEY", key)
+
+		viper.Reset()
+		t.Cleanup(viper.Reset)
+
+		viper.SetConfigFile(path)
+		viper.AutomaticEnv()
+
+		if err := viper.ReadInConfig(); err != nil {
+			t.Fatalf("ReadInConfig: %v", err)
+		}
+
+		return loadProviders()
+	}
+
+	t.Run("with a key it is ready to answer", func(t *testing.T) {
+		providers := load(t, "nvapi-test")
+
+		if len(providers) != 1 {
+			t.Fatalf("loadProviders() returned %d entries, want 1: %#v", len(providers), providers)
+		}
+
+		got := providers[0]
+
+		if got.Name != "nvidia" {
+			t.Errorf("Name = %q, want nvidia", got.Name)
+		}
+		if got.BaseURL != "https://integrate.api.nvidia.com/v1" {
+			t.Errorf("BaseURL = %q, want the NVIDIA NIM endpoint", got.BaseURL)
+		}
+		if got.APIKeyEnv != "NVIDIA_API_KEY" {
+			t.Errorf("APIKeyEnv = %q, want NVIDIA_API_KEY", got.APIKeyEnv)
+		}
+		if got.APIKey != "nvapi-test" {
+			t.Errorf("APIKey = %q, want it resolved from NVIDIA_API_KEY", got.APIKey)
+		}
+		if len(got.Models) == 0 {
+			t.Error("Models is empty, want the preset defaults")
+		}
+		if !got.Configured() {
+			t.Error("Configured() = false, want true once the key is set")
+		}
+	})
+
+	t.Run("without a key it is listed but never used", func(t *testing.T) {
+		providers := load(t, "")
+
+		if len(providers) != 1 {
+			t.Fatalf("loadProviders() returned %d entries, want 1 so /providers can explain", len(providers))
+		}
+		if providers[0].APIKey != "" {
+			t.Errorf("APIKey = %q, want empty", providers[0].APIKey)
+		}
+		if providers[0].Configured() {
+			t.Error("Configured() = true without a key, want false")
+		}
+	})
 }
