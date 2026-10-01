@@ -69,8 +69,10 @@ func TestSystemPromptCarriesPersona(t *testing.T) {
 		"Always answer in English language.",
 		"You are a test assistant.",
 		"plain text",
+		"Explain in plain words first",
 		"Write maths the way a phone shows it",
 		"Never emit LaTeX",
+		"One short line per step",
 		"Never write more than 3500 characters",
 	} {
 		if !strings.Contains(prompt, want) {

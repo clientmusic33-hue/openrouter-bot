@@ -143,6 +143,51 @@ func TestHumanizeMath(t *testing.T) {
 			in:   `\foo{bar} stays as written`,
 			want: `\foo{bar} stays as written`,
 		},
+		{
+			name: "functions keep their name",
+			in:   `\log_2 8 = 3 and \sin^2 x + \cos^2 x = 1`,
+			want: "log₂ 8 = 3 and sin² x + cos² x = 1",
+		},
+		{
+			name: "equation number survives",
+			in:   `a^2 + b^2 = c^2 \tag{1}`,
+			want: "a² + b² = c² (1)",
+		},
+		{
+			name: "old style fraction",
+			in:   `{a \over b} = 2`,
+			want: "a/b = 2",
+		},
+		{
+			name: "congruence",
+			in:   `17 \pmod{5} = 2`,
+			want: "17 (mod 5) = 2",
+		},
+		{
+			name: "sets and links keep their text",
+			in:   `x \in \mathbb{R} and \href{http://example.com}{this page}`,
+			want: "x ∈ R and this page",
+		},
+		{
+			name: "bold and labels",
+			in:   `\textbf{Note:} x \in \mathbb{R}`,
+			want: "Note: x ∈ R",
+		},
+		{
+			name: "list items",
+			in:   `\item first \item second`,
+			want: "• first • second",
+		},
+		{
+			name: "brackets",
+			in:   `\lceil x \rceil + \lfloor y \rfloor`,
+			want: "⌈ x ⌉ + ⌊ y ⌋",
+		},
+		{
+			name: "alignment tabs",
+			in:   `\begin{aligned} a &= 1 \\ b &= 2 \end{aligned}`,
+			want: " a = 1 \n b = 2 ",
+		},
 		// A stream renders what it has, so a half-arrived command must not
 		// be shown; the next update carries the complete token.
 		{

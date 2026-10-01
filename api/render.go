@@ -267,6 +267,24 @@ var mathSymbolMap = map[string]string{
 	"notin": "∉", "subset": "⊂", "supset": "⊃", "cup": "∪", "cap": "∩",
 	"emptyset": "∅", "star": "★",
 
+	// functions: the name is already readable, only the backslash goes
+	"sin": "sin", "cos": "cos", "tan": "tan", "cot": "cot", "sec": "sec",
+	"csc": "csc", "arcsin": "arcsin", "arccos": "arccos", "arctan": "arctan",
+	"sinh": "sinh", "cosh": "cosh", "tanh": "tanh", "log": "log", "ln": "ln",
+	"lg": "lg", "exp": "exp", "det": "det", "gcd": "gcd", "lcm": "lcm",
+	"arg": "arg", "dim": "dim", "ker": "ker", "hom": "hom", "sup": "sup",
+	"inf": "inf", "lim": "lim", "max": "max", "min": "min",
+	"liminf": "lim inf", "limsup": "lim sup", "Pr": "Pr",
+
+	// brackets, arrows and the rest of what a model reaches for
+	"lceil": "⌈", "rceil": "⌉", "lfloor": "⌊", "rfloor": "⌋",
+	"langle": "⟨", "rangle": "⟩", "vert": "|", "Vert": "‖", "mid": "|",
+	"nmid": "∤", "neg": "¬", "lnot": "¬", "oplus": "⊕", "ominus": "⊖",
+	"otimes": "⊗", "oslash": "⊘", "odot": "⊙", "wedge": "∧", "vee": "∨",
+	"mapsto": "↦", "uparrow": "↑", "downarrow": "↓", "updownarrow": "↕",
+	"sim": "~", "simeq": "≃", "cong": "≅", "asymp": "≍", "doteq": "≐",
+	"gt": ">", "lt": "<", "colon": ":", "ast": "∗", "bullet": "•",
+
 	// greek
 	"alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ",
 	"epsilon": "ε", "varepsilon": "ε", "zeta": "ζ", "eta": "η",
@@ -322,13 +340,19 @@ var (
 	mathWrapperRe = regexp.MustCompile(
 		`\\(?:text|textrm|mathrm|mathbf|mathit|mathsf|mathtt|boldsymbol|` +
 			`mathbb|mathcal|mathfrak|operatorname|boxed|overline|underline|` +
-			`widehat|hat|vec|bar|tilde)\{([^{}]*)\}`)
+			`widehat|hat|vec|bar|tilde|emph|textbf|textit|texttt|textsc|` +
+			`textsf|textnormal|textmd|textup|textsl|mbox|hbox|fbox|framebox|` +
+			`makebox|substack|url|caption|section|subsection|subsubsection|` +
+			`paragraph)\*?\{([^{}]*)\}`)
 
 	// \left( and \right) are sizing hints that mean nothing in plain text.
 	mathSizingRe = regexp.MustCompile(`\\(?:left|right)\s*([()\[\]|])|\\(?:left|right|big|Big|bigg|Bigg)\b`)
 
 	// Spacing commands.
-	mathSpacingRe = regexp.MustCompile(`\\(?:displaystyle|limits|nolimits|quad|qquad|,|;|:|!| )`)
+	mathSpacingRe = regexp.MustCompile(
+		`\\(?:displaystyle|limits|nolimits|quad|qquad|thinspace|medspace|` +
+			`thickspace|negthinspace|negmedspace|negthickspace|enspace|` +
+			`hfill|hfil|hfilll|,|;|:|!| )`)
 
 	// \binom{n}{k} has no single character, so it is spelled out.
 	mathBinomRe = regexp.MustCompile(`\\(?:binom|dbinom|tbinom)\{([^{}]*)\}\{([^{}]*)\}`)
@@ -349,6 +373,31 @@ var (
 	// A single letter subscript is maths ("x_i"), but only when it is not
 	// the start of a word: "user_id" stays an identifier, "x_i" becomes xᵢ.
 	mathSubLetterRe = regexp.MustCompile(`([A-Za-z0-9)])_([A-Za-z0-9])([^A-Za-z0-9]|$)`)
+
+	// Commands that carry nothing a reader needs: labels and page layout.
+	mathDropRe = regexp.MustCompile(
+		`\\(?:label|nonumber|notag|hline|centering|noindent|bigskip|medskip|` +
+			`smallskip|newpage|clearpage)\b|` +
+			`\\(?:hspace|vspace|rule|includegraphics|cline|raisebox)\*?\{[^{}]*}`)
+
+	// An equation number still means something to the reader.
+	mathTagRe = regexp.MustCompile(`\\tag\{([^}]*)}`)
+
+	// Congruence: a mod b.
+	mathPmodRe = regexp.MustCompile(`[ \t]*\\pmod\s*\{([^}]*)}`)
+
+	// A link is worth its text, not its target.
+	mathHrefRe = regexp.MustCompile(`\\href\{[^}]*}\{([^{}]*)}`)
+
+	// The old style fraction, {a \over b}, which models quote as often as
+	// \frac{a}{b}.
+	mathOverRe = regexp.MustCompile(`\{([^{}]*)\\over([^{}]*)\}`)
+
+	// List items, which models write when they answer step by step.
+	mathItemRe = regexp.MustCompile(`\\item\b[ \t]*`)
+
+	// In an aligned block "a &= 1" the ampersand is only the alignment tab.
+	mathAlignEqRe = regexp.MustCompile(`&[ \t]*=`)
 
 	// A fragment a stream can leave dangling at the very end of an answer:
 	// "\fra" from \frac, or a "\(" whose partner has not arrived yet.
@@ -404,9 +453,11 @@ func HumanizeMath(text string) string {
 	for i := 0; i < 12; i++ {
 		before := out
 
+		out = expandDrops(out)
 		out = expandWrappers(out)
 		out = expandRoots(out)
 		out = mathBinomRe.ReplaceAllString(out, "($1 choose $2)")
+		out = expandOverFractions(out)
 		out = expandFractions(out)
 		out = expandScripts(out)
 		out = expandSymbols(out)
@@ -465,6 +516,37 @@ func looksLikeMath(s string) bool {
 	}
 
 	return false
+}
+
+// expandDrops removes the commands that only exist to lay a formula out on a
+// page, and rewrites the few that still carry meaning: an equation number, a
+// congruence and a link.
+func expandDrops(s string) string {
+	s = mathDropRe.ReplaceAllString(s, "")
+	s = mathTagRe.ReplaceAllString(s, "($1)")
+	s = mathPmodRe.ReplaceAllString(s, " (mod $1)")
+	s = mathHrefRe.ReplaceAllString(s, "$1")
+	s = mathItemRe.ReplaceAllString(s, "• ")
+	s = mathAlignEqRe.ReplaceAllString(s, "=")
+
+	return s
+}
+
+// expandOverFractions rewrites {a \over b} the same way as \frac{a}{b},
+// because models quote both forms.
+func expandOverFractions(s string) string {
+	for i := 0; i < 10 && mathOverRe.MatchString(s); i++ {
+		s = mathOverRe.ReplaceAllStringFunc(s, func(m string) string {
+			groups := mathOverRe.FindStringSubmatch(m)
+			if len(groups) < 3 {
+				return m
+			}
+
+			return renderFraction(groups[1], groups[2])
+		})
+	}
+
+	return s
 }
 
 // expandSymbols replaces every known LaTeX command with one character.
