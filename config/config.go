@@ -87,8 +87,36 @@ type Config struct {
 	RateLimitPerMinute int
 
 	// Providers is the failover chain, best first. When empty it is
-	// synthesised from BASE_URL/MODEL/API_KEY plus GEMINI_API_KEY.
+	// synthesised from BASE_URL/MODEL/API_KEY plus every preset whose API
+	// key is present in the environment.
 	Providers []provider.Config
+
+	// MaxReplyChars caps one outgoing answer. Telegram allows 4096
+	// characters per message; the default stays comfortably below that so
+	// adding formatting cannot push a chunk over the limit.
+	MaxReplyChars int
+	// RenderMarkdown makes the final message try MarkdownV2 before falling
+	// back to plain text. Off by default: the built-in persona answers in
+	// plain text, and Telegram rejects unclosed markup outright.
+	RenderMarkdown bool
+	// SuggestModels enables the occasional "this model may suit you better"
+	// hint based on the user's usage.
+	SuggestModels bool
+	// GroupAccess is the default access mode for a new group:
+	// "everyone", "admins" or "owner". A group can override it with /group.
+	GroupAccess string
+	// PrivateAccess is who may use the bot in a direct chat: "everyone",
+	// "admins" (the owner) or "owner". PUBLIC_MODE forces it to everyone,
+	// because a public bot has to answer anybody who finds it.
+	PrivateAccess string
+	// PersonaPrompt holds the response style rules appended to every system
+	// prompt.
+	PersonaPrompt string
+
+	// TelegramAPIURL points at a custom Bot API server. Empty means
+	// api.telegram.org. The value keeps the two %s placeholders the Telegram
+	// library fills with the token and the method name.
+	TelegramAPIURL string
 
 	// PublicMode removes every usage restriction: unlimited budget for all
 	// roles, no rate limiting and answers to every group message. It exists
@@ -159,8 +187,15 @@ func Load() (*Config, error) {
 		MaxConcurrentRequests: viper.GetInt("MAX_CONCURRENT_REQUESTS"),
 		RateLimitPerMinute:    viper.GetInt("RATE_LIMIT_PER_MINUTE"),
 
-		Providers:  loadProviders(),
-		PublicMode: viper.GetBool("PUBLIC_MODE"),
+		Providers:      loadProviders(),
+		PublicMode:     viper.GetBool("PUBLIC_MODE"),
+		MaxReplyChars:  viper.GetInt("MAX_REPLY_CHARS"),
+		RenderMarkdown: viper.GetBool("RENDER_MARKDOWN"),
+		SuggestModels:  viper.GetBool("SUGGEST_MODELS"),
+		GroupAccess:    strings.ToLower(strings.TrimSpace(viper.GetString("GROUP_ACCESS"))),
+		PrivateAccess:  strings.ToLower(strings.TrimSpace(viper.GetString("PRIVATE_ACCESS"))),
+		PersonaPrompt:  viper.GetString("PERSONA_PROMPT"),
+		TelegramAPIURL: strings.TrimSpace(viper.GetString("TELEGRAM_API_URL")),
 	}
 
 	if config.Model.ModelName == "" {
@@ -171,10 +206,7 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
-	// The assistant is asked to answer in the configured UI language unless a
-	// custom prompt already says otherwise.
-	config.SystemPrompt = "Always answer in " +
-		languageName(config.Lang) + " language." + config.SystemPrompt
+	config.SystemPrompt = buildSystemPrompt(config)
 
 	printConfig(config)
 
@@ -241,6 +273,28 @@ func (c *Config) Validate() error {
 	if c.StatsMinRole == "" {
 		c.StatsMinRole = "ADMIN"
 	}
+	if c.MaxReplyChars <= 0 {
+		c.MaxReplyChars = DefaultMaxReplyChars
+	}
+	// Never hand Telegram more than it accepts, whatever the config says.
+	if c.MaxReplyChars > TelegramMaxMessageLength-96 {
+		c.MaxReplyChars = TelegramMaxMessageLength - 96
+	}
+	if !ValidGroupAccess(c.GroupAccess) {
+		if c.GroupAccess != "" {
+			log.Printf("Unknown GROUP_ACCESS %q, falling back to %q", c.GroupAccess, AccessEveryone)
+		}
+		c.GroupAccess = AccessEveryone
+	}
+	if !ValidPrivateAccess(c.PrivateAccess) {
+		if c.PrivateAccess != "" {
+			log.Printf("Unknown PRIVATE_ACCESS %q, falling back to %q", c.PrivateAccess, AccessEveryone)
+		}
+		c.PrivateAccess = AccessEveryone
+	}
+	if strings.TrimSpace(c.PersonaPrompt) == "" {
+		c.PersonaPrompt = DefaultPersonaPrompt
+	}
 
 	if c.PublicMode {
 		// A negative budget means unlimited in HaveAccess.
@@ -248,6 +302,12 @@ func (c *Config) Validate() error {
 		c.GuestBudget = -1
 		c.RateLimitPerMinute = 0
 		c.GroupChatMode = GroupModeAll
+		// A public bot answers anybody, in groups and in direct messages.
+		// Restricting direct messages is the one thing PUBLIC_MODE overrules.
+		if c.PrivateAccess != AccessEveryone {
+			log.Printf("PUBLIC_MODE overrides PRIVATE_ACCESS=%s; direct messages are open", c.PrivateAccess)
+		}
+		c.PrivateAccess = AccessEveryone
 
 		log.Printf(
 			"PUBLIC MODE ENABLED: budgets are unlimited, rate limiting is off " +
@@ -327,6 +387,11 @@ func setDefaults() {
 	viper.SetDefault("MAX_CONCURRENT_REQUESTS", 8)
 	viper.SetDefault("RATE_LIMIT_PER_MINUTE", 10)
 	viper.SetDefault("TYPE", "openrouter")
+	viper.SetDefault("MAX_REPLY_CHARS", DefaultMaxReplyChars)
+	viper.SetDefault("RENDER_MARKDOWN", false)
+	viper.SetDefault("SUGGEST_MODELS", true)
+	viper.SetDefault("GROUP_ACCESS", AccessEveryone)
+	viper.SetDefault("PRIVATE_ACCESS", AccessEveryone)
 }
 
 // languageName is intentionally dependency free so that the config package
@@ -359,6 +424,11 @@ func loadProviders() []provider.Config {
 		if entry.Name == "" {
 			continue
 		}
+
+		// A provider may be listed by name only: the preset supplies the
+		// endpoint, the models and the name of the key variable.
+		entry = provider.ApplyPreset(entry)
+
 		if entry.APIKeyEnv != "" {
 			entry.APIKey = os.Getenv(entry.APIKeyEnv)
 		}
@@ -372,23 +442,95 @@ func loadProviders() []provider.Config {
 	return resolved
 }
 
-// FallbackProviders builds a chain from the flat environment variables, used
-// when config.yaml does not define a providers list.
-func FallbackProviders(c *Config) []provider.Config {
-	list := []provider.Config{{
+// extraProviderOrder is the order in which environment-configured providers
+// join a chain that config.yaml did not define itself.
+var extraProviderOrder = []string{"groq", "gemini", "cerebras", "nvidia", "mistral", "deepseek", "together"}
+
+// PrimaryProvider describes the endpoint of the flat BASE_URL/MODEL/API_KEY
+// variables. It is the first entry of the fallback chain.
+func PrimaryProvider(c *Config) provider.Config {
+	return provider.Config{
 		Name:    "openrouter",
 		BaseURL: c.OpenAIBaseURL,
 		APIKey:  c.OpenAIApiKey,
 		Models:  []string{c.Model.ModelName},
-	}}
+	}
+}
 
-	if c.GeminiAPIKey != "" {
-		list = append(list, provider.Config{
-			Name:    "gemini",
-			BaseURL: "https://generativelanguage.googleapis.com/v1beta/openai/",
-			APIKey:  c.GeminiAPIKey,
-			Models:  []string{"gemini-2.5-flash", "gemini-2.5-flash-lite"},
+// ProvidersFromEnv returns the preset providers whose API key is present in
+// the environment, in a stable order. This is what makes "just set
+// GROQ_API_KEY" (or GEMINI_API_KEY, or CEREBRAS_API_KEY) enough to get a
+// failover chain.
+func ProvidersFromEnv() []provider.Config {
+	var out []provider.Config
+
+	for _, name := range extraProviderOrder {
+		preset, ok := provider.LookupPreset(name)
+		if !ok || preset.APIKeyEnv == "" {
+			continue
+		}
+
+		key := strings.TrimSpace(os.Getenv(preset.APIKeyEnv))
+		if key == "" {
+			continue
+		}
+
+		out = append(out, provider.Config{
+			Name:        preset.Name,
+			BaseURL:     preset.BaseURL,
+			APIKeyEnv:   preset.APIKeyEnv,
+			APIKey:      key,
+			Models:      append([]string(nil), preset.Models...),
+			RequiresKey: true,
 		})
+	}
+
+	return out
+}
+
+// hasProvider reports whether a list already contains a provider by name.
+func hasProvider(list []provider.Config, name string) bool {
+	for _, entry := range list {
+		if strings.EqualFold(entry.Name, name) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// FallbackProviders builds a chain from the flat environment variables, used
+// when config.yaml does not define a providers list. The primary provider
+// comes first, then every preset with a key, then a local Ollama endpoint if
+// one was configured.
+func FallbackProviders(c *Config) []provider.Config {
+	list := []provider.Config{PrimaryProvider(c)}
+
+	list = append(list, ProvidersFromEnv()...)
+
+	// An explicit GEMINI_API_KEY on the config struct counts even when the
+	// variable was set through config.yaml rather than the environment.
+	if c.GeminiAPIKey != "" && !hasProvider(list, "gemini") {
+		if preset, ok := provider.LookupPreset("gemini"); ok {
+			list = append(list, provider.Config{
+				Name:        preset.Name,
+				BaseURL:     preset.BaseURL,
+				APIKeyEnv:   preset.APIKeyEnv,
+				APIKey:      c.GeminiAPIKey,
+				Models:      append([]string(nil), preset.Models...),
+				RequiresKey: true,
+			})
+		}
+	}
+
+	if host := strings.TrimSpace(os.Getenv("OLLAMA_BASE_URL")); host != "" {
+		if preset, ok := provider.LookupPreset("ollama"); ok {
+			list = append(list, provider.Config{
+				Name:    preset.Name,
+				BaseURL: strings.TrimRight(host, "/") + "/v1",
+				Models:  append([]string(nil), preset.Models...),
+			})
+		}
 	}
 
 	return list

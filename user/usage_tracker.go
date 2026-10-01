@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"openrouter-bot/config"
@@ -46,14 +47,56 @@ func NewUsageTracker(userID, userName, logsDir string, conf *config.Config, hist
 }
 
 func newUserUsage(userName string) *UserUsage {
+	settings := DefaultSettings()
+	settings.Initialised = true
+
 	return &UserUsage{
 		UserName: userName,
 		UsageHistory: UsageHist{
 			ChatCost: make(map[string]float64),
 			Requests: make(map[string]int),
 		},
+		Settings: settings,
 	}
 }
+
+// updateUsage mutates the usage record under its lock and persists the result.
+func (ut *UsageTracker) updateUsage(mutate func(*UserUsage)) {
+	ut.UsageMu.Lock()
+	if ut.Usage == nil {
+		ut.Usage = newUserUsage(ut.UserName)
+	}
+	if ut.Usage.UsageHistory.ChatCost == nil {
+		ut.Usage.UsageHistory.ChatCost = make(map[string]float64)
+	}
+	if ut.Usage.UsageHistory.Requests == nil {
+		ut.Usage.UsageHistory.Requests = make(map[string]int)
+	}
+
+	mutate(ut.Usage)
+	ut.UsageMu.Unlock()
+
+	if err := ut.saveUsage(); err != nil {
+		logSaveFailure("usage", ut.UserID, err)
+	}
+}
+
+// logSaveFailure reports a failed persist without flooding the log: a broken
+// log directory would otherwise print a warning on every single message.
+func logSaveFailure(kind, userID string, err error) {
+	key := userID + "/" + kind
+	if last, ok := lastSaveFailure.Load(key); ok {
+		if lastTime, ok := last.(time.Time); ok && time.Since(lastTime) < time.Minute {
+			return
+		}
+	}
+	lastSaveFailure.Store(key, time.Now())
+
+	log.Printf("Failed to save %s for user %s: %v", kind, userID, err)
+}
+
+// lastSaveFailure rate limits persistence warnings per user and kind.
+var lastSaveFailure sync.Map
 
 // -----------------------------------------------------------------------------
 // ACCESS CONTROL
@@ -394,6 +437,7 @@ func (ut *UsageTracker) UsageProfile() provider.UsageProfile {
 	if ut.Usage != nil {
 		profile.AvgPromptChars = ut.Usage.AvgPromptChars
 		profile.UsesVision = ut.Usage.UsedVision
+		profile.DislikedModels = ut.Usage.Settings.Downvotes
 
 		total, days := 0, 0
 		for _, count := range ut.Usage.UsageHistory.Requests {
@@ -417,6 +461,10 @@ func (ut *UsageTracker) UsageProfile() provider.UsageProfile {
 
 	ut.UsageMu.Unlock()
 
+	// Heavy users care about latency, essay writers about depth.
+	profile.PrefersFast = profile.RequestsPerDay > 50
+	profile.NeedsReasoning = profile.AvgPromptChars > 800
+
 	// History size and the biggest single message decide the context need.
 	history := ut.GetMessages()
 	profile.HistoryMessages = len(history)
@@ -436,9 +484,14 @@ func (ut *UsageTracker) UsageProfile() provider.UsageProfile {
 // OPENROUTER GENERATION STATISTICS
 // -----------------------------------------------------------------------------
 
-// GetUsageFromApi retrieves the cost of a generation from OpenRouter and adds
-// it to the user's usage.
-func (ut *UsageTracker) GetUsageFromApi(id string, conf *config.Config) error {
+// GetUsageFromApi retrieves the cost of a generation from the provider that
+// produced it and adds it to the user's usage.
+//
+// baseURL and apiKey identify the answering backend, so the lookup follows the
+// provider that actually served the request instead of assuming OpenRouter.
+// Providers without a generation statistics endpoint return an error from the
+// request, which callers treat as "no cost data available".
+func (ut *UsageTracker) GetUsageFromApi(id, baseURL, apiKey string) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		// Nothing was generated (the request failed before the first chunk),
@@ -446,13 +499,13 @@ func (ut *UsageTracker) GetUsageFromApi(id string, conf *config.Config) error {
 		return nil
 	}
 
-	if conf == nil || conf.OpenAIApiKey == "" {
+	if strings.TrimSpace(baseURL) == "" || strings.TrimSpace(apiKey) == "" {
 		return nil
 	}
 
-	endpoint := "https://openrouter.ai/api/v1/generation?id=" + url.QueryEscape(id)
+	endpoint := strings.TrimRight(baseURL, "/") + "/generation?id=" + url.QueryEscape(id)
 
-	totalCost, err := fetchGenerationCost(endpoint, conf.OpenAIApiKey)
+	totalCost, err := fetchGenerationCost(endpoint, apiKey)
 	if err != nil {
 		return err
 	}
@@ -506,7 +559,7 @@ func requestGenerationCost(client *http.Client, endpoint, apiKey string) (float6
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return 0, fmt.Errorf("OpenRouter generation API returned status %s", resp.Status)
+		return 0, fmt.Errorf("generation API returned status %s", resp.Status)
 	}
 
 	var generation GenerationResponse

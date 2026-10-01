@@ -2,6 +2,7 @@ package user
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -75,6 +76,13 @@ type UserUsage struct {
 	AvgPromptChars float64 `json:"avg_prompt_chars"`
 	PromptSamples  int64   `json:"prompt_samples"`
 	UsedVision     bool    `json:"used_vision"`
+
+	// Settings holds the user's own model choice and UI preferences.
+	Settings Settings `json:"settings"`
+
+	// LastModel is the model that produced the newest answer. Feedback and the
+	// footer need to name it without looking at the whole conversation.
+	LastModel string `json:"last_model,omitempty"`
 }
 
 type Cost struct {
@@ -190,4 +198,71 @@ func (ut *UsageTracker) StopStream() bool {
 	}
 
 	return cancel != nil
+}
+
+// -----------------------------------------------------------------------------
+// CONVERSATION CONTROL
+// -----------------------------------------------------------------------------
+
+// LastUserMessage returns the most recent user prompt in this conversation.
+// Used by "regenerate", which repeats the last question.
+func (ut *UsageTracker) LastUserMessage() (string, bool) {
+	messages := ut.GetMessages()
+
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" && strings.TrimSpace(messages[i].Content) != "" {
+			return messages[i].Content, true
+		}
+	}
+
+	return "", false
+}
+
+// DropLastAssistant removes the final assistant message, so a regenerated
+// answer does not stack on top of the one it replaces. It returns the role of
+// the message it removed.
+func (ut *UsageTracker) DropLastAssistant() bool {
+	return ut.History.dropLast("assistant")
+}
+
+// DropLastUser removes the final user message. Regenerating replays the prompt
+// itself, so the copy kept in history would otherwise be duplicated.
+func (ut *UsageTracker) DropLastUser() bool {
+	return ut.History.dropLast("user")
+}
+
+// LastModel returns the model that produced the newest answer, if any.
+func (ut *UsageTracker) LastModel() string {
+	ut.UsageMu.Lock()
+	defer ut.UsageMu.Unlock()
+
+	if ut.Usage == nil {
+		return ""
+	}
+
+	return ut.Usage.LastModel
+}
+
+// SetLastModel remembers which model answered, so feedback and the footer can
+// name it.
+func (ut *UsageTracker) SetLastModel(model string) {
+	ut.updateUsage(func(usage *UserUsage) {
+		usage.LastModel = strings.TrimSpace(model)
+	})
+}
+
+// RequestCount returns how many requests the user has made in total.
+func (ut *UsageTracker) RequestCount() int64 {
+	ut.UsageMu.Lock()
+	defer ut.UsageMu.Unlock()
+
+	var total int64
+	if ut.Usage == nil {
+		return 0
+	}
+	for _, count := range ut.Usage.UsageHistory.Requests {
+		total += int64(count)
+	}
+
+	return total
 }

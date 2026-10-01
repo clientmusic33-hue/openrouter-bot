@@ -107,6 +107,27 @@ func (h *History) prune(maxMessages int, maxAge time.Duration) {
 	h.messages = kept
 }
 
+// dropLast removes the newest message with the given role. It reports whether
+// anything was removed.
+func (h *History) dropLast(role string) bool {
+	if h == nil {
+		return false
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	for i := len(h.messages) - 1; i >= 0; i-- {
+		if h.messages[i].Role == role {
+			h.messages = append(h.messages[:i], h.messages[i+1:]...)
+
+			return true
+		}
+	}
+
+	return false
+}
+
 // Len returns the number of stored messages.
 func (h *History) Len() int {
 	if h == nil {

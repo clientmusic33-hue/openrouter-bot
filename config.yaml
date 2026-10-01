@@ -17,11 +17,24 @@ presence_penalty: 0
 # Response configuration
 max_tokens: 2000
 
+# Maximum length of one outgoing answer. Telegram allows 4096 characters per
+# message, so anything close to that risks a rejected message; 3500 keeps a
+# safety margin and matches what the assistant is told to produce.
+max_reply_chars: 3500
+
+# Render final answers as Markdown. Off by default: the assistant is asked for
+# plain text, and Telegram rejects the whole message when markup is malformed.
+render_markdown: false
+
+# Occasionally suggest a model that suits the user's usage better.
+suggest_models: true
+
 # ---------------------------------------------------------------------------
 # Access control
 # ---------------------------------------------------------------------------
 
-# Telegram user ID of admins, or empty to assign no admin
+# Telegram user ID of admins (the bot owner), or empty to assign no admin.
+# An owner can always use the bot, in private chats and in every group.
 admin_ids: ""
 
 # Allowed USER IDs. Leave empty to treat everyone as USER.
@@ -38,16 +51,32 @@ budget_period: monthly
 # Behaviour
 # ---------------------------------------------------------------------------
 
-# Language to use for the bot (supported: EN, RU)
+# Language of the bot's own messages (supported: EN, RU) and of the answers.
 lang: EN
 
-# Minimum role to show stats (ADMIN, USER, GUEST)
+# Minimum role to show spend statistics (ADMIN, USER, GUEST)
 stats_min_role: ADMIN
 
 # PUBLIC_MODE removes every usage restriction at once: unlimited budget for
-# all roles, no rate limiting, and answers to every group message.
-# Anyone who finds the bot can then spend your provider credits.
-# public_mode: true
+# all roles, no rate limiting, answers to every group message and open direct
+# messages.
+public_mode: true
+
+# Who may use the bot in a direct message:
+#   everyone - anybody who finds it (default, right for a public bot)
+#   admins   - only the bot owner; there are no other admins in a private chat
+#   owner    - the same, spelled out for a personal assistant
+# PUBLIC_MODE forces everyone. A stranger who writes to a restricted bot gets
+# one short explanation instead of silence.
+private_access: everyone
+
+# Who may use the bot in a group before anyone runs /group:
+#   everyone - any member (default, right for a free public bot)
+#   admins   - only chat administrators and the owner
+#   owner    - only the bot owner
+# A group can override this at any time with /group. The buttons in the bot
+# also change it, no command needed.
+group_access: everyone
 
 # How the bot behaves in group chats:
 #   mention - answer only when mentioned or replied to
@@ -80,62 +109,81 @@ max_history_time: 60
 #
 # Requests walk this list top to bottom. When a model fails the next model of
 # the same provider is tried; when a provider fails the next provider is
-# tried - both at stream creation and mid-stream.
+# tried - at stream creation and mid-stream. A user can override the order
+# from the buttons (/model), and the bot falls back automatically.
 #
-# api_key_env names the environment variable holding the key. A provider whose
-# key is unset is still listed by /providers (marked as having no key) but
-# will fail until you set it.
+# A provider only needs a name: the built-in preset supplies the endpoint, the
+# models and the name of the environment variable holding the key. Everything
+# may be overridden per entry.
+#
+# A provider whose key is missing is listed by /providers and the model picker
+# (marked "no key") but never costs a request - nothing has to be commented
+# out when a key is absent.
+#
+# Built-in presets: openrouter, groq, gemini, cerebras, nvidia, mistral,
+# deepseek, together, ollama, lmstudio.
 #
 # Remove this block entirely to fall back to the flat BASE_URL/MODEL/API_KEY
-# variables plus GEMINI_API_KEY.
+# variables plus every preset whose key is set in the environment.
 
 providers:
+  # OpenRouter: https://openrouter.ai/settings/keys  (API_KEY)
   - name: openrouter
-    base_url: https://openrouter.ai/api/v1
-    api_key_env: API_KEY
     models:
       - deepseek/deepseek-r1:free
       - openrouter/free
+      - meta-llama/llama-3.3-70b-instruct:free
 
+  # Groq: fast and free, the best default for a busy public bot.
+  # Key: GROQ_API_KEY from https://console.groq.com/keys
   - name: groq
-    base_url: https://api.groq.com/openai/v1
-    api_key_env: GROQ_API_KEY
-    models:
-      - llama-3.3-70b-versatile
-      - openai/gpt-oss-120b
-      - llama-3.1-8b-instant
 
+  # Google Gemini: 1M token context and vision.
+  # Key: GEMINI_API_KEY from https://aistudio.google.com/apikey
   - name: gemini
-    base_url: https://generativelanguage.googleapis.com/v1beta/openai/
-    api_key_env: GEMINI_API_KEY
-    models:
-      - gemini-2.5-flash
-      - gemini-2.5-flash-lite
 
-  # Optional: uncomment and set CEREBRAS_API_KEY.
-  #- name: cerebras
-  #  base_url: https://api.cerebras.ai/v1
-  #  api_key_env: CEREBRAS_API_KEY
-  #  models:
-  #    - gpt-oss-120b
-  #    - llama-3.3-70b
+  # Cerebras, NVIDIA NIM, Mistral, DeepSeek and Together all work the same
+  # way - add the name and set the matching key.
+  # Key: CEREBRAS_API_KEY from https://cloud.cerebras.ai
+  - name: cerebras
+  # NVIDIA NIM: the hosted model catalogue, with a free tier.
+  # Key: NVIDIA_API_KEY from https://build.nvidia.com
+  - name: nvidia
+  # Key: MISTRAL_API_KEY from https://console.mistral.ai
+  #- name: mistral
+  # Key: DEEPSEEK_API_KEY from https://platform.deepseek.com
+  #- name: deepseek
 
-  # Local Ollama: no API key needed, never rate limited. Shows as "no API key"
-  # in /providers, which is expected for a local endpoint.
-  - name: ollama
-    base_url: http://localhost:11434/v1
-    models:
-      - llama3.2:3b
+  # Local Ollama: no key needed, never rate limited. Uncomment when you run
+  # Ollama on the same machine; set OLLAMA_BASE_URL for a remote one.
+  #- name: ollama
 
 # ---------------------------------------------------------------------------
 # Prompts and vision
 # ---------------------------------------------------------------------------
 
+# Extra instructions prepended to the system prompt. The bot always adds the
+# response persona (plain text, no Markdown, short answers) and the language.
 assistant_prompt: |
   Read the entire conversation history line by line before answering.
   You are Assistant.
 
+# Replace the built-in response persona. Keep it plain text: Telegram rejects
+# a message whose markup does not parse.
+#persona_prompt: |
+#  You are a friendly and smart Telegram assistant.
+
 # Vision is off by default: enabling it sends user images to the model.
+# Groq and Gemini models in this bot can see images; OpenRouter depends on the
+# model. Turn it on to use it.
 vision: false
 vision_prompt: Describe the image
 vision_detail: low
+
+# ---------------------------------------------------------------------------
+# Telegram API
+# ---------------------------------------------------------------------------
+# Use a local Bot API server instead of api.telegram.org (useful for large
+# files). The value must contain the two %s placeholders the library fills in
+# with the token and the method name.
+#telegram_api_url: http://localhost:8081/bot%s/%s

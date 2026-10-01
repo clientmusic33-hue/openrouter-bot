@@ -3,6 +3,9 @@ package api
 import (
 	"strings"
 	"testing"
+
+	"openrouter-bot/config"
+	"openrouter-bot/provider"
 )
 
 func TestSplitMessageKeepsShortText(t *testing.T) {
@@ -98,5 +101,39 @@ func TestIsFreeModel(t *testing.T) {
 		if got := isFreeModel(tc.model); got != tc.want {
 			t.Errorf("%s: isFreeModel() = %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+// TestFooterNamesModelAndFailover covers the "which model answered" line,
+// including the visible note when the chain had to switch.
+func TestFooterNamesModelAndFailover(t *testing.T) {
+	candidate := provider.Candidate{Provider: "groq", Model: "llama-3.3-70b-versatile"}
+
+	plain := footer(candidate, 0)
+	if !strings.Contains(plain, "groq") || !strings.Contains(plain, "llama-3.3-70b-versatile") {
+		t.Errorf("footer = %q, want provider and model", plain)
+	}
+	if strings.Contains(plain, "switched") {
+		t.Errorf("footer = %q, should not mention a switch", plain)
+	}
+
+	switched := footer(candidate, 2)
+	if !strings.Contains(switched, "2 failed attempt") {
+		t.Errorf("footer = %q, want the failover note", switched)
+	}
+}
+
+// TestSplitMessageDefaultLimit guards the persona cap: an answer that reaches
+// the configured maximum stays inside one Telegram message.
+func TestSplitMessageDefaultLimit(t *testing.T) {
+	text := strings.Repeat("a", config.DefaultMaxReplyChars)
+
+	chunks := SplitMessage(text, config.DefaultMaxReplyChars, 0)
+	if len(chunks) != 1 {
+		t.Fatalf("got %d chunks, want a single message", len(chunks))
+	}
+	if len([]rune(chunks[0])) > config.TelegramMaxMessageLength {
+		t.Fatalf("chunk is %d runes, Telegram rejects more than %d",
+			len([]rune(chunks[0])), config.TelegramMaxMessageLength)
 	}
 }
