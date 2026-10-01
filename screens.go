@@ -142,16 +142,16 @@ func (a *app) modelsScreen(conf *config.Config, tracker *user.UsageTracker, prov
 		for _, ref := range models[offset:end] {
 			info := provider.LookupModel(ref.Model)
 			var badges []string
-			if info.Fast || info.Throughput >= 4 {
+			if info.Fast {
 				badges = append(badges, "⚡ fast")
 			}
-			if info.Reasoning >= 5 {
+			if info.Reasoning {
 				badges = append(badges, "🧠 reasoning")
 			}
 			if info.Vision {
 				badges = append(badges, "👁 vision")
 			}
-			if info.Coding >= 4 {
+			if info.Coding {
 				badges = append(badges, "💻 coding")
 			}
 			badgeStr := ""
