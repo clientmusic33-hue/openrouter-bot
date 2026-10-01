@@ -434,7 +434,7 @@ func setDefaults() {
 	viper.SetDefault("RATE_LIMIT_PER_MINUTE", 10)
 	viper.SetDefault("TYPE", "openrouter")
 	viper.SetDefault("MAX_REPLY_CHARS", DefaultMaxReplyChars)
-	viper.SetDefault("RENDER_MARKDOWN", false)
+	viper.SetDefault("RENDER_MARKDOWN", true)
 	viper.SetDefault("SUGGEST_MODELS", true)
 	viper.SetDefault("GROUP_ACCESS", AccessEveryone)
 	viper.SetDefault("PRIVATE_ACCESS", AccessEveryone)
@@ -490,7 +490,7 @@ func loadProviders() []provider.Config {
 
 // extraProviderOrder is the order in which environment-configured providers
 // join a chain that config.yaml did not define itself.
-var extraProviderOrder = []string{"groq", "gemini", "cerebras", "nvidia", "mistral", "deepseek", "together"}
+var extraProviderOrder = []string{"groq", "gemini", "cerebras", "nvidia", "mistral", "huggingface", "deepseek", "together"}
 
 // PrimaryProvider describes the endpoint of the flat BASE_URL/MODEL/API_KEY
 // variables. It is the first entry of the fallback chain.

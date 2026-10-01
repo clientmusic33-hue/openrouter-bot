@@ -104,6 +104,21 @@ var presets = []Preset{
 		Docs: "https://console.mistral.ai",
 	},
 	{
+		Name:      "huggingface",
+		BaseURL:   "https://router.huggingface.co/v1",
+		APIKeyEnv: "HF_TOKEN",
+		// The router lists every model its inference providers serve, which
+		// is far more than a Telegram bot needs; these are the ones worth
+		// starting from. Discovery replaces them with the live list.
+		Models: []string{
+			"openai/gpt-oss-120b",
+			"deepseek-ai/DeepSeek-V3.1",
+			"meta-llama/Llama-3.3-70B-Instruct",
+			"Qwen/Qwen3-8B",
+		},
+		Docs: "https://huggingface.co/docs/inference-providers",
+	},
+	{
 		Name:      "deepseek",
 		BaseURL:   "https://api.deepseek.com/v1",
 		APIKeyEnv: "DEEPSEEK_API_KEY",
@@ -207,17 +222,18 @@ func ApplyPreset(cfg Config) Config {
 // providerSpeed hints how quickly a provider answers. Used to favour fast
 // backends for chatty users. 0..1, higher is faster.
 var providerSpeed = map[string]float64{
-	"groq":       1.0,
-	"cerebras":   0.95,
-	"gemini":     0.7,
-	"mistral":    0.7,
-	"openrouter": 0.5,
-	"nvidia":     0.5,
-	"deepseek":   0.5,
-	"together":   0.5,
-	"ollama":     0.3,
-	"lmstudio":   0.3,
-	"local":      0.3,
+	"groq":        1.0,
+	"cerebras":    0.95,
+	"gemini":      0.7,
+	"mistral":     0.7,
+	"huggingface": 0.6,
+	"openrouter":  0.5,
+	"nvidia":      0.5,
+	"deepseek":    0.5,
+	"together":    0.5,
+	"ollama":      0.3,
+	"lmstudio":    0.3,
+	"local":       0.3,
 }
 
 // Speed returns the relative speed hint for a provider, defaulting to a

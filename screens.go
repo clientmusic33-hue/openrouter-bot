@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"openrouter-bot/config"
+	"openrouter-bot/internal/models"
 	"openrouter-bot/provider"
 	"openrouter-bot/ui"
 	"openrouter-bot/user"
@@ -92,9 +93,14 @@ func (a *app) providersScreen(conf *config.Config, tracker *user.UsageTracker, p
 		page = 0
 	}
 
+	keyboard := ui.ProviderList(status, active, page, providersPageSize)
+	keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("🔐 Your Providers", ui.Encode(ui.ActionUserProviders)),
+	))
+
 	return screen{
 		Text:     text,
-		Keyboard: ui.ProviderList(status, active, page, providersPageSize),
+		Keyboard: keyboard,
 	}
 }
 
@@ -108,21 +114,48 @@ func (a *app) modelsForProvider(providerIndex int) (string, []provider.ModelRef)
 	}
 
 	providerName := names[providerIndex]
-	catalogue := a.chain.ModelCatalog()
 
-	models := make([]provider.ModelRef, 0, len(catalogue))
-	for _, ref := range catalogue {
-		if strings.EqualFold(ref.Provider, providerName) {
-			models = append(models, ref)
+	return providerName, a.providerModels(providerName)
+}
+
+// providerModels returns what the picker shows for one chain provider: the
+// live catalogue once discovery has run, the configured list until then. The
+// configured list keeps the screen instant and doubles as the fallback for a
+// provider that does not expose a model list.
+func (a *app) providerModels(name string) []provider.ModelRef {
+	refs := make([]provider.ModelRef, 0, 8)
+
+	for _, ref := range a.chain.ModelCatalog() {
+		if strings.EqualFold(ref.Provider, name) {
+			refs = append(refs, ref)
 		}
 	}
 
-	return providerName, models
+	if a.modelCatalog == nil {
+		return refs
+	}
+
+	discovered, ok := a.modelCatalog.Cached(models.CacheKey(name, ""))
+	if !ok || len(discovered) == 0 {
+		return refs
+	}
+
+	out := make([]provider.ModelRef, 0, len(discovered))
+	for _, model := range discovered {
+		out = append(out, provider.ModelRef{
+			Provider:      name,
+			Model:         model.ModelID,
+			Description:   provider.DescribeModel(model.ModelID),
+			ContextLength: model.ContextLength,
+		})
+	}
+
+	return out
 }
 
 // modelsScreen lists one provider's models.
 func (a *app) modelsScreen(conf *config.Config, tracker *user.UsageTracker, providerIndex, page int) screen {
-	providerName, models := a.modelsForProvider(providerIndex)
+	providerName, refs := a.modelsForProvider(providerIndex)
 	if providerName == "" {
 		return a.providersScreen(conf, tracker, 0)
 	}
@@ -133,13 +166,13 @@ func (a *app) modelsScreen(conf *config.Config, tracker *user.UsageTracker, prov
 
 	offset := page * modelsPageSize
 	end := offset + modelsPageSize
-	if end > len(models) {
-		end = len(models)
+	if end > len(refs) {
+		end = len(refs)
 	}
 
 	var modelLines []string
-	if offset < len(models) {
-		for _, ref := range models[offset:end] {
+	if offset < len(refs) {
+		for _, ref := range refs[offset:end] {
 			info := provider.LookupModel(ref.Model)
 			var badges []string
 			if info.Fast {
@@ -158,7 +191,11 @@ func (a *app) modelsScreen(conf *config.Config, tracker *user.UsageTracker, prov
 			if len(badges) > 0 {
 				badgeStr = " · " + strings.Join(badges, " · ")
 			}
-			modelLines = append(modelLines, fmt.Sprintf("• <code>%s</code>%s", escapeHTML(ref.Model), badgeStr))
+			line := fmt.Sprintf("• <code>%s</code>%s", escapeHTML(ref.Model), badgeStr)
+			if ref.ContextLength > 0 {
+				line += fmt.Sprintf(" · %dk ctx", ref.ContextLength/1000)
+			}
+			modelLines = append(modelLines, line)
 		}
 	}
 
@@ -171,7 +208,7 @@ func (a *app) modelsScreen(conf *config.Config, tracker *user.UsageTracker, prov
 		"🧠 <b>%s</b> · %d model(s)\n\n"+
 			"Tap a model to pin it, or keep <b>✨ auto</b> and let the bot choose.\n"+
 			"Current: <b>%s</b>%s",
-		escapeHTML(providerName), len(models), escapeHTML(tracker.SettingsSummary()), details,
+		escapeHTML(providerName), len(refs), escapeHTML(tracker.SettingsSummary()), details,
 	)
 
 	// The marker follows the model this user actually uses, not the
@@ -186,12 +223,131 @@ func (a *app) modelsScreen(conf *config.Config, tracker *user.UsageTracker, prov
 		Keyboard: ui.ModelList(
 			providerIndex,
 			providerName,
-			models,
+			refs,
 			current,
 			page*modelsPageSize,
 			modelsPageSize,
 			tracker.IsFavourite,
 		),
+	}
+}
+
+// userProvidersScreen lists the providers a user added themselves. Only that
+// user's records are ever loaded, keyed by their Telegram id.
+func (a *app) userProvidersScreen(userID int64, page int) screen {
+	if page < 0 {
+		page = 0
+	}
+
+	if a.userProviders == nil || !a.userProviders.Enabled() {
+		return screen{Text: userProvidersDisabledText, Keyboard: ui.UserProviderList(nil, page, providersPageSize)}
+	}
+
+	list, err := a.userProviders.List(a.ctx, userID)
+	if err != nil {
+		log.Printf("Could not load user providers for user %d: %v", userID, err)
+
+		return screen{
+			Text:     "⚠️ Could not load your providers right now.",
+			Keyboard: ui.UserProviderList(nil, page, providersPageSize),
+		}
+	}
+
+	if len(list) == 0 {
+		return screen{
+			Text: "🔐 <b>Your providers</b>\n\n" +
+				"You have not added one yet.\n\n" +
+				"➕ <b>Add provider</b> stores your own API key encrypted, then lets you pick a model from it.\n" +
+				"Your key is never shown, never logged and never visible to another user.",
+			Keyboard: ui.UserProviderList(nil, page, providersPageSize),
+		}
+	}
+
+	names := make([]string, 0, len(list))
+	lines := make([]string, 0, len(list))
+
+	for i, record := range list {
+		names = append(names, record.Name)
+
+		model := record.Model
+		if model == "" {
+			model = "no model chosen yet"
+		}
+
+		lines = append(lines, fmt.Sprintf(
+			"%d. <b>%s</b> · <code>%s</code>\n    🌐 %s",
+			i+1,
+			escapeHTML(record.Name),
+			escapeHTML(model),
+			escapeHTML(hostOf(record.BaseURL)),
+		))
+	}
+
+	text := "🔐 <b>Your providers</b>\n\n" +
+		strings.Join(lines, "\n") + "\n\n" +
+		"Tap a provider to browse its models.\n" +
+		"Remove one with /removeprovider &lt;name&gt;."
+
+	return screen{Text: text, Keyboard: ui.UserProviderList(names, page, providersPageSize)}
+}
+
+// userProviderModelsScreen lists the models of one of the user's own
+// providers, discovered with that user's key and cached under their record.
+func (a *app) userProviderModelsScreen(userID int64, tracker *user.UsageTracker, index, page int) screen {
+	list, err := a.userProviderList(userID)
+	if err != nil || index < 0 || index >= len(list) {
+		return a.userProvidersScreen(userID, page)
+	}
+
+	record := list[index]
+	modelIDs := a.userProviderModelIDs(record)
+	current := tracker.Preference().Model
+
+	if len(modelIDs) == 0 {
+		return screen{
+			Text: fmt.Sprintf(
+				"🤖 <b>%s</b>\n\nNo models yet.\nTap 🔄 Refresh models to list what your key can use.",
+				escapeHTML(record.Name),
+			),
+			Keyboard: ui.UserProviderModels(index, nil, current, 0, modelsPageSize),
+		}
+	}
+
+	if page < 0 {
+		page = 0
+	}
+
+	offset := page * modelsPageSize
+	end := offset + modelsPageSize
+	if end > len(modelIDs) {
+		end = len(modelIDs)
+	}
+
+	var lines []string
+	if offset < len(modelIDs) {
+		for i := offset; i < end; i++ {
+			marker := "•"
+			if strings.EqualFold(modelIDs[i], current) {
+				marker = "▶"
+			}
+
+			lines = append(lines, fmt.Sprintf("%s <code>%s</code>", marker, escapeHTML(modelIDs[i])))
+		}
+	}
+
+	text := fmt.Sprintf(
+		"🤖 <b>%s</b> · %d model(s)\n\n"+
+			"Current: <b>%s</b>\n\n%s\n\n"+
+			"Tap a model to pin it.",
+		escapeHTML(record.Name),
+		len(modelIDs),
+		escapeHTML(tracker.SettingsSummary()),
+		strings.Join(lines, "\n"),
+	)
+
+	return screen{
+		Text:     text,
+		Keyboard: ui.UserProviderModels(index, modelIDs, current, offset, modelsPageSize),
 	}
 }
 
