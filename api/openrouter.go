@@ -10,9 +10,11 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"openrouter-bot/config"
+	"openrouter-bot/provider"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/sashabaranov/go-openai"
@@ -20,6 +22,19 @@ import (
 
 // modelsTimeout bounds the /models lookup.
 const modelsTimeout = 20 * time.Second
+
+// modelsCacheTTL is how long the free models list is cached in memory.
+const modelsCacheTTL = 5 * time.Minute
+
+type cachedModelsEntry struct {
+	result    string
+	expiresAt time.Time
+}
+
+var (
+	modelsCacheMu sync.RWMutex
+	modelsCache   = make(map[string]cachedModelsEntry)
+)
 
 type Pricing struct {
 	Prompt     string `json:"prompt"`
@@ -41,12 +56,21 @@ type APIResponse struct {
 // -----------------------------------------------------------------------------
 
 // GetFreeModels returns a Markdown list of models that are free for both
-// prompt and completion tokens.
+// prompt and completion tokens. Results are cached with a TTL to avoid
+// redundant upstream API calls.
 func GetFreeModels(baseURL string, apiKey string) (string, error) {
 	base := strings.TrimRight(baseURL, "/")
 	if base == "" {
 		return "", errors.New("no provider base url configured")
 	}
+
+	now := time.Now()
+	modelsCacheMu.RLock()
+	if entry, ok := modelsCache[base]; ok && now.Before(entry.expiresAt) {
+		modelsCacheMu.RUnlock()
+		return entry.result, nil
+	}
+	modelsCacheMu.RUnlock()
 
 	req, err := http.NewRequest(http.MethodGet, base+"/models", nil)
 	if err != nil {
@@ -57,7 +81,7 @@ func GetFreeModels(baseURL string, apiKey string) (string, error) {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 
-	client := &http.Client{Timeout: modelsTimeout}
+	client := provider.SharedHTTPClient(modelsTimeout)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -90,7 +114,15 @@ func GetFreeModels(baseURL string, apiKey string) (string, error) {
 		return "", errors.New("no free models returned by the API")
 	}
 
-	return result.String(), nil
+	rendered := result.String()
+	modelsCacheMu.Lock()
+	modelsCache[base] = cachedModelsEntry{
+		result:    rendered,
+		expiresAt: time.Now().Add(modelsCacheTTL),
+	}
+	modelsCacheMu.Unlock()
+
+	return rendered, nil
 }
 
 // isFreeModel reports whether both prompt and completion are free. Checking

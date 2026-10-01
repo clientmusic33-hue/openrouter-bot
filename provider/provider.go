@@ -15,6 +15,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -55,6 +56,9 @@ type Config struct {
 	// skipped) but never used for a request.
 	RequiresKey bool `mapstructure:"requires_key"`
 
+	// TimeoutSeconds is an optional per-provider timeout override.
+	TimeoutSeconds int `mapstructure:"timeout_seconds"`
+
 	// APIKey is the resolved secret. It is never serialised.
 	APIKey string `mapstructure:"-"`
 }
@@ -92,6 +96,11 @@ func NewProvider(cfg Config) (*Provider, error) {
 
 	clientCfg := openai.DefaultConfig(cfg.APIKey)
 	clientCfg.BaseURL = strings.TrimRight(cfg.BaseURL, "/")
+	// Use a shared pooled HTTP transport so TCP/TLS connections are reused
+	// across completions and streams.
+	clientCfg.HTTPClient = &http.Client{
+		Transport: SharedTransport(),
+	}
 
 	return &Provider{
 		config: cfg,
@@ -136,6 +145,7 @@ func (p *Provider) HasModel(model string) bool {
 type Candidate struct {
 	Provider string
 	Model    string
+	Timeout  time.Duration
 
 	client *openai.Client
 }
@@ -158,6 +168,12 @@ func (c Candidate) Complete(
 	req openai.ChatCompletionRequest,
 ) (openai.ChatCompletionResponse, error) {
 	req.Model = c.Model
+
+	if c.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.Timeout)
+		defer cancel()
+	}
 
 	return c.client.CreateChatCompletion(ctx, req)
 }
@@ -196,10 +212,12 @@ func (p Preference) Describe() string {
 type health struct {
 	failures      int
 	successes     int
+	timeouts      int
 	cooldowns     int
 	lastErr       string
 	lastFailure   time.Time
 	cooldownUntil time.Time
+	latency       LatencyStats
 }
 
 // -----------------------------------------------------------------------------
@@ -209,9 +227,10 @@ type health struct {
 // Chain is the ordered set of providers plus the bot wide default model.
 // All exported methods are safe for concurrent use.
 type Chain struct {
-	mu        sync.RWMutex
-	providers []*Provider
-	health    map[string]*health
+	mu           sync.RWMutex
+	providers    []*Provider
+	health       map[string]*health
+	modelLatency map[string]*LatencyStats
 
 	active int    // index of the preferred provider (admin default)
 	model  string // admin default model, may belong to any provider
@@ -226,7 +245,8 @@ func NewChain(cfgs []Config) (*Chain, error) {
 	}
 
 	chain := &Chain{
-		health: make(map[string]*health),
+		health:       make(map[string]*health),
+		modelLatency: make(map[string]*LatencyStats),
 	}
 
 	for _, cfg := range cfgs {
@@ -461,6 +481,11 @@ func (c *Chain) CandidatesFor(pref Preference, profile *UsageProfile) []Candidat
 			continue
 		}
 
+		var timeout time.Duration
+		if p.config.TimeoutSeconds > 0 {
+			timeout = time.Duration(p.config.TimeoutSeconds) * time.Second
+		}
+
 		group := make([]Candidate, 0, len(p.Models()))
 		for _, model := range p.Models() {
 			if strings.TrimSpace(model) == "" {
@@ -469,6 +494,7 @@ func (c *Chain) CandidatesFor(pref Preference, profile *UsageProfile) []Candidat
 			group = append(group, Candidate{
 				Provider: p.Name(),
 				Model:    model,
+				Timeout:  timeout,
 				client:   p.Client(),
 			})
 		}
@@ -612,6 +638,16 @@ func (c *Chain) inCooldown(name string, now time.Time) bool {
 // failures the provider drops to the back of the chain, and each further
 // outage widens the window (60s, 2m, 4m … up to 10m).
 func (c *Chain) RecordFailure(name string, err error) {
+	if err == nil {
+		return
+	}
+
+	class := ClassifyError(err)
+	// A user pressing Stop cancels the context; that is not an upstream outage.
+	if class == ErrClassCanceled {
+		return
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -621,8 +657,17 @@ func (c *Chain) RecordFailure(name string, err error) {
 	}
 
 	h.failures++
+	if class == ErrClassTimeout {
+		h.timeouts++
+	}
 	h.lastErr = err.Error()
 	h.lastFailure = time.Now()
+
+	// Auth errors (401/403) cannot succeed on immediate retry, so open the
+	// circuit breaker right away instead of burning 3 consecutive requests.
+	if class == ErrClassAuth && h.failures < cooldownAfter {
+		h.failures = cooldownAfter
+	}
 
 	if h.failures >= cooldownAfter {
 		h.cooldowns++
@@ -640,19 +685,55 @@ func (c *Chain) RecordFailure(name string, err error) {
 
 // RecordSuccess notes that a provider answered, clearing its failure streak.
 func (c *Chain) RecordSuccess(name string) {
+	c.RecordSuccessLatency(name, "", 0)
+}
+
+// RecordSuccessLatency notes that a provider/model answered and records its
+// response latency for adaptive routing.
+func (c *Chain) RecordSuccessLatency(name, model string, latency time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	h := c.health[name]
-	if h == nil {
-		return
+	if h != nil {
+		h.successes++
+		h.failures = 0
+		h.cooldowns = 0
+		h.lastErr = ""
+		h.cooldownUntil = time.Time{}
+		if latency > 0 {
+			h.latency.Record(latency)
+		}
 	}
 
-	h.successes++
-	h.failures = 0
-	h.cooldowns = 0
-	h.lastErr = ""
-	h.cooldownUntil = time.Time{}
+	if latency > 0 && strings.TrimSpace(model) != "" {
+		if c.modelLatency == nil {
+			c.modelLatency = make(map[string]*LatencyStats)
+		}
+		key := strings.ToLower(strings.TrimSpace(model))
+		stats := c.modelLatency[key]
+		if stats == nil {
+			stats = &LatencyStats{}
+			c.modelLatency[key] = stats
+		}
+		stats.Record(latency)
+	}
+}
+
+// ModelLatency returns the observed EWMA latency for a model, if any.
+func (c *Chain) ModelLatency(model string) (time.Duration, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.modelLatency == nil {
+		return 0, false
+	}
+	stats := c.modelLatency[strings.ToLower(strings.TrimSpace(model))]
+	if stats == nil || stats.Samples == 0 {
+		return 0, false
+	}
+
+	return stats.Avg, true
 }
 
 // Info is the per-provider status shown by /providers.
@@ -664,9 +745,13 @@ type Info struct {
 	Current     bool // currently selected model belongs to this provider
 	Failures    int
 	Successes   int
+	Timeouts    int
 	Cooldowns   int
 	LastErr     string
 	Cooldown    time.Duration
+	AvgLatency  time.Duration
+	LastLatency time.Duration
+	Circuit     CircuitState
 	Configured  bool
 	RequiresKey bool
 	Local       bool
@@ -695,15 +780,22 @@ func (c *Chain) Status() []Info {
 			Configured:  p.Configured(),
 			RequiresKey: p.RequiresKey(),
 			Local:       p.Keyless(),
+			Circuit:     CircuitClosed,
 		}
 
 		if h := c.health[p.Name()]; h != nil {
 			info.Failures = h.failures
 			info.Successes = h.successes
+			info.Timeouts = h.timeouts
 			info.Cooldowns = h.cooldowns
 			info.LastErr = h.lastErr
+			info.AvgLatency = h.latency.Avg.Round(time.Millisecond)
+			info.LastLatency = h.latency.Last.Round(time.Millisecond)
 			if now.Before(h.cooldownUntil) {
 				info.Cooldown = h.cooldownUntil.Sub(now).Round(time.Second)
+				info.Circuit = CircuitOpen
+			} else if h.failures > 0 {
+				info.Circuit = CircuitHalfOpen
 			}
 		}
 

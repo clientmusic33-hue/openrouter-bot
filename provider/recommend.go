@@ -14,7 +14,10 @@ type ModelInfo struct {
 	Context   int     // context window in tokens
 	Vision    bool    // accepts images
 	Reasoning bool    // chain-of-thought style model, slower but stronger
+	Coding    bool    // strong at software engineering / code tasks
+	Fast      bool    // optimised for low-latency responses
 	SizeB     float64 // parameter count in billions, 0 when unknown
+	CostTier  int     // 0 = free/local, 1 = low cost, 2 = standard
 	Known     bool    // true when this came from the catalogue, not a guess
 }
 
@@ -30,59 +33,64 @@ const charsPerToken = 3.5
 // catalogue maps a lower-cased model id to its capabilities.
 var catalogue = map[string]ModelInfo{
 	// Groq
-	"llama-3.3-70b-versatile":                   {Context: 131072, SizeB: 70},
-	"llama-3.1-8b-instant":                      {Context: 131072, SizeB: 8},
-	"llama-3.1-70b-versatile":                   {Context: 131072, SizeB: 70},
-	"openai/gpt-oss-120b":                       {Context: 131072, SizeB: 117, Reasoning: true},
-	"openai/gpt-oss-20b":                        {Context: 131072, SizeB: 21, Reasoning: true},
-	"moonshotai/kimi-k2-instruct":               {Context: 131072, SizeB: 1000, Reasoning: true},
-	"qwen/qwen3-32b":                            {Context: 131072, SizeB: 32, Reasoning: true},
-	"meta-llama/llama-4-scout-17b-16e-instruct": {Context: 131072, SizeB: 17, Vision: true},
+	"llama-3.3-70b-versatile":                   {Context: 131072, SizeB: 70, Coding: true, Fast: true},
+	"llama-3.1-8b-instant":                      {Context: 131072, SizeB: 8, Fast: true},
+	"llama-3.1-70b-versatile":                   {Context: 131072, SizeB: 70, Coding: true},
+	"openai/gpt-oss-120b":                       {Context: 131072, SizeB: 117, Reasoning: true, Coding: true},
+	"openai/gpt-oss-20b":                        {Context: 131072, SizeB: 21, Reasoning: true, Fast: true},
+	"moonshotai/kimi-k2-instruct":               {Context: 131072, SizeB: 1000, Reasoning: true, Coding: true},
+	"qwen/qwen3-32b":                            {Context: 131072, SizeB: 32, Reasoning: true, Coding: true},
+	"meta-llama/llama-4-scout-17b-16e-instruct": {Context: 131072, SizeB: 17, Vision: true, Fast: true},
 
 	// Google
-	"gemini-2.5-flash":      {Context: 1_048_576, Vision: true},
-	"gemini-2.5-flash-lite": {Context: 1_048_576, Vision: true},
-	"gemini-2.5-pro":        {Context: 1_048_576, Vision: true, Reasoning: true},
-	"gemini-2.0-flash":      {Context: 1_048_576, Vision: true},
+	"gemini-2.5-flash":      {Context: 1_048_576, Vision: true, Fast: true, Coding: true},
+	"gemini-2.5-flash-lite": {Context: 1_048_576, Vision: true, Fast: true},
+	"gemini-2.5-pro":        {Context: 1_048_576, Vision: true, Reasoning: true, Coding: true},
+	"gemini-2.0-flash":      {Context: 1_048_576, Vision: true, Fast: true},
 
 	// OpenRouter
-	"deepseek/deepseek-r1:free":                     {Context: 131072, Reasoning: true, SizeB: 671},
-	"deepseek/deepseek-r1":                          {Context: 131072, Reasoning: true, SizeB: 671},
-	"deepseek/deepseek-chat-v3-0324:free":           {Context: 131072, SizeB: 671},
-	"deepseek/deepseek-chat":                        {Context: 131072, SizeB: 671},
+	"deepseek/deepseek-r1:free":                     {Context: 131072, Reasoning: true, Coding: true, SizeB: 671},
+	"deepseek/deepseek-r1":                          {Context: 131072, Reasoning: true, Coding: true, SizeB: 671, CostTier: 1},
+	"deepseek/deepseek-chat-v3-0324:free":           {Context: 131072, Coding: true, SizeB: 671},
+	"deepseek/deepseek-chat":                        {Context: 131072, Coding: true, SizeB: 671, CostTier: 1},
 	"openrouter/free":                               {Context: 200000},
-	"openrouter/auto":                               {Context: 200000},
+	"openrouter/auto":                               {Context: 200000, CostTier: 1},
 	"google/gemma-3-27b-it:free":                    {Context: 131072, Vision: true, SizeB: 27},
-	"qwen/qwen3-coder:free":                         {Context: 262144, SizeB: 480},
-	"meta-llama/llama-3.3-70b-instruct:free":        {Context: 131072, SizeB: 70},
+	"qwen/qwen3-coder:free":                         {Context: 262144, Coding: true, SizeB: 480},
+	"meta-llama/llama-3.3-70b-instruct:free":        {Context: 131072, Coding: true, SizeB: 70},
 	"mistralai/mistral-small-3.2-24b-instruct:free": {Context: 131072, SizeB: 24, Vision: true},
 
 	// NVIDIA NIM
-	"meta/llama-3.3-70b-instruct":            {Context: 131072, SizeB: 70},
-	"nvidia/llama-3.3-nemotron-super-49b-v1": {Context: 131072, SizeB: 49, Reasoning: true},
-	"qwen/qwen3-235b-a22b":                   {Context: 32768, SizeB: 235},
+	"nvidia/nemotron-3.5-lightning-30b-a3b":  {Context: 131072, SizeB: 30, Fast: true},
+	"meta/llama-3.3-70b-instruct":            {Context: 131072, SizeB: 70, Coding: true},
+	"deepseek-ai/deepseek-v4-pro":            {Context: 131072, SizeB: 671, Reasoning: true, Coding: true},
+	"google/gemma-4-31b-it":                  {Context: 131072, SizeB: 31, Vision: true},
+	"moonshotai/kimi-k3":                     {Context: 131072, SizeB: 1000, Reasoning: true, Coding: true},
+	"nvidia/llama-3.3-nemotron-super-49b-v1": {Context: 131072, SizeB: 49, Reasoning: true, Coding: true},
+	"qwen/qwen3-235b-a22b":                   {Context: 32768, SizeB: 235, Reasoning: true, Coding: true},
 
 	// Cerebras
-	"llama-3.3-70b": {Context: 65536, SizeB: 70},
-	"gpt-oss-120b":  {Context: 65536, SizeB: 117, Reasoning: true},
+	"llama-3.3-70b": {Context: 65536, SizeB: 70, Coding: true, Fast: true},
+	"gpt-oss-120b":  {Context: 65536, SizeB: 117, Reasoning: true, Coding: true, Fast: true},
 
 	// Mistral
-	"mistral-small-latest": {Context: 131072, SizeB: 24, Vision: true},
-	"open-mistral-nemo":    {Context: 131072, SizeB: 12},
-	"mistral-large-latest": {Context: 131072, SizeB: 123},
+	"mistral-small-latest": {Context: 131072, SizeB: 24, Vision: true, Fast: true},
+	"open-mistral-nemo":    {Context: 131072, SizeB: 12, Fast: true},
+	"mistral-large-latest": {Context: 131072, SizeB: 123, Coding: true, CostTier: 1},
 
 	// Together
-	"meta-llama/llama-3.3-70b-instruct-turbo":           {Context: 131072, SizeB: 70},
-	"meta-llama/llama-4-maverick-17b-128e-instruct-fp8": {Context: 131072, SizeB: 17, Vision: true},
+	"meta-llama/llama-3.3-70b-instruct-turbo":           {Context: 131072, SizeB: 70, Coding: true, Fast: true},
+	"meta-llama/llama-4-maverick-17b-128e-instruct-fp8": {Context: 131072, SizeB: 17, Vision: true, Fast: true},
 
 	// DeepSeek direct
-	"deepseek-reasoner": {Context: 65536, Reasoning: true, SizeB: 671},
+	"deepseek-chat":     {Context: 65536, Coding: true, SizeB: 671, CostTier: 1},
+	"deepseek-reasoner": {Context: 65536, Reasoning: true, Coding: true, SizeB: 671, CostTier: 1},
 
 	// Ollama / local
-	"llama3.2:3b":         {Context: 131072, SizeB: 3},
-	"llama3.2:1b":         {Context: 131072, SizeB: 1},
+	"llama3.2:3b":         {Context: 131072, SizeB: 3, Fast: true},
+	"llama3.2:1b":         {Context: 131072, SizeB: 1, Fast: true},
 	"llama3.2-vision:11b": {Context: 131072, Vision: true, SizeB: 11},
-	"qwen2.5:7b":          {Context: 32768, SizeB: 7},
+	"qwen2.5:7b":          {Context: 32768, SizeB: 7, Coding: true},
 	"local-model":         {Context: 32768},
 }
 
@@ -102,6 +110,10 @@ type UsageProfile struct {
 	NeedsReasoning bool
 	// PrefersFast is set for heavy users, who care about latency.
 	PrefersFast bool
+	// NeedsCoding is set when the request is a coding/software task.
+	NeedsCoding bool
+	// Task names the detected task category (e.g. CODING, REASONING, FAST).
+	Task string
 }
 
 // Recommendation is the model the bot thinks suits the user right now.
@@ -208,6 +220,22 @@ func scoreCandidate(
 		reasons = append(reasons, "reasoning model suits long prompts")
 	}
 
+	// Coding models excel on programming and debugging prompts.
+	if profile.NeedsCoding && info.Coding {
+		score += 18
+		reasons = append(reasons, "strong at coding tasks")
+	}
+
+	// Observed low latency bonus when measurements exist.
+	if state.avgLatency > 0 {
+		switch {
+		case state.avgLatency < 800*time.Millisecond:
+			score += 8
+		case state.avgLatency > 8*time.Second:
+			score -= 10
+		}
+	}
+
 	// Local backends are free and unmetered: a good default for a public bot.
 	if state.local {
 		score += scoreLocalBonus
@@ -239,9 +267,10 @@ func scoreCandidate(
 
 // providerState is the chain level context a score depends on.
 type providerState struct {
-	cooldown bool
-	active   bool
-	local    bool
+	cooldown   bool
+	active     bool
+	local      bool
+	avgLatency time.Duration
 }
 
 // rank sorts candidates best first for a profile. It is stable, so models of
@@ -264,10 +293,15 @@ func rank(
 			active = chain.providers[chain.active].Name()
 		}
 		for _, p := range chain.providers {
+			var avgLat time.Duration
+			if h := chain.health[p.Name()]; h != nil {
+				avgLat = h.latency.Avg
+			}
 			states[p.Name()] = providerState{
-				cooldown: chain.inCooldown(p.Name(), now),
-				active:   strings.EqualFold(p.Name(), active),
-				local:    p.Keyless(),
+				cooldown:   chain.inCooldown(p.Name(), now),
+				active:     strings.EqualFold(p.Name(), active),
+				local:      p.Keyless(),
+				avgLatency: avgLat,
 			}
 		}
 		chain.mu.RUnlock()

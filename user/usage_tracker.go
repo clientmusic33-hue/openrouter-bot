@@ -520,7 +520,7 @@ func (ut *UsageTracker) GetUsageFromApi(id, baseURL, apiKey string) error {
 // fetchGenerationCost performs the request, retrying once because OpenRouter
 // needs a moment to finalise the statistics for a generation.
 func fetchGenerationCost(endpoint, apiKey string) (float64, error) {
-	client := &http.Client{Timeout: 20 * time.Second}
+	client := provider.SharedHTTPClient(20 * time.Second)
 
 	var lastErr error
 

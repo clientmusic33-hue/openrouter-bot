@@ -222,13 +222,13 @@ func (ut *UsageTracker) LastUserMessage() (string, bool) {
 // answer does not stack on top of the one it replaces. It returns the role of
 // the message it removed.
 func (ut *UsageTracker) DropLastAssistant() bool {
-	return ut.History.dropLast("assistant")
+	return ut.getHistory().dropLast("assistant")
 }
 
 // DropLastUser removes the final user message. Regenerating replays the prompt
 // itself, so the copy kept in history would otherwise be duplicated.
 func (ut *UsageTracker) DropLastUser() bool {
-	return ut.History.dropLast("user")
+	return ut.getHistory().dropLast("user")
 }
 
 // LastModel returns the model that produced the newest answer, if any.

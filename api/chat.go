@@ -12,6 +12,7 @@ import (
 	"openrouter-bot/config"
 	"openrouter-bot/lang"
 	"openrouter-bot/provider"
+	"openrouter-bot/router"
 	"openrouter-bot/ui"
 	"openrouter-bot/user"
 
@@ -39,6 +40,11 @@ type Options struct {
 	MaxChars int
 	// Buttons attaches the stop / regenerate / feedback keyboard.
 	Buttons bool
+	// TaskOverride forces a specific router task category (e.g. FAST, CODING).
+	TaskOverride router.TaskType
+	// SystemSupplement appends extra context (persona, memory, summary) to the
+	// system prompt for this request without mutating the stored prompt.
+	SystemSupplement string
 }
 
 // Prompt is one generation request. It is either derived from an incoming
@@ -65,6 +71,8 @@ type Result struct {
 	Failovers int
 	// Stopped is true when the user pressed stop.
 	Stopped bool
+	// Latency is the total generation duration.
+	Latency time.Duration
 	// Messages are the Telegram message ids that carry the answer. The first
 	// one holds the action keyboard.
 	Messages []int
@@ -118,7 +126,24 @@ func Generate(
 	tracker.ChatMu.Lock()
 	defer tracker.ChatMu.Unlock()
 
-	candidates := chain.CandidatesFor(opts.Preference, opts.Profile)
+	hasImages := cfg.Vision && prompt.Message != nil && len(prompt.Message.Photo) > 0
+	var profileVal provider.UsageProfile
+	if opts.Profile != nil {
+		profileVal = *opts.Profile
+	}
+
+	var candidates []provider.Candidate
+	if opts.Preference.Auto || opts.TaskOverride != "" || hasImages {
+		candidates, _ = router.Route(chain, router.RouteRequest{
+			Prompt:       prompt.Text,
+			HasImages:    hasImages,
+			TaskOverride: opts.TaskOverride,
+			Preference:   opts.Preference,
+			Profile:      profileVal,
+		})
+	} else {
+		candidates = chain.CandidatesFor(opts.Preference, opts.Profile)
+	}
 	if len(candidates) == 0 {
 		return Result{}, errors.New("no usable models in the provider chain")
 	}
@@ -170,10 +195,15 @@ func Generate(
 
 	currentMessage, userText := buildUserMessage(bot, prompt, cfg)
 
+	sysContent := tracker.GetSystemPrompt()
+	if extra := strings.TrimSpace(opts.SystemSupplement); extra != "" {
+		sysContent = strings.TrimSpace(sysContent + "\n\n" + extra)
+	}
+
 	messages := []openai.ChatCompletionMessage{
 		{
 			Role:    openai.ChatMessageRoleSystem,
-			Content: tracker.GetSystemPrompt(),
+			Content: sysContent,
 		},
 	}
 	for _, historyMessage := range tracker.GetMessages() {
@@ -220,6 +250,7 @@ func Generate(
 
 	idx := 0
 	failovers := 0
+	requestStart := time.Now()
 
 	var stream *openai.ChatCompletionStream
 	var current provider.Candidate
@@ -227,6 +258,7 @@ func Generate(
 
 	for ; idx < len(candidates); idx++ {
 		candidate := candidates[idx]
+		attemptStart := time.Now()
 
 		stream, streamErr = candidate.Stream(ctx, req)
 		if streamErr == nil {
@@ -234,7 +266,7 @@ func Generate(
 				failovers = idx
 			}
 			current = candidate
-			chain.RecordSuccess(candidate.Provider)
+			chain.RecordSuccessLatency(candidate.Provider, candidate.Model, time.Since(attemptStart))
 			break
 		}
 
@@ -302,6 +334,7 @@ func Generate(
 			Text:       messageText,
 			Failovers:  failovers,
 			Stopped:    stopped,
+			Latency:    time.Since(requestStart),
 			Messages:   sink.Messages(),
 		}
 
@@ -364,7 +397,7 @@ func Generate(
 				current.Provider, current.Model, responseID,
 			)
 
-			chain.RecordSuccess(current.Provider)
+			chain.RecordSuccessLatency(current.Provider, current.Model, time.Since(requestStart))
 
 			tracker.AddMessage(openai.ChatMessageRoleUser, userText)
 			tracker.AddMessage(openai.ChatMessageRoleAssistant, messageText)
@@ -506,4 +539,140 @@ func footer(candidate provider.Candidate, failovers int) string {
 	}
 
 	return line
+}
+
+// GenerateRace executes a concurrent model race across 2-3 suitable candidates
+// and renders the winning (or synthesised) answer into ChatID.
+func GenerateRace(
+	parentCtx context.Context,
+	bot *tgbotapi.BotAPI,
+	chain *provider.Chain,
+	prompt Prompt,
+	cfg *config.Config,
+	tracker *user.UsageTracker,
+	opts Options,
+	synthesize bool,
+) (Result, error) {
+	if cfg == nil {
+		return Result{}, errors.New("no configuration provided")
+	}
+	if chain == nil {
+		return Result{}, errors.New("no provider chain configured")
+	}
+
+	tracker.ChatMu.Lock()
+	defer tracker.ChatMu.Unlock()
+
+	var profileVal provider.UsageProfile
+	if opts.Profile != nil {
+		profileVal = *opts.Profile
+	}
+
+	taskOverride := router.TaskFast
+	if synthesize {
+		taskOverride = router.TaskReasoning
+	}
+
+	candidates, _ := router.Route(chain, router.RouteRequest{
+		Prompt:       prompt.Text,
+		TaskOverride: taskOverride,
+		Preference:   provider.Preference{Auto: true},
+		Profile:      profileVal,
+	})
+	if len(candidates) == 0 {
+		return Result{}, errors.New("no usable models in the provider chain")
+	}
+
+	placeholder := tgbotapi.NewMessage(prompt.ChatID, "🏎 Racing models...")
+	if opts.Buttons {
+		placeholder.ReplyMarkup = ui.StopButton()
+	}
+
+	sentMsg, err := bot.Send(placeholder)
+	if err != nil {
+		return Result{}, fmt.Errorf("failed to send race placeholder: %w", err)
+	}
+
+	stopTyping := typingLoop(bot, prompt.ChatID)
+	defer stopTyping()
+
+	tracker.CheckHistory(cfg.MaxHistorySize, cfg.MaxHistoryTime)
+	tracker.Touch()
+
+	currentMessage, userText := buildUserMessage(bot, prompt, cfg)
+
+	sysContent := tracker.GetSystemPrompt()
+	if extra := strings.TrimSpace(opts.SystemSupplement); extra != "" {
+		sysContent = strings.TrimSpace(sysContent + "\n\n" + extra)
+	}
+
+	messages := []openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleSystem, Content: sysContent},
+	}
+	for _, historyMessage := range tracker.GetMessages() {
+		if strings.TrimSpace(historyMessage.Content) == "" {
+			continue
+		}
+		messages = append(messages, openai.ChatCompletionMessage{
+			Role:    historyMessage.Role,
+			Content: historyMessage.Content,
+		})
+	}
+	messages = append(messages, currentMessage)
+
+	req := openai.ChatCompletionRequest{
+		FrequencyPenalty: float32(cfg.Model.FrequencyPenalty),
+		PresencePenalty:  float32(cfg.Model.PresencePenalty),
+		Temperature:      float32(cfg.Model.Temperature),
+		TopP:             float32(cfg.Model.TopP),
+		MaxTokens:        cfg.MaxTokens,
+		Messages:         messages,
+	}
+
+	ctx, cancel := context.WithTimeout(parentCtx, cfg.RequestTimeout)
+	defer cancel()
+	tracker.SetStream(nil, cancel)
+	defer tracker.ClearStream()
+
+	raceRes, err := router.Race(ctx, chain, candidates, req, router.RaceOptions{
+		MaxModels:  router.DefaultRaceConcurrency,
+		Timeout:    cfg.RequestTimeout,
+		Synthesize: synthesize,
+	})
+	if err != nil {
+		errorMessage := lang.Translate("errorText", cfg.Lang)
+		if errorMessage == "" {
+			errorMessage = "❌ Could not answer right now, please try again."
+		}
+		editMsg := tgbotapi.NewEditMessageText(prompt.ChatID, sentMsg.MessageID, errorMessage)
+		_, _ = bot.Send(editMsg)
+		return Result{}, err
+	}
+
+	tracker.AddMessage(openai.ChatMessageRoleUser, userText)
+	tracker.AddMessage(openai.ChatMessageRoleAssistant, raceRes.Text)
+	tracker.SetLastModel(raceRes.Model)
+
+	text := strings.TrimRight(raceRes.Text, " \t\n")
+	if opts.ShowFooter {
+		modeTag := "🏎 race winner"
+		if raceRes.Synthesized {
+			modeTag = "⚖️ race synthesis"
+		}
+		text += fmt.Sprintf("\n\n⚡ %s · %s (%s, %s)", raceRes.Provider, raceRes.Model, modeTag, raceRes.Latency.Round(time.Millisecond))
+	}
+
+	sink := newMessageSink(bot, prompt.ChatID, sentMsg.MessageID, opts.MaxChars)
+	sink.Finish(text, opts.Markdown)
+	if opts.Buttons {
+		sink.SetKeyboard(ui.AnswerActions())
+	}
+
+	return Result{
+		Provider: raceRes.Provider,
+		Model:    raceRes.Model,
+		Text:     raceRes.Text,
+		Latency:  raceRes.Latency,
+		Messages: sink.Messages(),
+	}, nil
 }
