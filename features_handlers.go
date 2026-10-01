@@ -117,6 +117,12 @@ func (a *app) handleFast(message *tgbotapi.Message, conf *config.Config, tracker
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Recovered from panic in handleFast: %v", r)
+				a.send(message.Chat.ID, "❌ Fast mode request failed. Please try again.", "")
+			}
+		}()
 		select {
 		case a.semaphore <- struct{}{}:
 			defer func() { <-a.semaphore }()
@@ -144,6 +150,10 @@ func (a *app) handleFast(message *tgbotapi.Message, conf *config.Config, tracker
 			Message: message,
 		}, conf, tracker, opts)
 		done(res.Model, memory.EstimateTokens(promptText+res.Text), err)
+		if err != nil && len(res.Messages) == 0 {
+			a.send(message.Chat.ID, "❌ Fast mode request failed. Please try again.", "")
+			return
+		}
 		if len(res.Messages) > 0 && res.Text != "" && !res.Stopped {
 			a.rememberAnswer(message.Chat.ID, res.Messages[0], senderID(message), promptText, res.Model)
 		}
@@ -177,6 +187,12 @@ func (a *app) handleRace(message *tgbotapi.Message, conf *config.Config, tracker
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Recovered from panic in handleRace: %v", r)
+				a.send(message.Chat.ID, "❌ Race request failed. Please try again.", "")
+			}
+		}()
 		select {
 		case a.semaphore <- struct{}{}:
 			defer func() { <-a.semaphore }()
@@ -203,6 +219,10 @@ func (a *app) handleRace(message *tgbotapi.Message, conf *config.Config, tracker
 			Message: message,
 		}, conf, tracker, opts, synthesize)
 		done(res.Model, memory.EstimateTokens(args+res.Text), err)
+		if err != nil && len(res.Messages) == 0 {
+			a.send(message.Chat.ID, "❌ Race request failed. Please try again.", "")
+			return
+		}
 		if len(res.Messages) > 0 && res.Text != "" {
 			a.rememberAnswer(message.Chat.ID, res.Messages[0], senderID(message), args, res.Model)
 		}
@@ -233,6 +253,12 @@ func (a *app) handleAgentCommand(message *tgbotapi.Message, conf *config.Config,
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Recovered from panic in handleAgentCommand: %v", r)
+				a.send(message.Chat.ID, "❌ Agent task failed. Please try again.", "")
+			}
+		}()
 		select {
 		case a.semaphore <- struct{}{}:
 			defer func() { <-a.semaphore }()
@@ -247,6 +273,7 @@ func (a *app) handleAgentCommand(message *tgbotapi.Message, conf *config.Config,
 
 		placeholder, err := a.bot.Send(tgbotapi.NewMessage(message.Chat.ID, "🤖 Agent planning and executing tools..."))
 		if err != nil {
+			a.send(message.Chat.ID, "❌ Could not start agent task. Please try again.", "")
 			return
 		}
 
@@ -265,7 +292,9 @@ func (a *app) handleAgentCommand(message *tgbotapi.Message, conf *config.Config,
 		if runErr != nil {
 			done("", 0, runErr)
 			edit := tgbotapi.NewEditMessageText(message.Chat.ID, placeholder.MessageID, "❌ Agent task failed: "+runErr.Error())
-			_, _ = a.bot.Send(edit)
+			if _, sendErr := a.bot.Send(edit); sendErr != nil {
+				a.send(message.Chat.ID, "❌ Agent task failed: "+runErr.Error(), "")
+			}
 			return
 		}
 
@@ -309,6 +338,12 @@ func (a *app) handleResearchCommand(message *tgbotapi.Message, conf *config.Conf
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Recovered from panic in handleResearchCommand: %v", r)
+				a.send(message.Chat.ID, "❌ Research failed. Please try again.", "")
+			}
+		}()
 		select {
 		case a.semaphore <- struct{}{}:
 			defer func() { <-a.semaphore }()
@@ -323,6 +358,7 @@ func (a *app) handleResearchCommand(message *tgbotapi.Message, conf *config.Conf
 
 		placeholder, err := a.bot.Send(tgbotapi.NewMessage(message.Chat.ID, "🔎 Researching sources..."))
 		if err != nil {
+			a.send(message.Chat.ID, "❌ Could not start research. Please try again.", "")
 			return
 		}
 
@@ -334,7 +370,9 @@ func (a *app) handleResearchCommand(message *tgbotapi.Message, conf *config.Conf
 		if err != nil {
 			done("", 0, err)
 			edit := tgbotapi.NewEditMessageText(message.Chat.ID, placeholder.MessageID, "❌ Research failed. Please try again.")
-			_, _ = a.bot.Send(edit)
+			if _, sendErr := a.bot.Send(edit); sendErr != nil {
+				a.send(message.Chat.ID, "❌ Research failed. Please try again.", "")
+			}
 			return
 		}
 
@@ -509,6 +547,12 @@ func (a *app) runSummaryCompletion(chatID int64, transcript string, conf *config
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Recovered from panic in runSummaryCompletion: %v", r)
+				a.send(chatID, "❌ Could not generate summary right now.", "")
+			}
+		}()
 		select {
 		case a.semaphore <- struct{}{}:
 			defer func() { <-a.semaphore }()
@@ -823,6 +867,12 @@ func (a *app) handleCodeCommand(message *tgbotapi.Message, conf *config.Config, 
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Recovered from panic in handleCodeCommand: %v", r)
+				a.send(message.Chat.ID, "❌ Coding request failed. Please try again.", "")
+			}
+		}()
 		select {
 		case a.semaphore <- struct{}{}:
 			defer func() { <-a.semaphore }()
@@ -850,6 +900,10 @@ func (a *app) handleCodeCommand(message *tgbotapi.Message, conf *config.Config, 
 			Message: message,
 		}, conf, tracker, opts)
 		done(res.Model, memory.EstimateTokens(fullPrompt+res.Text), err)
+		if err != nil && len(res.Messages) == 0 {
+			a.send(message.Chat.ID, "❌ Coding request failed. Please try again.", "")
+			return
+		}
 		if len(res.Messages) > 0 && res.Text != "" && !res.Stopped {
 			a.rememberAnswer(message.Chat.ID, res.Messages[0], senderID(message), fullPrompt, res.Model)
 		}
@@ -890,6 +944,12 @@ func (a *app) handleDocument(message *tgbotapi.Message, conf *config.Config, tra
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Recovered from panic in handleDocument: %v", r)
+				a.send(chatID, "❌ File analysis failed. Please try again.", "")
+			}
+		}()
 		select {
 		case a.semaphore <- struct{}{}:
 			defer func() { <-a.semaphore }()
@@ -943,6 +1003,10 @@ func (a *app) handleDocument(message *tgbotapi.Message, conf *config.Config, tra
 			Text:   promptText,
 		}, conf, tracker, opts)
 		done(res.Model, memory.EstimateTokens(promptText+res.Text), err)
+		if err != nil && len(res.Messages) == 0 {
+			a.send(chatID, "❌ File analysis failed. Please try again.", "")
+			return
+		}
 		if len(res.Messages) > 0 && res.Text != "" && !res.Stopped {
 			a.rememberAnswer(chatID, res.Messages[0], senderID(message), promptText, res.Model)
 		}
@@ -989,6 +1053,12 @@ func (a *app) handleVoice(message *tgbotapi.Message, conf *config.Config, tracke
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Recovered from panic in handleVoice: %v", r)
+				a.send(chatID, "❌ Voice processing failed. Please try again.", "")
+			}
+		}()
 		select {
 		case a.semaphore <- struct{}{}:
 			defer func() { <-a.semaphore }()
@@ -1010,6 +1080,7 @@ func (a *app) handleVoice(message *tgbotapi.Message, conf *config.Config, tracke
 		client := provider.SharedHTTPClient(30 * time.Second)
 		req, err := http.NewRequestWithContext(a.ctx, http.MethodGet, tgFile.Link(a.bot.Token), nil)
 		if err != nil {
+			a.send(chatID, "❌ Could not download voice message.", "")
 			return
 		}
 		resp, err := client.Do(req)
@@ -1046,6 +1117,10 @@ func (a *app) handleVoice(message *tgbotapi.Message, conf *config.Config, tracke
 			Text:   transcript,
 		}, conf, tracker, opts)
 		done(res.Model, memory.EstimateTokens(transcript+res.Text), err)
+		if err != nil && len(res.Messages) == 0 {
+			a.send(chatID, "❌ Could not answer voice message. Please try again.", "")
+			return
+		}
 		if len(res.Messages) > 0 && res.Text != "" && !res.Stopped {
 			a.rememberAnswer(chatID, res.Messages[0], senderID(message), transcript, res.Model)
 		}

@@ -94,14 +94,6 @@ func main() {
 	bot.Debug = false
 	log.Printf("Authorized as @%s", bot.Self.UserName)
 
-	if _, err := bot.Request(tgbotapi.DeleteWebhookConfig{}); err != nil {
-		log.Printf("Warning: failed to delete webhook: %v", err)
-	}
-
-	u := tgbotapi.NewUpdate(0)
-	u.Timeout = 60
-	updates := bot.GetUpdatesChan(u)
-
 	// ---------------------------------------------------------------------
 	// PROVIDER CHAIN
 	// ---------------------------------------------------------------------
@@ -168,7 +160,7 @@ func main() {
 	app.setCommands(manager.GetConfig())
 
 	// ---------------------------------------------------------------------
-	// HEALTH SERVER
+	// HEALTH SERVER & KEEP-ALIVE
 	// ---------------------------------------------------------------------
 
 	server := app.startHealthServer()
@@ -178,6 +170,8 @@ func main() {
 		_ = server.Shutdown(shutdownCtx)
 	}()
 
+	app.startKeepAlive()
+
 	// ---------------------------------------------------------------------
 	// UPDATE LOOP
 	// ---------------------------------------------------------------------
@@ -185,7 +179,7 @@ func main() {
 	app.ready.Store(true)
 	log.Printf("Bot is running, waiting for updates | user data=%s", logsDir())
 
-	app.run(updates)
+	app.run()
 
 	// ---------------------------------------------------------------------
 	// GRACEFUL SHUTDOWN
@@ -292,23 +286,63 @@ type pendingAnswer struct {
 	CreatedAt time.Time
 }
 
-// run consumes Telegram updates until the channel closes or the context is
-// cancelled.
-func (a *app) run(updates tgbotapi.UpdatesChannel) {
+// run consumes Telegram updates in a resilient loop, automatically restarting
+// polling on crash or channel closure until the context is cancelled.
+func (a *app) run() {
 	for {
 		select {
 		case <-a.ctx.Done():
 			return
-		case update, ok := <-updates:
-			if !ok {
-				return
+		default:
+		}
+
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("Polling recovered from panic: %v", r)
+				}
+			}()
+
+			if _, err := a.bot.Request(tgbotapi.DeleteWebhookConfig{}); err != nil {
+				log.Printf("Warning: failed to delete webhook: %v", err)
 			}
-			a.processUpdate(update)
+
+			u := tgbotapi.NewUpdate(0)
+			u.Timeout = 60
+			updates := a.bot.GetUpdatesChan(u)
+
+			for {
+				select {
+				case <-a.ctx.Done():
+					return
+				case update, ok := <-updates:
+					if !ok {
+						log.Println("Updates channel closed, restarting polling...")
+						return
+					}
+					a.processUpdate(update)
+				}
+			}
+		}()
+
+		select {
+		case <-a.ctx.Done():
+			return
+		case <-time.After(3 * time.Second):
 		}
 	}
 }
 
 func (a *app) processUpdate(update tgbotapi.Update) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Recovered from panic in processUpdate: %v", r)
+			if update.Message != nil && update.Message.Chat != nil {
+				a.send(update.Message.Chat.ID, "❌ Something went wrong. Please try again.", "")
+			}
+		}
+	}()
+
 	// Read a fresh snapshot: the configuration may have been reloaded.
 	conf := a.manager.GetConfig()
 
@@ -436,6 +470,12 @@ func (a *app) processUpdate(update tgbotapi.Update) {
 // bounded by the concurrency semaphore.
 func (a *app) handleChat(message *tgbotapi.Message, conf *config.Config, tracker *user.UsageTracker) {
 	defer a.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Recovered from panic in handleChat: %v", r)
+			a.send(message.Chat.ID, "❌ Could not answer right now, please try again.", "")
+		}
+	}()
 
 	select {
 	case a.semaphore <- struct{}{}:
@@ -497,6 +537,13 @@ func (a *app) handleChat(message *tgbotapi.Message, conf *config.Config, tracker
 	done(result.Model, memory.EstimateTokens(prompt+result.Text), err)
 	if err != nil {
 		log.Printf("AI request failed for user %s: %v", tracker.UserID, err)
+		if len(result.Messages) == 0 {
+			errMsg := lang.Translate("errorText", conf.Lang)
+			if errMsg == "" {
+				errMsg = "❌ Could not answer right now, please try again."
+			}
+			a.send(message.Chat.ID, errMsg, "")
+		}
 	}
 
 	// Buttons under the answer need to find the question again.
@@ -769,6 +816,11 @@ func (a *app) startTranslation(message *tgbotapi.Message, target string, conf *c
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Recovered from panic in startTranslation: %v", r)
+			}
+		}()
 
 		select {
 		case a.semaphore <- struct{}{}:
@@ -785,6 +837,7 @@ func (a *app) startTranslation(message *tgbotapi.Message, target string, conf *c
 		translated, err := translator.Translate(ctx, a.chain, text, target)
 		if err != nil {
 			log.Printf("Automatic translation FAILED: chat=%d message=%d error=%v", chatID, messageID, err)
+			a.send(chatID, "❌ Automatic translation failed. Please try again.", "")
 			return
 		}
 
@@ -868,11 +921,11 @@ func (a *app) sweepLocked() {
 }
 
 // -----------------------------------------------------------------------------
-// HEALTH SERVER
+// HEALTH SERVER & KEEP-ALIVE
 // -----------------------------------------------------------------------------
 
 func (a *app) startHealthServer() *http.Server {
-	port := os.Getenv("PORT")
+	port := strings.TrimSpace(os.Getenv("PORT"))
 	if port == "" {
 		port = "10000"
 	}
@@ -884,9 +937,7 @@ func (a *app) startHealthServer() *http.Server {
 		_, _ = w.Write([]byte("OpenRouter Telegram Bot is running"))
 	})
 
-	// /healthz reports real readiness: it fails until the bot is polling and
-	// returns 503 once the process is shutting down.
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+	healthHandler := func(w http.ResponseWriter, r *http.Request) {
 		if !a.ready.Load() {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = w.Write([]byte("starting"))
@@ -894,7 +945,10 @@ func (a *app) startHealthServer() *http.Server {
 		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("OK"))
-	})
+	}
+
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/healthz", healthHandler)
 
 	server := &http.Server{
 		Addr:              "0.0.0.0:" + port,
@@ -905,14 +959,56 @@ func (a *app) startHealthServer() *http.Server {
 	go func() {
 		log.Printf("HTTP server listening on %s", server.Addr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			// Never Fatalf from a goroutine: it would kill the bot because a
-			// port happened to be busy.
 			a.ready.Store(false)
 			log.Printf("HTTP server failed: %v", err)
 		}
 	}()
 
 	return server
+}
+
+// startKeepAlive periodically pings the bot's public Render URL (or local
+// health endpoint) every 10 minutes so Render free tier does not spin down
+// after 15 minutes of inactivity.
+func (a *app) startKeepAlive() {
+	port := strings.TrimSpace(os.Getenv("PORT"))
+	if port == "" {
+		port = "10000"
+	}
+
+	target := strings.TrimSpace(os.Getenv("KEEP_ALIVE_URL"))
+	if target == "" {
+		target = strings.TrimSpace(os.Getenv("RENDER_EXTERNAL_URL"))
+	}
+	if target != "" {
+		target = strings.TrimRight(target, "/") + "/health"
+	} else {
+		target = "http://127.0.0.1:" + port + "/health"
+	}
+
+	go func() {
+		client := &http.Client{Timeout: 10 * time.Second}
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-a.ctx.Done():
+				return
+			case <-ticker.C:
+				req, err := http.NewRequestWithContext(a.ctx, http.MethodGet, target, nil)
+				if err != nil {
+					continue
+				}
+				resp, err := client.Do(req)
+				if err != nil {
+					log.Printf("Keep-alive ping failed (%s): %v", target, err)
+					continue
+				}
+				_ = resp.Body.Close()
+			}
+		}
+	}()
 }
 
 // -----------------------------------------------------------------------------
