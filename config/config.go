@@ -61,6 +61,18 @@ type Config struct {
 	MaxHistorySize int
 	MaxHistoryTime int
 
+	// Token optimization & short-term memory summarization settings.
+	MaxContextMessages int
+	MaxContextTokens   int
+	SummaryThreshold   int
+
+	// Agent, file intelligence, and storage settings.
+	MaxAgentSteps int
+	MaxFileSize   int64
+	StorageType   string
+	PostgresDSN   string
+	RedisURL      string
+
 	Vision        bool
 	VisionPrompt  string
 	VisionDetails string
@@ -173,6 +185,16 @@ func Load() (*Config, error) {
 		MaxHistorySize: viper.GetInt("MAX_HISTORY_SIZE"),
 		MaxHistoryTime: viper.GetInt("MAX_HISTORY_TIME"),
 
+		MaxContextMessages: viper.GetInt("MAX_CONTEXT_MESSAGES"),
+		MaxContextTokens:   viper.GetInt("MAX_CONTEXT_TOKENS"),
+		SummaryThreshold:   viper.GetInt("SUMMARY_THRESHOLD"),
+
+		MaxAgentSteps: viper.GetInt("MAX_AGENT_STEPS"),
+		MaxFileSize:   viper.GetInt64("MAX_FILE_SIZE"),
+		StorageType:   strings.ToLower(strings.TrimSpace(viper.GetString("STORAGE_TYPE"))),
+		PostgresDSN:   strings.TrimSpace(viper.GetString("POSTGRES_DSN")),
+		RedisURL:      strings.TrimSpace(viper.GetString("REDIS_URL")),
+
 		Vision:        viper.GetBool("VISION"),
 		VisionPrompt:  viper.GetString("VISION_PROMPT"),
 		VisionDetails: viper.GetString("VISION_DETAIL"),
@@ -260,6 +282,24 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxHistoryTime <= 0 {
 		c.MaxHistoryTime = 60
+	}
+	if c.MaxContextMessages <= 0 {
+		c.MaxContextMessages = c.MaxHistorySize
+	}
+	if c.MaxContextTokens <= 0 {
+		c.MaxContextTokens = 3000
+	}
+	if c.SummaryThreshold <= 0 {
+		c.SummaryThreshold = 10
+	}
+	if c.MaxAgentSteps <= 0 {
+		c.MaxAgentSteps = 5
+	}
+	if c.MaxFileSize <= 0 {
+		c.MaxFileSize = 10 << 20 // 10 MiB
+	}
+	if c.StorageType == "" {
+		c.StorageType = "json"
 	}
 	if c.OpenAIBaseURL == "" {
 		c.OpenAIBaseURL = "https://openrouter.ai/api/v1"
@@ -378,6 +418,12 @@ func setDefaults() {
 	viper.SetDefault("GUEST_BUDGET", 0)
 	viper.SetDefault("MAX_HISTORY_SIZE", 10)
 	viper.SetDefault("MAX_HISTORY_TIME", 60)
+	viper.SetDefault("MAX_CONTEXT_MESSAGES", 8)
+	viper.SetDefault("MAX_CONTEXT_TOKENS", 3000)
+	viper.SetDefault("SUMMARY_THRESHOLD", 10)
+	viper.SetDefault("MAX_AGENT_STEPS", 5)
+	viper.SetDefault("MAX_FILE_SIZE", 10485760)
+	viper.SetDefault("STORAGE_TYPE", "json")
 	// Must match the file names in lang/, which are upper case.
 	viper.SetDefault("LANG", "EN")
 	viper.SetDefault("STATS_MIN_ROLE", "ADMIN")

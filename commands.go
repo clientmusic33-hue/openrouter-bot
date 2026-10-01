@@ -119,8 +119,50 @@ func (a *app) handleCommand(message *tgbotapi.Message, conf *config.Config, trac
 	case "stats", "usage":
 		a.sendScreen(chatID, a.statsScreen(conf, tracker))
 
-	case "reset":
+	case "reset", "new":
 		a.handleReset(message, conf, tracker)
+
+	case "fast":
+		a.handleFast(message, conf, tracker)
+
+	case "race":
+		a.handleRace(message, conf, tracker)
+
+	case "research", "web":
+		a.handleResearchCommand(message, conf, tracker)
+
+	case "agent":
+		a.handleAgentCommand(message, conf, tracker)
+
+	case "memory", "mem":
+		a.handleMemoryCommand(message, conf, tracker)
+
+	case "persona":
+		a.handlePersonaCommand(message, conf, tracker)
+
+	case "summarize", "summary":
+		a.handleSummarizeCommand(message, conf, tracker)
+
+	case "remind":
+		a.handleRemindCommand(message, tracker)
+
+	case "reminders":
+		a.handleRemindersListCommand(message, tracker)
+
+	case "note":
+		a.handleNoteCommand(message, tracker)
+
+	case "notes":
+		a.handleNotesListCommand(message, tracker)
+
+	case "task":
+		a.handleTaskCommand(message, tracker)
+
+	case "tasks", "todo":
+		a.handleTasksListCommand(message, tracker)
+
+	case "code", "review", "explain", "testgen":
+		a.handleCodeCommand(message, conf, tracker)
 
 	case "stop":
 		if tracker.StopStream() {
@@ -157,21 +199,27 @@ func (a *app) handleCommand(message *tgbotapi.Message, conf *config.Config, trac
 
 func (a *app) handleHelp(message *tgbotapi.Message, conf *config.Config) {
 	text := "❓ <b>How to use me</b>\n\n" +
-		"Just send a message — I answer with the best available model. ✨\n\n" +
+		"Just send a message, photo, voice note, or document — I answer with the best available model. ✨\n\n" +
 		"<b>Buttons</b>\n" +
 		"🧠 Model — pick a provider, then a model, or stay on auto\n" +
-		"⚙️ Settings — footer, live typing, your own preferences\n" +
-		"📊 Usage — your statistics\n" +
-		"🔮 Best for me — a model suggestion based on your usage\n\n" +
-		"<b>Commands</b>\n" +
-		"/menu — the main panel\n" +
-		"/model &lt;name&gt; — pin a model by id\n" +
-		"/provider &lt;name&gt; — pin a provider\n" +
-		"/auto — let me choose again\n" +
-		"/reset — clear the conversation\n" +
-		"/stop — stop the answer that is streaming\n" +
-		"/group — group panel (admins)\n\n" +
-		"Everything is free, no limits. 🤝"
+		"🎭 Persona — Developer, Teacher, Researcher, Writer, Translator, Coding Agent, Business\n" +
+		"🗂 Memory — view or manage persistent facts\n" +
+		"⚙️ Settings — footer, live typing, preferences\n\n" +
+		"<b>AI &amp; Speed</b>\n" +
+		"/fast &lt;prompt&gt; — lowest-latency model\n" +
+		"/race &lt;prompt&gt; — race 2–3 models concurrently\n" +
+		"/research &lt;topic&gt; — web research with cited sources\n" +
+		"/agent &lt;task&gt; — multi-step tool-using agent\n" +
+		"/code · /review · /explain · /testgen — coding assistant\n\n" +
+		"<b>Memory, Personas &amp; Productivity</b>\n" +
+		"/persona [name] — switch AI persona\n" +
+		"/memory [list|add|forget|clear|off] — long-term memory\n" +
+		"/remind &lt;30m|14:30&gt; &lt;text&gt; · /reminders\n" +
+		"/note &lt;text&gt; · /notes · /task &lt;text&gt; · /tasks\n" +
+		"/summarize — summarize conversation &amp; action items\n" +
+		"/tr &lt;lang&gt; — translate replied message or text\n" +
+		"/model · /provider · /auto · /reset · /stop · /group\n\n" +
+		"Everything is free, fast, and resilient. 🤝"
 
 	if isGroupChat(message.Chat) {
 		text += "\n\nIn groups I only answer when you mention me or reply to me."
@@ -375,19 +423,32 @@ func (a *app) handleAdmin(message *tgbotapi.Message, conf *config.Config) {
 	a.sendScreen(message.Chat.ID, a.adminScreen(conf))
 }
 
-// handleTranslateReply translates the message a user replied to.
+// handleTranslateReply translates the message a user replied to, or inline text
+// passed as `/tr <lang> <text>`.
 func (a *app) handleTranslateReply(message *tgbotapi.Message, conf *config.Config) {
-	if message.ReplyToMessage == nil {
-		a.send(message.Chat.ID, "🌐 Reply to a message and use:\n\n/tr hi\n/tr en\n/tr ru", "")
+	args := strings.TrimSpace(message.CommandArguments())
+
+	targetLanguage := "English"
+	sourceText := ""
+
+	if message.ReplyToMessage != nil {
+		if args != "" {
+			targetLanguage = args
+		}
+		sourceText = strings.TrimSpace(messageText(message.ReplyToMessage))
+	} else if args != "" {
+		parts := strings.SplitN(args, " ", 2)
+		if len(parts) == 2 {
+			targetLanguage = strings.TrimSpace(parts[0])
+			sourceText = strings.TrimSpace(parts[1])
+		} else {
+			sourceText = args
+		}
+	} else {
+		a.send(message.Chat.ID, "🌐 Reply to a message and use:\n\n/tr hi\n/tr en\n/tr ru\n\nOr translate inline:\n/tr es Hello world", "")
 		return
 	}
 
-	targetLanguage := strings.TrimSpace(message.CommandArguments())
-	if targetLanguage == "" {
-		targetLanguage = "English"
-	}
-
-	sourceText := strings.TrimSpace(messageText(message.ReplyToMessage))
 	if sourceText == "" {
 		a.send(message.Chat.ID, "❌ The replied message doesn't contain text.", "")
 		return
@@ -403,7 +464,12 @@ func (a *app) handleTranslateReply(message *tgbotapi.Message, conf *config.Confi
 		return
 	}
 
-	a.send(message.Chat.ID, "🌐 <b>Translation</b>\n\n"+escapeHTML(translated), "HTML")
+	detected := translator.DetectLanguage(sourceText)
+	header := "🌐 <b>Translation</b>"
+	if detected != "" && detected != "Unknown" {
+		header = fmt.Sprintf("🌐 <b>Translation</b> (%s → %s)", escapeHTML(detected), escapeHTML(targetLanguage))
+	}
+	a.send(message.Chat.ID, header+"\n\n"+escapeHTML(translated), "HTML")
 }
 
 // handleTranslateSettings manages automatic group translation.
@@ -475,6 +541,15 @@ func (a *app) setCommands(conf *config.Config) {
 	private := []tgbotapi.BotCommand{
 		{Command: "menu", Description: "Main panel with buttons"},
 		{Command: "model", Description: "Pick a provider and a model"},
+		{Command: "fast", Description: "Fast low-latency AI response"},
+		{Command: "race", Description: "Race multiple AI models concurrently"},
+		{Command: "research", Description: "Web research with cited sources"},
+		{Command: "agent", Description: "Multi-step tool-using AI agent"},
+		{Command: "persona", Description: "Switch AI persona"},
+		{Command: "memory", Description: "Manage long-term AI memory"},
+		{Command: "remind", Description: "Set or list reminders"},
+		{Command: "note", Description: "Save or view notes"},
+		{Command: "task", Description: "Manage your todo list"},
 		{Command: "auto", Description: "Let the bot choose the model"},
 		{Command: "settings", Description: "Your preferences"},
 		{Command: "recommend", Description: "Best model for your usage"},
@@ -488,6 +563,10 @@ func (a *app) setCommands(conf *config.Config) {
 	group := []tgbotapi.BotCommand{
 		{Command: "menu", Description: "Main panel with buttons"},
 		{Command: "model", Description: "Pick a provider and a model"},
+		{Command: "fast", Description: "Fast low-latency AI response"},
+		{Command: "race", Description: "Race multiple AI models concurrently"},
+		{Command: "research", Description: "Web research with cited sources"},
+		{Command: "summarize", Description: "Summarize recent group messages"},
 		{Command: "auto", Description: "Let the bot choose the model"},
 		{Command: "recommend", Description: "Best model for your usage"},
 		{Command: "translate", Description: "Auto-translate this group"},

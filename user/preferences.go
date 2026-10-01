@@ -29,6 +29,10 @@ type Settings struct {
 	Downvotes map[string]int `json:"downvotes,omitempty"`
 	// HintsShown counts the "this model may suit you better" nudges.
 	HintsShown int `json:"hints_shown,omitempty"`
+	// Persona is the active persona key ("default", "developer", "teacher", ...).
+	Persona string `json:"persona,omitempty"`
+	// CustomPersona holds a user-defined persona prompt when Persona == "custom".
+	CustomPersona string `json:"custom_persona,omitempty"`
 	// initialised is set once the defaults above have been written, so a file
 	// from an older version gets sensible values without wiping choices.
 	Initialised bool `json:"settings_initialised,omitempty"`
@@ -60,6 +64,8 @@ func (ut *UsageTracker) Settings() Settings {
 		def.Provider = settings.Provider
 		def.Model = settings.Model
 		def.Downvotes = settings.Downvotes
+		def.Persona = settings.Persona
+		def.CustomPersona = settings.CustomPersona
 		// A model or provider chosen in a previous version wins over auto.
 		def.Auto = settings.Provider == "" && settings.Model == ""
 		settings = def
@@ -87,6 +93,8 @@ func (ut *UsageTracker) updateSettings(mutate func(*Settings)) {
 		def.Model = settings.Model
 		def.Downvotes = settings.Downvotes
 		def.Favourites = settings.Favourites
+		def.Persona = settings.Persona
+		def.CustomPersona = settings.CustomPersona
 		def.Auto = settings.Provider == "" && settings.Model == ""
 		settings = def
 	}
@@ -282,4 +290,22 @@ func (ut *UsageTracker) SettingsSummary() string {
 	default:
 		return "auto · best for your usage"
 	}
+}
+
+// Persona returns the user's selected persona key and optional custom prompt.
+func (ut *UsageTracker) Persona() (string, string) {
+	settings := ut.Settings()
+	key := strings.TrimSpace(settings.Persona)
+	if key == "" {
+		key = "default"
+	}
+	return key, settings.CustomPersona
+}
+
+// SetPersona stores a named or custom persona for this user.
+func (ut *UsageTracker) SetPersona(key, customPrompt string) {
+	ut.updateSettings(func(settings *Settings) {
+		settings.Persona = strings.TrimSpace(key)
+		settings.CustomPersona = strings.TrimSpace(customPrompt)
+	})
 }

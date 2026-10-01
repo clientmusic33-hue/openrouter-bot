@@ -1,9 +1,11 @@
 package provider
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func testConfigs() []Config {
@@ -409,5 +411,45 @@ func TestProviderOf(t *testing.T) {
 	}
 	if _, ok := chain.ProviderOf("nope"); ok {
 		t.Error("ProviderOf should report false for an unknown model")
+	}
+}
+
+func TestClassifyErrorAndCircuitBreaker(t *testing.T) {
+	if ClassifyError(context.Canceled) != ErrClassCanceled {
+		t.Error("context.Canceled should be classified as ErrClassCanceled")
+	}
+	if !IsTimeoutError(context.DeadlineExceeded) {
+		t.Error("context.DeadlineExceeded should be classified as timeout")
+	}
+	if !IsPermanentError(errors.New("status code: 401 unauthorized")) {
+		t.Error("401 should be classified as permanent/auth")
+	}
+	if !IsRateLimitError(errors.New("429 rate limit exceeded")) {
+		t.Error("429 should be classified as rate limit")
+	}
+
+	chain := newTestChain(t)
+
+	// User cancellation must not increment failures.
+	chain.RecordFailure("openrouter", context.Canceled)
+	for _, info := range chain.Status() {
+		if info.Name == "openrouter" && info.Failures != 0 {
+			t.Errorf("context.Canceled should not count as provider failure, got %d", info.Failures)
+		}
+	}
+
+	// Auth error immediately trips circuit breaker to open.
+	chain.RecordFailure("openrouter", errors.New("status 401 invalid api key"))
+	for _, info := range chain.Status() {
+		if info.Name == "openrouter" && info.Circuit != CircuitOpen {
+			t.Errorf("expected CircuitOpen on 401 auth failure, got %s", info.Circuit)
+		}
+	}
+
+	// Recording latency updates model & provider latency and closes circuit.
+	chain.RecordSuccessLatency("openrouter", "deepseek/deepseek-r1:free", 250*time.Millisecond)
+	lat, ok := chain.ModelLatency("deepseek/deepseek-r1:free")
+	if !ok || lat != 250*time.Millisecond {
+		t.Errorf("expected 250ms model latency, got %v (ok=%v)", lat, ok)
 	}
 }

@@ -29,19 +29,20 @@ This project allows you to launch your Telegram bot in a few minutes to communic
 | Feature | Notes |
 |---|---|
 | Streaming responses | Tokens are edited into the message as they arrive, with a 🛑 Stop button |
-| Provider chain with failover | OpenRouter, Groq, Gemini, Cerebras, NVIDIA, Mistral, DeepSeek, Together, Ollama — the next model answers when one fails, at start **and** mid-stream |
-| Provider → model picker | Inline buttons, no commands to memorise: providers, models, favourites, auto |
-| Smart routing | In auto mode the bot scores every model against your usage (volume, prompt length, images, feedback) and starts with the best one |
-| 👍 / 👎 feedback | A thumbs down steers the automatic routing away from that model |
-| 🔁 Regenerate | Replays the last question with one tap |
-| Per-user settings | Model, model footer, live typing and favourites are stored per user |
-| Groups with roles | `/group` panel: everyone / admins / owner, auto-translation, bot-admin detection |
-| Plain text by default | The assistant is asked for plain text, so Telegram can never reject an answer over broken markup |
-| Public mode | Unlimited budgets, no rate limiting, free to use |
-| `/tr` and `/translate` | Translate a single message, or auto-translate a whole group |
-| Vision | Send a photo and ask about it |
-| Per-user budgets | Spend caps per day / month / all time |
-| Long answers | Automatically split across several Telegram messages |
+| Provider chain with failover | OpenRouter, Groq, Gemini, Cerebras, NVIDIA, Mistral, DeepSeek, Together, Ollama — EWMA latency tracking, circuit breakers, exponential backoff, and mid-stream failover |
+| Provider → model picker | Inline buttons with live status (`🟢 available`, `🟡 degraded`, `🔴 unavailable`) and capability badges (`⚡ fast`, `🧠 reasoning`, `👁 vision`, `💻 coding`) |
+| Smart task routing | Automatically classifies prompts (`CHAT`, `CODING`, `REASONING`, `VISION`, `TRANSLATION`, `SUMMARIZATION`, `RESEARCH`, `FAST`, `LONG_CONTEXT`) and selects the optimal healthy model |
+| `/fast` & `/race` modes | Low-latency single-model routing (`/fast`) or concurrent 2–3 model racing (`/race`, `/race judge`) cancelling slower candidates on first completion |
+| Multi-step `/agent` | Bounded tool-using agent (`calculator`, `time`, `web`, `url`, `github`, `translator`, `notes`) with loop prevention and strict step/time limits |
+| `/research` web search | SSRF-protected web search and page extraction with source deduplication and numbered citations |
+| File intelligence | Upload TXT, MD, PDF, DOCX, CSV, JSON, YAML, or source code files for summarization, Q&A, CSV stats, and code review |
+| Coding assistant | `/code`, `/review`, `/explain`, `/testgen` plus automatic language and stack-trace detection |
+| Memory & token optimizer | Bounded short-term context with automatic summarization plus long-term user fact memory (`/memory`) |
+| Personas | Built-in (`Developer`, `Teacher`, `Researcher`, `Writer`, `Translator`, `Coding Agent`, `Business`) and custom personas (`/persona`) |
+| Reminders, tasks & notes | Persistent `/remind`, `/reminders`, `/task`, `/tasks`, `/note`, `/notes` surviving restarts |
+| Group AI & `/summarize` | Per-group access mode, auto-translation, and `/summarize` with action-item extraction |
+| Voice & multimodal | Voice message transcription (Whisper STT) and photo/image-document vision analysis |
+| Storage & optional Redis | Crash-safe atomic JSON storage by default (`STORAGE_TYPE=json`) with optional PostgreSQL (`STORAGE_TYPE=postgres`) and Redis caching/rate-limiting (`REDIS_URL`) |
 
 ---
 
@@ -124,10 +125,21 @@ Commands still work for power users; nothing is hidden behind them.
 | `/reset system` | Clear history and restore the default system prompt |
 | `/stop` | Stop the request currently streaming for you |
 | `/get_models` | Free models of the preferred provider (OpenRouter style APIs) |
-| `/tr [lang]` | Translate the message you replied to (defaults to English) |
+| `/fast <prompt>` | Route immediately to the lowest-latency healthy model |
+| `/race [judge] <prompt>` | Race 2–3 healthy models concurrently and return the fastest (or synthesised) answer |
+| `/research <topic>` | Search the web, extract pages, and answer with numbered citations |
+| `/agent <task>` | Run the bounded multi-step tool-using agent |
+| `/code`, `/review`, `/explain`, `/testgen` | Coding assistant commands |
+| `/persona [name\|custom <prompt>]` | Switch AI persona or set a custom persona |
+| `/memory [list\|add\|forget\|clear\|off\|on]` | Manage persistent long-term user memory |
+| `/remind <30m\|14:30> <text>`, `/reminders` | Schedule or list persistent reminders |
+| `/note <text>`, `/notes` | Save or list persistent notes |
+| `/task <text>`, `/tasks` | Manage your persistent todo list |
+| `/summarize` | Summarize recent group or private conversation and extract action items |
+| `/tr [lang] [text]` | Translate the replied message or inline text (preserves code, URLs, emojis, `@usernames`) |
 | `/translate on\|off\|<lang>\|status` | Automatic group translation (groups only) |
 | `/group` | Group admin panel: access mode, auto-translation |
-| `/admin` | Owner panel: uptime, users, provider health |
+| `/admin` | Owner observability panel: uptime, active requests, error rate, latency, model/token usage, cost, cache & storage |
 | `/about` | About this bot |
 
 ---
@@ -338,19 +350,26 @@ CI (`.github/workflows/ci.yml`) runs formatting, `go vet`, `go mod tidy` verific
 ### Layout
 
 ```
-main.go       update loop, group access, chat handling
-commands.go   slash commands and reply-keyboard actions
-callbacks.go  inline button handling
-screens.go    the panels (menu, models, settings, group, owner)
-hints.go      occasional model suggestions
-api/          provider chain streaming, Telegram rendering, chunking
-provider/     backends, presets, routing scores, health and failover
-config/       configuration loading, hot reload, persona
-ui/           every keyboard and the callback data format
-groups/       per-chat settings: access mode, translation, bot admin
-user/         spend tracking, budgets, history, per-user preferences
-translator/   one-shot translation helper
-internal/     crash-safe file writes
+main.go              update loop, group access, chat handling
+commands.go          slash commands and reply-keyboard actions
+callbacks.go         inline button handling
+screens.go           the panels (menu, models, settings, group, owner observability)
+features_handlers.go handlers for /fast, /race, /research, /agent, /memory, /persona, /remind, files, voice
+hints.go             occasional model suggestions
+api/                 provider chain streaming, model race integration, Telegram rendering, chunking
+provider/            backends, presets, performance engine, circuit breaker, EWMA latency, failover
+router/              smart task classifier, model router, and concurrent model race engine
+agent/               bounded multi-step planner, executor, and context state
+tools/               safe permission-aware tool registry (calculator, time, url, web, github, translator, notes)
+features/            modular capabilities (memory, personas, reminders, research, files, coding, voice)
+storage/             persistence abstraction (atomic JSON default and optional PostgreSQL)
+ config/             configuration loading, hot reload, persona
+ui/                  every keyboard and the callback data format
+groups/              per-chat settings, message ring buffer, translation, bot admin
+user/                spend tracking, budgets, history, per-user preferences
+translator/          language detection and token-preserving translation helper
+workers/             background reminder delivery scheduler
+internal/            atomicfile, SSRF/path/secret security guards, response cache, Redis client, rate limiter, telemetry
 ```
 
 ---

@@ -51,6 +51,7 @@ func (um *Manager) GetUser(chatID, userID int64, userName string, conf *config.C
 	}
 
 	// Keep the stored user name fresh.
+	tracker.mu.Lock()
 	if userName != "" {
 		tracker.UserName = userName
 	}
@@ -62,6 +63,7 @@ func (um *Manager) GetUser(chatID, userID int64, userName string, conf *config.C
 		um.histories[key] = history
 	}
 	tracker.History = history
+	tracker.mu.Unlock()
 
 	return tracker
 }

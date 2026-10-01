@@ -10,9 +10,11 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"openrouter-bot/config"
+	"openrouter-bot/provider"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/sashabaranov/go-openai"
@@ -20,6 +22,19 @@ import (
 
 // modelsTimeout bounds the /models lookup.
 const modelsTimeout = 20 * time.Second
+
+// modelsCacheTTL is how long the free models list is cached in memory.
+const modelsCacheTTL = 5 * time.Minute
+
+type cachedModelsEntry struct {
+	result    string
+	expiresAt time.Time
+}
+
+var (
+	modelsCacheMu sync.RWMutex
+	modelsCache   = make(map[string]cachedModelsEntry)
+)
 
 type Pricing struct {
 	Prompt     string `json:"prompt"`
@@ -41,12 +56,21 @@ type APIResponse struct {
 // -----------------------------------------------------------------------------
 
 // GetFreeModels returns a Markdown list of models that are free for both
-// prompt and completion tokens.
+// prompt and completion tokens. Results are cached with a TTL to avoid
+// redundant upstream API calls.
 func GetFreeModels(baseURL string, apiKey string) (string, error) {
 	base := strings.TrimRight(baseURL, "/")
 	if base == "" {
 		return "", errors.New("no provider base url configured")
 	}
+
+	now := time.Now()
+	modelsCacheMu.RLock()
+	if entry, ok := modelsCache[base]; ok && now.Before(entry.expiresAt) {
+		modelsCacheMu.RUnlock()
+		return entry.result, nil
+	}
+	modelsCacheMu.RUnlock()
 
 	req, err := http.NewRequest(http.MethodGet, base+"/models", nil)
 	if err != nil {
@@ -57,7 +81,7 @@ func GetFreeModels(baseURL string, apiKey string) (string, error) {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 
-	client := &http.Client{Timeout: modelsTimeout}
+	client := provider.SharedHTTPClient(modelsTimeout)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -90,7 +114,15 @@ func GetFreeModels(baseURL string, apiKey string) (string, error) {
 		return "", errors.New("no free models returned by the API")
 	}
 
-	return result.String(), nil
+	rendered := result.String()
+	modelsCacheMu.Lock()
+	modelsCache[base] = cachedModelsEntry{
+		result:    rendered,
+		expiresAt: time.Now().Add(modelsCacheTTL),
+	}
+	modelsCacheMu.Unlock()
+
+	return rendered, nil
 }
 
 // isFreeModel reports whether both prompt and completion are free. Checking
@@ -146,6 +178,20 @@ func messageText(message *tgbotapi.Message) string {
 // VISION MESSAGE
 // -----------------------------------------------------------------------------
 
+// hasImageAttachment reports whether message carries a photo or an image document.
+func hasImageAttachment(message *tgbotapi.Message) bool {
+	if message == nil {
+		return false
+	}
+	if len(message.Photo) > 0 {
+		return true
+	}
+	if message.Document != nil && strings.HasPrefix(strings.ToLower(message.Document.MimeType), "image/") {
+		return true
+	}
+	return false
+}
+
 func addVisionMessage(
 	bot *tgbotapi.BotAPI,
 	message *tgbotapi.Message,
@@ -153,17 +199,23 @@ func addVisionMessage(
 ) (openai.ChatCompletionMessage, string) {
 	plainText := strings.TrimSpace(messageText(message))
 
-	if len(message.Photo) == 0 {
+	fileID := ""
+	if len(message.Photo) > 0 {
+		// Use the largest available photo size.
+		photoSize := message.Photo[len(message.Photo)-1]
+		fileID = photoSize.FileID
+	} else if message.Document != nil && strings.HasPrefix(strings.ToLower(message.Document.MimeType), "image/") {
+		fileID = message.Document.FileID
+	}
+
+	if fileID == "" || bot == nil {
 		return openai.ChatCompletionMessage{
 			Role:    openai.ChatMessageRoleUser,
 			Content: plainText,
 		}, plainText
 	}
 
-	// Use the largest available photo size.
-	photoSize := message.Photo[len(message.Photo)-1]
-
-	file, err := bot.GetFile(tgbotapi.FileConfig{FileID: photoSize.FileID})
+	file, err := bot.GetFile(tgbotapi.FileConfig{FileID: fileID})
 	if err != nil {
 		log.Printf("Error getting file: %v", err)
 
@@ -178,7 +230,7 @@ func addVisionMessage(
 		prompt = cfg.VisionPrompt
 	}
 	if prompt == "" {
-		prompt = "Describe this image."
+		prompt = "Describe this image, extract any visible text (OCR), and summarize key details."
 	}
 
 	visionMessage := openai.ChatCompletionMessage{

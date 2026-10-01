@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "arena/**"]
   pull_request:
     branches: [main]
 
@@ -25,13 +25,19 @@ jobs:
         run: |
           unformatted=$(gofmt -l .)
           if [ -n "$unformatted" ]; then
-            echo "These files need gofmt:"
-            echo "$unformatted"
+            files_joined=$(echo "$unformatted" | tr '\n' ' ')
+            diff_out=$(gofmt -d . | head -n 80 | tr '\n' ' ')
+            echo "::error::Unformatted files: $files_joined | Diff: $diff_out"
             exit 1
           fi
 
       - name: Vet
-        run: go vet ./...
+        run: |
+          if ! out=$(go vet ./... 2>&1); then
+            msg=$(echo "$out" | tr '\n' ' ')
+            echo "::error::go vet failed: $msg"
+            exit 1
+          fi
 
       - name: Tidy check
         run: |
@@ -39,7 +45,17 @@ jobs:
           git diff --exit-code -- go.mod go.sum
 
       - name: Build
-        run: go build ./...
+        run: |
+          if ! out=$(go build ./... 2>&1); then
+            msg=$(echo "$out" | tr '\n' ' ')
+            echo "::error::go build failed: $msg"
+            exit 1
+          fi
 
       - name: Test
-        run: go test -race -covermode=atomic ./...
+        run: |
+          if ! out=$(go test -race -covermode=atomic ./... 2>&1); then
+            msg=$(echo "$out" | tail -n 40 | tr '\n' ' ')
+            echo "::error::go test failed: $msg"
+            exit 1
+          fi

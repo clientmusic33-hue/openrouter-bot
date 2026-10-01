@@ -5,6 +5,13 @@ import (
 	"time"
 )
 
+func (ut *UsageTracker) getHistory() *History {
+	ut.mu.Lock()
+	defer ut.mu.Unlock()
+
+	return ut.History
+}
+
 // AddMessage appends a message to the conversation.
 func (ut *UsageTracker) AddMessage(role, content string) {
 	content = strings.TrimSpace(content)
@@ -12,7 +19,7 @@ func (ut *UsageTracker) AddMessage(role, content string) {
 		return
 	}
 
-	ut.History.add(Message{
+	ut.getHistory().add(Message{
 		Role:      role,
 		Content:   content,
 		CreatedAt: time.Now(),
@@ -21,18 +28,18 @@ func (ut *UsageTracker) AddMessage(role, content string) {
 
 // GetMessages returns a copy of the conversation.
 func (ut *UsageTracker) GetMessages() []Message {
-	return ut.History.snapshot()
+	return ut.getHistory().snapshot()
 }
 
 // ClearHistory drops the whole conversation.
 func (ut *UsageTracker) ClearHistory() {
-	ut.History.clear()
+	ut.getHistory().clear()
 }
 
 // CheckHistory prunes the conversation to at most maxMessages recent messages
 // and drops anything older than maxTime minutes.
 func (ut *UsageTracker) CheckHistory(maxMessages int, maxTime int) {
-	ut.History.prune(maxMessages, time.Duration(maxTime)*time.Minute)
+	ut.getHistory().prune(maxMessages, time.Duration(maxTime)*time.Minute)
 }
 
 // --- History ---------------------------------------------------------------

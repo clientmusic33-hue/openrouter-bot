@@ -21,14 +21,23 @@ import (
 	"syscall"
 	"time"
 
+	"openrouter-bot/agent"
 	"openrouter-bot/api"
 	"openrouter-bot/config"
+	"openrouter-bot/features/memory"
+	"openrouter-bot/features/reminders"
 	"openrouter-bot/groups"
+	"openrouter-bot/internal/cache"
+	"openrouter-bot/internal/ratelimit"
+	"openrouter-bot/internal/telemetry"
 	"openrouter-bot/lang"
 	"openrouter-bot/provider"
+	"openrouter-bot/storage"
+	"openrouter-bot/tools"
 	"openrouter-bot/translator"
 	"openrouter-bot/ui"
 	"openrouter-bot/user"
+	"openrouter-bot/workers"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -122,6 +131,17 @@ func main() {
 	// APPLICATION
 	// ---------------------------------------------------------------------
 
+	redisClient := cache.NewRedisFromEnv()
+	store := storage.Open(conf.StorageType, "data", conf.PostgresDSN)
+	respCache := cache.NewResponseCache(512, 15*time.Minute, redisClient)
+	limiter := ratelimit.New(redisClient)
+	memMgr := memory.NewManager(store)
+	optimizer := memory.NewOptimizer()
+	remMgr := reminders.NewManager(store)
+	toolReg := tools.DefaultRegistry(chain, remMgr)
+	aiAgent := agent.New(chain, toolReg)
+	metrics := telemetry.NewCollector()
+
 	app := &app{
 		ctx:       ctx,
 		bot:       bot,
@@ -129,11 +149,21 @@ func main() {
 		chain:     chain,
 		users:     user.NewUserManager(logsDir()),
 		groups:    groups.NewManager("data/groups.json"),
+		store:     store,
+		cache:     respCache,
+		limiter:   limiter,
+		memory:    memMgr,
+		optimizer: optimizer,
+		reminders: remMgr,
+		agent:     aiAgent,
+		metrics:   metrics,
 		semaphore: make(chan struct{}, conf.MaxConcurrentRequests),
 		pending:   make(map[int64]map[int]pendingAnswer),
 		warned:    make(map[warnKey]time.Time),
 		started:   time.Now(),
 	}
+
+	workers.StartReminderScheduler(ctx, remMgr, 5*time.Second, app.deliverReminder)
 
 	app.setCommands(manager.GetConfig())
 
@@ -221,8 +251,16 @@ type app struct {
 	// chain is the ordered list of AI providers tried on every request.
 	chain *provider.Chain
 
-	users  *user.Manager
-	groups *groups.Manager
+	users     *user.Manager
+	groups    *groups.Manager
+	store     storage.Store
+	cache     *cache.ResponseCache
+	limiter   *ratelimit.Limiter
+	memory    *memory.Manager
+	optimizer *memory.Optimizer
+	reminders *reminders.Manager
+	agent     *agent.Agent
+	metrics   *telemetry.Collector
 
 	// semaphore caps concurrent AI requests so that a burst of group
 	// messages cannot exhaust the upstream rate limit.
@@ -313,6 +351,16 @@ func (a *app) processUpdate(update tgbotapi.Update) {
 
 	if isGroupChat(update.Message.Chat) {
 		a.trackChat(update.Message.Chat, conf)
+		settings := a.groups.Get(update.Message.Chat.ID)
+		if !settings.MemoryDisabled && !update.Message.IsCommand() {
+			senderLabel := senderUsername
+			if senderLabel != "" {
+				senderLabel = "@" + senderLabel
+			} else {
+				senderLabel = strconv.FormatInt(senderID, 10)
+			}
+			a.groups.RecordMessage(update.Message.Chat.ID, senderLabel, messageText(update.Message))
+		}
 	}
 
 	if update.Message.IsCommand() {
@@ -370,6 +418,16 @@ func (a *app) processUpdate(update tgbotapi.Update) {
 		return
 	}
 
+	if update.Message.Voice != nil || update.Message.Audio != nil {
+		a.handleVoice(update.Message, conf, tracker)
+		return
+	}
+
+	if update.Message.Document != nil && !strings.HasPrefix(strings.ToLower(update.Message.Document.MimeType), "image/") {
+		a.handleDocument(update.Message, conf, tracker)
+		return
+	}
+
 	a.wg.Add(1)
 	go a.handleChat(update.Message, conf, tracker)
 }
@@ -396,6 +454,17 @@ func (a *app) handleChat(message *tgbotapi.Message, conf *config.Config, tracker
 		a.send(message.Chat.ID, lang.Translate("rate_limit", conf.Lang), "")
 		return
 	}
+	if a.limiter != nil {
+		cat := ratelimit.CategoryChat
+		if len(message.Photo) > 0 || (message.Document != nil && strings.HasPrefix(strings.ToLower(message.Document.MimeType), "image/")) {
+			cat = ratelimit.CategoryImage
+		}
+		if err := a.limiter.Allow(tracker.UserID, tracker.GetUserRole(conf), cat, conf.RateLimitPerMinute); err != nil {
+			log.Printf("Tiered rate limit user %s: %v", tracker.UserID, err)
+			a.send(message.Chat.ID, lang.Translate("rate_limit", conf.Lang), "")
+			return
+		}
+	}
 
 	prompt := messageText(message)
 
@@ -408,9 +477,13 @@ func (a *app) handleChat(message *tgbotapi.Message, conf *config.Config, tracker
 	)
 
 	tracker.RecordRequest(len(strings.TrimSpace(prompt)))
-	if len(message.Photo) > 0 {
+	if len(message.Photo) > 0 || (message.Document != nil && strings.HasPrefix(strings.ToLower(message.Document.MimeType), "image/")) {
 		tracker.MarkVision()
 	}
+
+	done := a.metrics.BeginRequest()
+	opts := a.chatOptions(conf, tracker)
+	opts.SystemSupplement = a.buildContextSupplement(message.Chat.ID, prompt, conf, tracker)
 
 	result, err := api.HandleChatGPTStreamResponse(
 		a.ctx,
@@ -419,8 +492,9 @@ func (a *app) handleChat(message *tgbotapi.Message, conf *config.Config, tracker
 		message,
 		conf,
 		tracker,
-		a.chatOptions(conf, tracker),
+		opts,
 	)
+	done(result.Model, memory.EstimateTokens(prompt+result.Text), err)
 	if err != nil {
 		log.Printf("AI request failed for user %s: %v", tracker.UserID, err)
 	}
