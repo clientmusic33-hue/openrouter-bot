@@ -7,6 +7,7 @@ import (
 	"openrouter-bot/api"
 	"openrouter-bot/config"
 	"openrouter-bot/features/personas"
+	"openrouter-bot/provider"
 	"openrouter-bot/ui"
 	"openrouter-bot/user"
 
@@ -94,6 +95,53 @@ func (a *app) handleCallback(query *tgbotapi.CallbackQuery, conf *config.Config)
 		tracker.SetModel(model, providerName)
 		a.toast(query, "Pinned "+model+" ✅")
 		a.editScreen(chatID, messageID, a.modelsScreen(conf, tracker, providerIndex, 0))
+
+	case ui.ActionCatalog:
+		a.editScreen(chatID, messageID, a.catalogueScreen(conf, tracker,
+			provider.FilterFromBits(firstIndex(callback.Args, 0), tracker.Settings().Favourites, a.searchQuery(chatID)), 0))
+
+	case ui.ActionCatalogList:
+		a.editScreen(chatID, messageID, a.catalogueListScreen(conf, tracker,
+			provider.FilterFromBits(firstIndex(callback.Args, 0), tracker.Settings().Favourites, a.searchQuery(chatID)),
+			secondIndex(callback.Args, 0)))
+
+	case ui.ActionModelInfo:
+		providerIndex := firstIndex(callback.Args, -1)
+		modelIndex := secondIndex(callback.Args, -1)
+		if a.modelAt(providerIndex, modelIndex) == "" {
+			a.toast(query, "That model is gone, try again")
+			return
+		}
+		a.rememberModelsView(chatID, messageID, modelsView{index: providerIndex, page: 0})
+		a.editScreen(chatID, messageID, a.modelDetailsScreen(conf, tracker, providerIndex, modelIndex))
+
+	case ui.ActionFavouriteModel:
+		providerIndex := firstIndex(callback.Args, -1)
+		modelIndex := secondIndex(callback.Args, -1)
+		model := a.modelAt(providerIndex, modelIndex)
+		if model == "" {
+			a.toast(query, "That model is gone, try again")
+			return
+		}
+		if tracker.ToggleFavourite(model) {
+			a.toast(query, "Added to favourites ⭐")
+		} else {
+			a.toast(query, "Removed from favourites")
+		}
+		a.editScreen(chatID, messageID, a.modelDetailsScreen(conf, tracker, providerIndex, modelIndex))
+
+	case ui.ActionCatalogRefresh:
+		if !a.refreshCatalogue(chatID) {
+			a.toast(query, "Nothing to refresh right now")
+		}
+
+	case ui.ActionProviderRefresh:
+		index := firstIndex(callback.Args, 0)
+		a.toast(query, "Refreshing models 🔄")
+		a.showChainModels(chatID, messageID, conf, tracker, index, 0)
+
+	case ui.ActionSearchHint:
+		a.send(chatID, searchHelpText, "HTML")
 
 	case ui.ActionUse:
 		model := ui.ModelFromCallback(callback)

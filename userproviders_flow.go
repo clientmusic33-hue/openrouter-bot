@@ -692,39 +692,6 @@ func (a *app) setChainModelCatalog(name string, fetched []models.Model) {
 	a.chain.SetDiscoveredModels(name, ids)
 }
 
-// refreshOpenRouterModels forces a background catalogue refresh for the
-// configured OpenRouter endpoint. It never sends a generation request.
-func (a *app) refreshOpenRouterModels(chatID int64) bool {
-	if a.modelCatalog == nil {
-		return false
-	}
-
-	for _, name := range a.chain.Names() {
-		baseURL, apiKey, ok := a.chain.EndpointOf(name)
-		if !ok || (!strings.EqualFold(name, "openrouter") && !strings.Contains(strings.ToLower(baseURL), "openrouter.ai")) {
-			continue
-		}
-
-		key := models.CacheKey(name, "")
-		a.modelCatalog.RefreshNowAsync(key, baseURL, func() string { return apiKey },
-			func(fetched []models.Model, err error) {
-				if err != nil || len(fetched) == 0 {
-					log.Printf("OpenRouter model catalogue refresh failed")
-					a.send(chatID, "⚠️ Could not refresh the OpenRouter model list. The last known catalogue is still available.", "")
-					return
-				}
-
-				a.setChainModelCatalog(name, fetched)
-				a.send(chatID, fmt.Sprintf("✅ Refreshed %d OpenRouter models. Reopen /model to browse them.", len(fetched)), "")
-			},
-		)
-		a.send(chatID, "🔄 Refreshing the OpenRouter model list in the background…", "")
-		return true
-	}
-
-	return false
-}
-
 // refreshChainModels keeps the picker honest: when the cached catalogue of a
 // chain provider is stale, the live list is fetched in the background and the
 // screen is updated in place. The user is never blocked by the request, and a

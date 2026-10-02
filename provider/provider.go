@@ -39,6 +39,10 @@ const (
 	modelAvailableTTL = 2 * time.Minute
 	modelLimitedTTL   = 45 * time.Second
 	modelFailedTTL    = 90 * time.Second
+
+	// modelFailureWindow bounds how long past failures still influence the
+	// ordering of the catalogue. The status itself expires much sooner.
+	modelFailureWindow = 15 * time.Minute
 )
 
 // ModelAvailability is based only on real request outcomes. The bot never
@@ -56,6 +60,12 @@ const (
 type modelHealth struct {
 	availability ModelAvailability
 	expiresAt    time.Time
+	// failures counts real generation failures. It outlives the availability
+	// window so the catalogue can order a model that keeps failing below one
+	// that simply has not been used yet.
+	failures   int
+	lastSeen   time.Time
+	lastFailed time.Time
 }
 
 // Config describes one provider as written in config.yaml.
@@ -827,13 +837,7 @@ func (c *Chain) RecordModelFailure(name, model string, err error) {
 		}
 
 		c.mu.Lock()
-		if c.modelHealth == nil {
-			c.modelHealth = make(map[string]modelHealth)
-		}
-		c.modelHealth[key(name, model)] = modelHealth{
-			availability: availability,
-			expiresAt:    time.Now().Add(ttl),
-		}
+		c.observeModelLocked(name, model, availability, ttl, true)
 		c.mu.Unlock()
 	}
 
@@ -856,14 +860,54 @@ func (c *Chain) RecordModelSuccess(name, model string, latency time.Duration) {
 	}
 
 	c.mu.Lock()
+	c.observeModelLocked(name, model, ModelAvailable, modelAvailableTTL, false)
+	c.mu.Unlock()
+}
+
+// observeModelLocked stores one real request outcome while keeping the
+// counters that outlive the availability window itself. A success clears the
+// failure streak, so a model recovers as soon as it answers again.
+func (c *Chain) observeModelLocked(name, model string, availability ModelAvailability, ttl time.Duration, failed bool) {
 	if c.modelHealth == nil {
 		c.modelHealth = make(map[string]modelHealth)
 	}
-	c.modelHealth[key(name, model)] = modelHealth{
-		availability: ModelAvailable,
-		expiresAt:    time.Now().Add(modelAvailableTTL),
+
+	healthKey := key(name, model)
+	now := time.Now()
+	observed := c.modelHealth[healthKey]
+
+	if failed {
+		if now.Sub(observed.lastFailed) > modelFailureWindow {
+			observed.failures = 0
+		}
+		observed.failures++
+		observed.lastFailed = now
+	} else {
+		observed.failures = 0
+		observed.lastSeen = now
 	}
-	c.mu.Unlock()
+
+	observed.availability = availability
+	observed.expiresAt = now.Add(ttl)
+	c.modelHealth[healthKey] = observed
+}
+
+// ModelFailures reports how many real generation failures a model collected
+// inside the recent failure window. Callers must not hold the chain lock.
+func (c *Chain) ModelFailures(name, model string) int {
+	if c == nil {
+		return 0
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	observed, ok := c.modelHealth[key(name, model)]
+	if !ok || time.Since(observed.lastFailed) > modelFailureWindow {
+		return 0
+	}
+
+	return observed.failures
 }
 
 // ModelAvailability reports recent request health without probing the model.
@@ -965,15 +1009,7 @@ func (c *Chain) ModelLatency(model string) (time.Duration, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	if c.modelLatency == nil {
-		return 0, false
-	}
-	stats := c.modelLatency[strings.ToLower(strings.TrimSpace(model))]
-	if stats == nil || stats.Samples == 0 {
-		return 0, false
-	}
-
-	return stats.Avg, true
+	return c.ModelLatencyLocked(model)
 }
 
 // Info is the per-provider status shown by /providers.
@@ -1077,10 +1113,27 @@ type ModelRef struct {
 	Availability   ModelAvailability
 	Free           bool
 	PriceKnown     bool
+	// PromptPrice and CompletionPrice are the raw per-token prices the
+	// provider reported. They stay empty when pricing is unknown.
+	PromptPrice     string
+	CompletionPrice string
 	// ContextLength is the context window in tokens when the provider
 	// reported one during discovery. Zero means unknown.
 	ContextLength int
 	Current       bool
+	// Vision, Reasoning and Coding are only set from metadata the provider
+	// actually reported or from the curated capability catalogue. They stay
+	// false when nothing is known, so a guess is never shown as a fact.
+	Vision    bool
+	Reasoning bool
+	Coding    bool
+	Fast      bool
+	// Failures counts real generation failures inside the recent failure
+	// window; Latency is the observed EWMA response time; LastSeen is the
+	// last successful real request. All are zero when never observed.
+	Failures int
+	Latency  time.Duration
+	LastSeen time.Time
 }
 
 // ModelCatalog lists every (provider, model) pair, providers in chain order.
@@ -1094,17 +1147,67 @@ func (c *Chain) ModelCatalog() []ModelRef {
 	now := time.Now()
 	for _, p := range c.providers {
 		for _, model := range c.modelsForLocked(p) {
-			refs = append(refs, ModelRef{
+			ref := ModelRef{
 				Provider:     p.Name(),
 				Model:        model,
 				Description:  DescribeModel(model),
 				Availability: c.modelAvailabilityLocked(p.Name(), model, now),
 				Current:      strings.EqualFold(model, c.model),
-			})
+			}
+			c.applyHealthLocked(&ref, now)
+			refs = append(refs, ref)
 		}
 	}
 
 	return refs
+}
+
+// applyHealthLocked copies the real-request observations of a model onto its
+// reference. Callers must hold at least a read lock.
+func (c *Chain) applyHealthLocked(ref *ModelRef, now time.Time) {
+	ref.Latency, _ = c.ModelLatencyLocked(ref.Model)
+
+	observed, ok := c.modelHealth[key(ref.Provider, ref.Model)]
+	if !ok {
+		return
+	}
+
+	ref.LastSeen = observed.lastSeen
+	if now.Sub(observed.lastFailed) <= modelFailureWindow {
+		ref.Failures = observed.failures
+	}
+}
+
+// ModelLatencyLocked is ModelLatency for callers that already hold the lock.
+func (c *Chain) ModelLatencyLocked(model string) (time.Duration, bool) {
+	if c.modelLatency == nil {
+		return 0, false
+	}
+
+	stats := c.modelLatency[strings.ToLower(strings.TrimSpace(model))]
+	if stats == nil || stats.Samples == 0 {
+		return 0, false
+	}
+
+	return stats.Avg, true
+}
+
+// EnrichModel copies the curated capability flags onto a reference whose
+// metadata the provider did not report. Nothing is invented: unknown models
+// keep every flag false.
+func EnrichModel(ref *ModelRef) {
+	info := LookupModel(ref.Model)
+	if !info.Known {
+		return
+	}
+
+	ref.Fast = ref.Fast || info.Fast
+	ref.Vision = ref.Vision || info.Vision
+	ref.Reasoning = ref.Reasoning || info.Reasoning
+	ref.Coding = ref.Coding || info.Coding
+	if ref.ContextLength == 0 {
+		ref.ContextLength = info.Context
+	}
 }
 
 // Count returns the number of configured providers.

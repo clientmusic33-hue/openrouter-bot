@@ -47,6 +47,16 @@ const (
 
 	// The "your own provider" flow: a user brings an API key, the bot stores
 	// it sealed and lists what that key can use.
+	// The live model catalogue: filters, the paged list, model details and
+	// the refresh that reads every provider's model list again.
+	ActionCatalog         = "cat"
+	ActionCatalogList     = "catl"
+	ActionModelInfo       = "minfo"
+	ActionCatalogRefresh  = "rcat"
+	ActionProviderRefresh = "prfr"
+	ActionSearchHint      = "srch"
+	ActionFavouriteModel  = "favm"
+
 	ActionUserProviders       = "uprovs"
 	ActionUserProvider        = "uprov"
 	ActionUserModel           = "umdl"
@@ -85,13 +95,15 @@ func UseModelButton(model string) (tgbotapi.InlineKeyboardButton, bool) {
 	return button("✅ Use "+truncate(model, 30), ActionUse, model), true
 }
 
-// ModelFromCallback returns the model id carried by a "use" callback.
+// ModelFromCallback returns the model id carried by a "use" callback. Model
+// ids may contain ':' themselves - OpenRouter's ":free" variants - so every
+// argument after the action belongs to the id.
 func ModelFromCallback(callback Callback) string {
-	if callback.Action != ActionUse || len(callback.Args) != 1 {
+	if callback.Action != ActionUse || len(callback.Args) == 0 {
 		return ""
 	}
 
-	return strings.TrimSpace(callback.Args[0])
+	return strings.TrimSpace(strings.Join(callback.Args, ":"))
 }
 
 // ParseCallback decodes callback data produced by the builders below.
@@ -207,6 +219,9 @@ func ProviderList(infos []provider.Info, active string, page, pageSize int) tgbo
 		tgbotapi.NewInlineKeyboardRow(
 			button("✨ Auto — best for my usage", ActionAuto),
 		),
+		tgbotapi.NewInlineKeyboardRow(
+			button("📚 Catalogue & filters", ActionCatalog, "0", "0"),
+		),
 	}
 
 	start := page * pageSize
@@ -301,11 +316,145 @@ func ModelList(providerIndex int, providerName string, models []provider.ModelRe
 	}
 
 	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		button("🔄 Refresh", ActionProviderRefresh, indexArgs(providerIndex)...),
+		button("🔎 Search", ActionSearchHint),
+	))
+
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
 		button("⬅️ Providers", ActionProviders),
 		button("🏠 Menu", ActionMenu),
 	))
 
 	return tgbotapi.NewInlineKeyboardMarkup(rows...)
+}
+
+// CatalogueEntry is one model of the global catalogue plus the indices its
+// buttons carry, so a filtered page can still resolve a tap.
+type CatalogueEntry struct {
+	Ref           provider.ModelRef
+	ProviderIndex int
+	ModelIndex    int
+}
+
+// Catalogue is the keyboard under the catalogue summary: the compact filter
+// toggles plus the way into the paged list.
+func Catalogue(filter provider.ModelFilter, matching int) tgbotapi.InlineKeyboardMarkup {
+	rows := filterRows(ActionCatalog, filter.Bits(), 0)
+
+	label := "📋 Browse models"
+	if filter.Active() {
+		label = fmt.Sprintf("📋 %d matching", matching)
+	}
+
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(button(label, ActionCatalogList, strconv.Itoa(filter.Bits()), "0")))
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		button("🔎 Search", ActionSearchHint),
+		button("🔄 Refresh", ActionCatalogRefresh),
+	))
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		button("⬅️ Providers", ActionProviders),
+		button("🏠 Menu", ActionMenu),
+	))
+
+	return tgbotapi.NewInlineKeyboardMarkup(rows...)
+}
+
+// CatalogueList is one page of the filtered global list.
+func CatalogueList(
+	filter provider.ModelFilter,
+	entries []CatalogueEntry,
+	current string,
+	offset, pageSize int,
+	favourite func(string) bool,
+) tgbotapi.InlineKeyboardMarkup {
+	rows := filterRows(ActionCatalogList, filter.Bits(), offset/pageSize)
+
+	end := offset + pageSize
+	if offset > len(entries) {
+		offset = len(entries)
+	}
+	if end > len(entries) {
+		end = len(entries)
+	}
+
+	for i := offset; i < end; i++ {
+		entry := entries[i]
+
+		label := modelPickerLabel(entry.Ref)
+		if entry.Ref.Current || (current != "" && strings.EqualFold(entry.Ref.Model, current)) {
+			label = "▶ " + label
+		} else if favourite != nil && favourite(entry.Ref.Model) {
+			label = "⭐ " + label
+		}
+
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+			button(truncate(label, 44), ActionModelInfo, indexArgs(entry.ProviderIndex, entry.ModelIndex)...),
+		))
+	}
+
+	if nav := Navigation(offset/pageSize, pageSize, len(entries), ActionCatalogList, strconv.Itoa(filter.Bits())); len(nav) > 0 {
+		rows = append(rows, nav)
+	}
+
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		button("🔄 Refresh", ActionCatalogRefresh),
+		button("🏠 Menu", ActionMenu),
+	))
+
+	return tgbotapi.NewInlineKeyboardMarkup(rows...)
+}
+
+// ModelDetails are the actions under one model's details.
+func ModelDetails(model string, providerIndex, modelIndex int, favourite bool) tgbotapi.InlineKeyboardMarkup {
+	rows := [][]tgbotapi.InlineKeyboardButton{}
+
+	if use, ok := UseModelButton(model); ok {
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(use))
+	}
+
+	star := "⭐ Favourite"
+	if favourite {
+		star = "💫 Remove favourite"
+	}
+
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		button(star, ActionFavouriteModel, indexArgs(providerIndex, modelIndex)...),
+	))
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		button("🔄 Refresh", ActionProviderRefresh, indexArgs(providerIndex)...),
+		button("⬅️ Back", ActionProvider, indexArgs(providerIndex)...),
+	))
+
+	return tgbotapi.NewInlineKeyboardMarkup(rows...)
+}
+
+// filterRows renders the compact inline filters. Each tap toggles one bit and
+// stays far below Telegram's 64 byte callback limit.
+func filterRows(action string, bits, page int) [][]tgbotapi.InlineKeyboardButton {
+	toggle := func(label string, bit int) tgbotapi.InlineKeyboardButton {
+		if bits&bit != 0 {
+			label = "✅ " + label
+		}
+
+		return button(label, action, strconv.Itoa(bits^bit), strconv.Itoa(page))
+	}
+
+	return [][]tgbotapi.InlineKeyboardButton{
+		tgbotapi.NewInlineKeyboardRow(
+			toggle("🆓 Free", provider.FilterFree),
+			toggle("🟢 Working", provider.FilterWorking),
+			toggle("⚡ Fast", provider.FilterFast),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			toggle("🧠 Reasoning", provider.FilterReasoning),
+			toggle("💻 Coding", provider.FilterCoding),
+			toggle("👁 Vision", provider.FilterVision),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			toggle("📚 Long ctx", provider.FilterLongContext),
+			toggle("⭐ Favourites", provider.FilterFavourites),
+		),
+	}
 }
 
 // offsetOf finds a model's index in the catalogue. The index is what travels

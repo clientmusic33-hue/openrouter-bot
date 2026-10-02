@@ -280,6 +280,20 @@ type app struct {
 	// modelCatalog caches the model lists discovered from the providers.
 	modelCatalog *models.Catalog
 
+	// refreshMu guards the global catalogue refresh: one refresh at a time,
+	// and never more often than the minimum interval.
+	refreshMu   sync.Mutex
+	refreshing  bool
+	lastRefresh time.Time
+
+	// searchMu guards the model search text a chat is filtering on.
+	searchMu sync.Mutex
+	search   map[int64]string
+
+	// notify replaces send when it is set. The catalogue refresh reports
+	// through it so the whole flow can be exercised without a bot.
+	notify func(chatID int64, text, mode string)
+
 	// flowMu guards the in progress /addprovider conversations.
 	flowMu sync.Mutex
 	flows  map[int64]*providerFlow
