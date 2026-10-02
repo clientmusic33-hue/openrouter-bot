@@ -498,7 +498,7 @@ func loadProviders() []provider.Config {
 
 // extraProviderOrder is the order in which environment-configured providers
 // join a chain that config.yaml did not define itself.
-var extraProviderOrder = []string{"groq", "gemini", "cerebras", "nvidia", "mistral", "huggingface", "deepseek", "together"}
+var extraProviderOrder = []string{"groq", "gemini", "cerebras", "nvidia", "sambanova", "mistral", "huggingface", "deepseek", "together"}
 
 // PrimaryProvider describes the endpoint of the flat BASE_URL/MODEL/API_KEY
 // variables. It is the first entry of the fallback chain.

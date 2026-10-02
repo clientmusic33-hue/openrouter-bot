@@ -167,6 +167,8 @@ providers:
   # Ollama on the same machine; set OLLAMA_BASE_URL for a remote one.
   #- name: ollama
 
+  - name: sambanova
+
 # ---------------------------------------------------------------------------
 # Prompts and vision
 # ---------------------------------------------------------------------------

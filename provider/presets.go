@@ -116,6 +116,18 @@ var presets = []Preset{
 		Docs: "https://huggingface.co/docs/inference-providers",
 	},
 	{
+		Name:      "sambanova",
+		BaseURL:   "https://api.sambanova.ai/v1",
+		APIKeyEnv: "SAMBANOVA_API_KEY",
+		Models: []string{
+			"DeepSeek-V3.1",
+			"Meta-Llama-3.3-70B-Instruct",
+			"DeepSeek-R1-Distill-Llama-70B",
+			"Qwen3-32B",
+		},
+		Docs: "https://cloud.sambanova.ai",
+	},
+	{
 		Name:      "deepseek",
 		BaseURL:   "https://api.deepseek.com/v1",
 		APIKeyEnv: "DEEPSEEK_API_KEY",
@@ -221,6 +233,7 @@ func ApplyPreset(cfg Config) Config {
 var providerSpeed = map[string]float64{
 	"groq":        1.0,
 	"cerebras":    0.95,
+	"sambanova":   0.8,
 	"gemini":      0.7,
 	"mistral":     0.7,
 	"huggingface": 0.6,
