@@ -20,6 +20,8 @@ services:
 
       - key: NVIDIA_API_KEY
         sync: false
+      - key: SAMBANOVA_API_KEY
+        sync: false
       - key: API_KEY
         sync: false
       - key: GROQ_API_KEY
