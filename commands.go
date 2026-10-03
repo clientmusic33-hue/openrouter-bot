@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"strings"
 
-	"openrouter-bot/api"
 	"openrouter-bot/config"
 	"openrouter-bot/lang"
+	"openrouter-bot/provider"
 	"openrouter-bot/translator"
 	"openrouter-bot/ui"
 	"openrouter-bot/user"
@@ -126,8 +126,7 @@ func (a *app) handleCommand(message *tgbotapi.Message, conf *config.Config, trac
 
 	case "auto":
 		tracker.ResetPreference()
-		a.send(chatID, "✨ Automatic mode on — I'll pick the best model for your usage.", "")
-		a.sendScreen(chatID, a.homeScreen(conf, tracker))
+		a.sendScreen(chatID, a.autoScreen(conf, tracker))
 
 	case "recommend", "rec":
 		a.sendScreen(chatID, a.recommendScreen(conf, tracker))
@@ -224,6 +223,11 @@ func (a *app) handleHelp(message *tgbotapi.Message, conf *config.Config) {
 		"🎭 Persona — Developer, Teacher, Researcher, Writer, Translator, Coding Agent, Business\n" +
 		"🗂 Memory — view or manage persistent facts\n" +
 		"⚙️ Settings — footer, live typing, preferences\n\n" +
+		"<b>Models</b>\n" +
+		"/models — live catalogue: free &amp; working models first, with filters\n" +
+		"/models qwen — search by name, id, provider or capability\n" +
+		"/providers · /provider &lt;name&gt; · /get_models — free models\n" +
+		"/refresh_models — re-read every provider's model list\n\n" +
 		"<b>AI &amp; Speed</b>\n" +
 		"/fast &lt;prompt&gt; — lowest-latency model\n" +
 		"/race &lt;prompt&gt; — race 2–3 models concurrently\n" +
@@ -251,19 +255,19 @@ func (a *app) handleHelp(message *tgbotapi.Message, conf *config.Config) {
 	a.send(message.Chat.ID, text, "HTML")
 }
 
-// handleFreeModels lists the free models of the preferred provider.
+// handleFreeModels lists the models every configured provider prices at zero,
+// ordered by live health. The list comes from the shared catalogue cache, so
+// no extra request is made and nothing is hardcoded.
 func (a *app) handleFreeModels(message *tgbotapi.Message, conf *config.Config) {
-	models, err := api.GetFreeModels(a.chain.ActiveBaseURL(), a.chain.ActiveAPIKey())
-	if err != nil {
-		log.Printf("Error getting models: %v", err)
-		a.send(message.Chat.ID, "❌ Failed to get available models. Please try again later.", "")
+	text := a.freeModelsText()
+	if text == "" {
+		a.send(message.Chat.ID, "❌ No models available. Try 🔄 Refresh.", "")
+		a.refreshCatalogue(message.Chat.ID)
+
 		return
 	}
 
-	a.send(message.Chat.ID,
-		lang.Translate("commands.getModels", conf.Lang)+models,
-		tgbotapi.ModeMarkdown,
-	)
+	a.send(message.Chat.ID, text, "HTML")
 }
 
 // handleSetModel pins a model, by id or by catalogue number.
@@ -337,15 +341,8 @@ func (a *app) handleProvider(message *tgbotapi.Message, conf *config.Config, tra
 		target = names[index-1]
 	}
 
-	found := ""
-	for _, name := range names {
-		if strings.EqualFold(name, target) {
-			found = name
-			break
-		}
-	}
-
-	if found == "" {
+	index := indexOfString(names, target)
+	if index < 0 {
 		a.send(message.Chat.ID, fmt.Sprintf(
 			"❌ Unknown provider %s\n\nAvailable: %s",
 			escapeHTML(target), escapeHTML(strings.Join(names, ", ")),
@@ -353,40 +350,37 @@ func (a *app) handleProvider(message *tgbotapi.Message, conf *config.Config, tra
 		return
 	}
 
-	tracker.SetProvider(found)
-	a.send(message.Chat.ID, fmt.Sprintf("📌 Provider pinned to <b>%s</b>. Models inside it stay on auto. ✨", escapeHTML(found)), "HTML")
+	// The provider view shows its live status; the first button pins it.
+	a.sendScreen(message.Chat.ID, a.modelsScreen(conf, tracker, index, 0))
 }
 
-// handleModels lists one provider's models as a numbered list.
+// handleModels opens the live catalogue. An argument that names a provider
+// opens that provider's models; anything else is a search, so
+// `/models qwen` finds a model by name, id, provider or capability.
 func (a *app) handleModels(message *tgbotapi.Message, conf *config.Config, tracker *user.UsageTracker) {
+	chatID := message.Chat.ID
 	args := strings.TrimSpace(message.CommandArguments())
-
 	names := a.chain.Names()
-	if args == "" {
-		// Default to the provider the user is on, or the first one.
-		if index := indexOfString(names, tracker.Preference().Provider); index >= 0 {
-			a.sendScreen(message.Chat.ID, a.modelsScreen(conf, tracker, index, 0))
-			return
-		}
-		a.sendScreen(message.Chat.ID, a.providersScreen(conf, tracker, 0))
-		return
-	}
 
 	target := args
 	if index, err := strconv.Atoi(args); err == nil && index >= 1 && index <= len(names) {
 		target = names[index-1]
 	}
 
-	index := indexOfString(names, target)
-	if index < 0 {
-		a.send(message.Chat.ID, fmt.Sprintf(
-			"❌ Unknown provider %s\n\nAvailable: %s",
-			escapeHTML(args), escapeHTML(strings.Join(names, ", ")),
-		), "HTML")
+	if args == "" || indexOfString(names, target) >= 0 {
+		a.setSearch(chatID, "")
+		if args == "" {
+			a.sendScreen(chatID, a.catalogueScreen(conf, tracker, provider.ModelFilter{}, 0))
+			return
+		}
+		a.sendScreen(chatID, a.modelsScreen(conf, tracker, indexOfString(names, target), 0))
+
 		return
 	}
 
-	a.sendScreen(message.Chat.ID, a.modelsScreen(conf, tracker, index, 0))
+	a.setSearch(chatID, args)
+	a.sendScreen(chatID, a.catalogueListScreen(conf, tracker,
+		provider.FilterFromBits(0, tracker.Settings().Favourites, args), 0))
 }
 
 func indexOfString(values []string, target string) int {
@@ -446,13 +440,11 @@ func (a *app) handleAdmin(message *tgbotapi.Message, conf *config.Config) {
 	a.sendScreen(message.Chat.ID, a.adminScreen(conf))
 }
 
+// handleRefreshModels re-reads every configured provider's model list,
+// updates the model health and rebuilds the picker.
 func (a *app) handleRefreshModels(message *tgbotapi.Message, conf *config.Config) {
-	if !conf.IsAdmin(senderID(message)) {
-		a.send(message.Chat.ID, "👑 Only the bot owner can refresh the model catalogue.", "")
-		return
-	}
-	if !a.refreshOpenRouterModels(message.Chat.ID) {
-		a.send(message.Chat.ID, "⚠️ No OpenRouter provider is configured.", "")
+	if !a.refreshCatalogue(message.Chat.ID) {
+		a.send(message.Chat.ID, "⚠️ No configured provider exposes a model list to refresh.", "")
 	}
 }
 
@@ -574,7 +566,10 @@ func (a *app) setCommands(conf *config.Config) {
 	private := []tgbotapi.BotCommand{
 		{Command: "menu", Description: "Main panel with buttons"},
 		{Command: "model", Description: "Pick a provider and a model"},
-		{Command: "refresh_models", Description: "Refresh the OpenRouter model catalogue (admin)"},
+		{Command: "models", Description: "Live model catalogue with status and filters"},
+		{Command: "providers", Description: "Provider health overview"},
+		{Command: "get_models", Description: "List the free models"},
+		{Command: "refresh_models", Description: "Refresh every provider's model list"},
 		{Command: "addprovider", Description: "Add your own AI provider and API key"},
 		{Command: "myproviders", Description: "List your own providers"},
 		{Command: "useprovider", Description: "Switch to one of your providers"},

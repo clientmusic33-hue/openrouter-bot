@@ -31,21 +31,27 @@ import (
 // what the provider actually returned is kept: nothing is invented.
 type Model struct {
 	// Provider is the bot-side name of the backend that listed the model.
-	Provider       string `json:"provider"`
+	Provider string `json:"provider"`
 	// ModelID is the id to send in a completion request.
-	ModelID        string `json:"model_id"`
+	ModelID string `json:"model_id"`
 	// DisplayName is the human label, when the provider supplies one.
-	DisplayName    string `json:"display_name,omitempty"`
+	DisplayName string `json:"display_name,omitempty"`
 	// SourceProvider is the upstream publisher/provider, usually the
 	// namespace before '/' in an OpenRouter model id.
 	SourceProvider string `json:"source_provider,omitempty"`
 	// ContextLength is the context window in tokens, when reported.
-	ContextLength  int    `json:"context_length,omitempty"`
+	ContextLength int `json:"context_length,omitempty"`
 	// Pricing is copied from the model catalogue. Missing fields remain empty
 	// so callers never mistake missing pricing for a free model.
 	Pricing    Pricing `json:"pricing,omitempty"`
 	PriceKnown bool    `json:"price_known,omitempty"`
 	Free       bool    `json:"free,omitempty"`
+
+	// Vision, Reasoning and Tools are set only when the provider reported
+	// them, so a capability is never guessed.
+	Vision    bool `json:"vision,omitempty"`
+	Reasoning bool `json:"reasoning,omitempty"`
+	Tools     bool `json:"tools,omitempty"`
 }
 
 // Pricing contains per-token prompt and completion prices in USD.
@@ -81,6 +87,11 @@ type listResponse struct {
 		TopProvider struct {
 			Name string `json:"name"`
 		} `json:"top_provider"`
+		Architecture struct {
+			Modality        string   `json:"modality"`
+			InputModalities []string `json:"input_modalities"`
+		} `json:"architecture"`
+		SupportedParameters []string `json:"supported_parameters"`
 	} `json:"data"`
 }
 
@@ -97,6 +108,7 @@ type Catalog struct {
 type entry struct {
 	models    []Model
 	expiresAt time.Time
+	fetchedAt time.Time
 }
 
 // New returns an empty catalogue with the default TTL.
@@ -237,13 +249,20 @@ func (c *Catalog) RefreshNowAsync(key, baseURL string, apiKey func() string, don
 	c.refreshAsync(key, baseURL, apiKey, done, true)
 }
 
-func (c *Catalog) refreshAsync(key, baseURL string, apiKey func() string, done func([]Model, error), force bool) {
+// RefreshNow is RefreshNowAsync for callers that need to know whether the
+// request was actually started, so they can wait for exactly as many
+// callbacks as they will receive.
+func (c *Catalog) RefreshNow(key, baseURL string, apiKey func() string, done func([]Model, error)) bool {
+	return c.refreshAsync(key, baseURL, apiKey, done, true)
+}
+
+func (c *Catalog) refreshAsync(key, baseURL string, apiKey func() string, done func([]Model, error), force bool) bool {
 	if c == nil || key == "" || strings.TrimSpace(baseURL) == "" || apiKey == nil {
-		return
+		return false
 	}
 	if !force {
 		if _, fresh := c.Cached(key); fresh {
-			return
+			return false
 		}
 	}
 
@@ -251,11 +270,11 @@ func (c *Catalog) refreshAsync(key, baseURL string, apiKey func() string, done f
 	if _, running := c.inflight[key]; running {
 		c.mu.Unlock()
 
-		return
+		return false
 	}
 	if !force && c.failedRecentlyLocked(key, time.Now()) {
 		c.mu.Unlock()
-		return
+		return false
 	}
 	c.inflight[key] = struct{}{}
 	c.mu.Unlock()
@@ -275,6 +294,8 @@ func (c *Catalog) refreshAsync(key, baseURL string, apiKey func() string, done f
 			done(list, err)
 		}
 	}()
+
+	return true
 }
 
 // awaitInflight waits for a discovery that another caller started, so two
@@ -328,12 +349,46 @@ func (c *Catalog) fetchAndStore(ctx context.Context, key, baseURL, apiKey string
 		}
 	}
 
+	now := time.Now()
+
 	c.mu.Lock()
-	c.entries[key] = entry{models: cloneModels(list), expiresAt: time.Now().Add(c.ttl)}
+	c.entries[key] = entry{models: cloneModels(list), expiresAt: now.Add(c.ttl), fetchedAt: now}
 	delete(c.failedUntil, key)
 	c.mu.Unlock()
 
 	return list, nil
+}
+
+// FetchedAt reports when a key was last filled from upstream. It keeps the
+// timestamp of the last good response, so a failed refresh does not lose it.
+func (c *Catalog) FetchedAt(key string) (time.Time, bool) {
+	if c == nil || key == "" {
+		return time.Time{}, false
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	item, ok := c.entries[key]
+	if !ok {
+		return time.Time{}, false
+	}
+
+	return item.fetchedAt, true
+}
+
+// Refreshing reports whether a discovery request for the key is in flight.
+func (c *Catalog) Refreshing(key string) bool {
+	if c == nil || key == "" {
+		return false
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	_, running := c.inflight[key]
+
+	return running
 }
 
 func (c *Catalog) failedRecentlyLocked(key string, now time.Time) bool {
@@ -435,10 +490,31 @@ func normalise(parsed listResponse) []Model {
 		model.PriceKnown = promptOK && completionOK
 		model.Free = model.PriceKnown && isZeroPrice(prompt) && isZeroPrice(completion)
 
+		model.Vision = reportsVision(item.Architecture.Modality, item.Architecture.InputModalities)
+		for _, param := range item.SupportedParameters {
+			switch strings.ToLower(strings.TrimSpace(param)) {
+			case "reasoning":
+				model.Reasoning = true
+			case "tools", "tool_choice":
+				model.Tools = true
+			}
+		}
+
 		out = append(out, model)
 	}
 
 	return out
+}
+
+// reportsVision reads the modality the provider declared for a model.
+func reportsVision(modality string, inputs []string) bool {
+	for _, input := range inputs {
+		if strings.Contains(strings.ToLower(input), "image") {
+			return true
+		}
+	}
+
+	return strings.Contains(strings.ToLower(strings.TrimSpace(modality)), "image")
 }
 
 func providerName(raw json.RawMessage) string {

@@ -119,8 +119,11 @@ Commands still work for power users; nothing is hidden behind them.
 | `/useprovider <n\|name>` | Switch to one of your own providers |
 | `/removeprovider <n\|name>` | Delete one of your own providers |
 | `/provider` | Open the provider list |
-| `/provider <n\|name>` | Pin a provider, keep auto model choice inside it |
-| `/models [provider]` | Numbered model list for one provider |
+| `/provider <n\|name>` | Provider view: model health counts, refresh and search |
+| `/models` | Live catalogue: 🆓 free & working first, then every provider, with filters |
+| `/models <query>` | Search by name, id, provider or capability (e.g. `/models qwen`) |
+| `/models <provider>` | That provider's models |
+| `/refresh_models` | Re-read every provider's model list and rebuild the picker |
 | `/recommend` | Best model for your usage, with a one-tap switch |
 | `/settings` | Your preferences as buttons |
 | `/stats`, `/usage` | Your usage statistics (respects `STATS_MIN_ROLE`) |
@@ -128,7 +131,7 @@ Commands still work for power users; nothing is hidden behind them.
 | `/reset <prompt>` | Clear history and set a new system prompt |
 | `/reset system` | Clear history and restore the default system prompt |
 | `/stop` | Stop the request currently streaming for you |
-| `/get_models` | Free models of the preferred provider (OpenRouter style APIs) |
+| `/get_models` | Every model priced at $0 for prompt and completion, health first |
 | `/fast <prompt>` | Route immediately to the lowest-latency healthy model |
 | `/race [judge] <prompt>` | Race 2–3 healthy models concurrently and return the fastest (or synthesised) answer |
 | `/research <topic>` | Search the web, extract pages, and answer with numbered citations |

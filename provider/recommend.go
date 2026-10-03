@@ -151,7 +151,25 @@ const (
 	scoreDislikeEach    = -25
 	scoreDislikeMax     = -75
 	scoreCurrentCompany = 3
+
+	// Observed model health, from real requests only. A model that just
+	// failed is pushed behind one that has not been tried recently; neither
+	// is removed, so failover still reaches it when nothing else answers.
+	scoreAvailabilityUnavailable = -70
+	scoreAvailabilityLimited     = -35
 )
+
+// availabilityPenalty grades a model by its most recent real-request outcome.
+func availabilityPenalty(availability ModelAvailability) float64 {
+	switch availability {
+	case ModelUnavailable:
+		return scoreAvailabilityUnavailable
+	case ModelLimited:
+		return scoreAvailabilityLimited
+	default:
+		return 0
+	}
+}
 
 // scoreCandidate grades one (provider, model) pair against a usage profile.
 // It is the single place where routing decisions are made, shared by the
@@ -286,6 +304,8 @@ func rank(
 	}
 
 	states := make(map[string]providerState, len(candidates))
+	health := make(map[string]ModelAvailability, len(candidates))
+
 	if chain != nil {
 		chain.mu.RLock()
 		active := ""
@@ -304,6 +324,10 @@ func rank(
 				avgLatency: avgLat,
 			}
 		}
+		for _, candidate := range candidates {
+			health[key(candidate.Provider, candidate.Model)] =
+				chain.modelAvailabilityLocked(candidate.Provider, candidate.Model, now)
+		}
 		chain.mu.RUnlock()
 	}
 
@@ -314,6 +338,7 @@ func rank(
 
 	for i, candidate := range candidates {
 		score, _ := scoreCandidate(candidate, profile, states[candidate.Provider])
+		score += availabilityPenalty(health[key(candidate.Provider, candidate.Model)])
 		scored[i].candidate = candidate
 		scored[i].score = score
 	}
@@ -372,6 +397,7 @@ func (c *Chain) RecommendAmong(candidates []Candidate, profile UsageProfile) Rec
 		c.mu.RUnlock()
 
 		score, reasons := scoreCandidate(candidate, profile, state)
+		score += availabilityPenalty(c.ModelAvailability(candidate.Provider, candidate.Model))
 		if score > bestScore {
 			bestScore = score
 			best = candidate

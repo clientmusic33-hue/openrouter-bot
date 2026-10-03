@@ -72,7 +72,13 @@ func (a *app) providersScreen(conf *config.Config, tracker *user.UsageTracker, p
 			icon = "🏠 local"
 		}
 
+		counts := provider.Count(a.providerModels(info.Name))
+
 		line := fmt.Sprintf("<b>%s</b> · %s · %d model(s)", escapeHTML(info.Name), icon, len(info.Models))
+		if counts.Total > 0 {
+			line += fmt.Sprintf(" · 🟢 %d 🟡 %d 🔴 %d ⚪ %d · 🆓 %d",
+				counts.Working, counts.Limited, counts.Unavailable, counts.Unknown, counts.Free)
+		}
 		if info.AvgLatency > 0 {
 			line += fmt.Sprintf(" · ⚡ %dms", info.AvgLatency.Milliseconds())
 		}
@@ -86,7 +92,9 @@ func (a *app) providersScreen(conf *config.Config, tracker *user.UsageTracker, p
 	}
 
 	text := "🧠 <b>Model &amp; provider</b>\n\n" +
-		"Your choice: <b>" + escapeHTML(tracker.SettingsSummary()) + "</b>\n\n" +
+		"Your choice: <b>" + escapeHTML(tracker.SettingsSummary()) + "</b>\n" +
+		"Live health: " + a.statusSummary() + "\n" +
+		"🔄 " + refreshAge(a.catalogueFetchedAt()) + "\n\n" +
 		strings.Join(rows, "\n") + "\n\n" +
 		"Tap a provider to browse its models."
 
@@ -137,18 +145,26 @@ func (a *app) providerModels(name string) []provider.ModelRef {
 			seen := make(map[string]struct{}, len(discovered))
 			for _, model := range discovered {
 				seen[strings.ToLower(model.ModelID)] = struct{}{}
-				out = append(out, provider.ModelRef{
-					Provider:       name,
-					Model:          model.ModelID,
-					Description:    provider.DescribeModel(model.ModelID),
-					DisplayName:    model.DisplayName,
-					SourceProvider: model.SourceProvider,
-					Availability:   a.chain.ModelAvailability(name, model.ModelID),
-					Free:           model.Free,
-					PriceKnown:     model.PriceKnown,
-					ContextLength:  model.ContextLength,
-					Current:        strings.EqualFold(model.ModelID, current),
-				})
+				ref := provider.ModelRef{
+					Provider:        name,
+					Model:           model.ModelID,
+					Description:     provider.DescribeModel(model.ModelID),
+					DisplayName:     model.DisplayName,
+					SourceProvider:  model.SourceProvider,
+					Availability:    a.chain.ModelAvailability(name, model.ModelID),
+					Free:            model.Free,
+					PriceKnown:      model.PriceKnown,
+					PromptPrice:     model.Pricing.Prompt,
+					CompletionPrice: model.Pricing.Completion,
+					ContextLength:   model.ContextLength,
+					Current:         strings.EqualFold(model.ModelID, current),
+					Vision:          model.Vision,
+					Reasoning:       model.Reasoning,
+					Failures:        a.chain.ModelFailures(name, model.ModelID),
+				}
+				ref.Latency, _ = a.chain.ModelLatency(model.ModelID)
+				provider.EnrichModel(&ref)
+				out = append(out, ref)
 			}
 			for _, ref := range a.chain.ModelCatalog() {
 				if !strings.EqualFold(ref.Provider, name) {
@@ -157,19 +173,24 @@ func (a *app) providerModels(name string) []provider.ModelRef {
 				if _, exists := seen[strings.ToLower(ref.Model)]; exists {
 					continue
 				}
+				provider.EnrichModel(&ref)
 				out = append(out, ref)
 			}
-			return out
+
+			return provider.Sort(out, current, nil)
 		}
 	}
 
 	refs := make([]provider.ModelRef, 0, 8)
 	for _, ref := range a.chain.ModelCatalog() {
-		if strings.EqualFold(ref.Provider, name) {
-			refs = append(refs, ref)
+		if !strings.EqualFold(ref.Provider, name) {
+			continue
 		}
+		provider.EnrichModel(&ref)
+		refs = append(refs, ref)
 	}
-	return refs
+
+	return provider.Sort(refs, a.chain.Model(), nil)
 }
 
 func modelAvailabilityLabel(status provider.ModelAvailability) string {
@@ -256,11 +277,16 @@ func (a *app) modelsScreen(conf *config.Config, tracker *user.UsageTracker, prov
 		details = "\n\n" + strings.Join(modelLines, "\n")
 	}
 
+	counts := provider.Count(refs)
+
 	text := fmt.Sprintf(
-		"🧠 <b>%s</b> · %d model(s)\n\n"+
-			"Tap a model to pin it, or keep <b>✨ auto</b> and let the bot choose.\n"+
-			"Current: <b>%s</b>%s",
-		escapeHTML(providerName), len(refs), escapeHTML(tracker.SettingsSummary()), details,
+		"🧠 <b>%s</b> · %d model(s)\n"+
+			"🟢 %d working · 🟡 %d limited · 🔴 %d unavailable · ⚪ %d unknown · 🆓 %d free\n\n"+
+			"Tap a model for details, or keep <b>✨ auto</b> and let the bot choose.\n"+
+			"Current: <b>%s</b> · 🔄 %s%s",
+		escapeHTML(providerName), len(refs),
+		counts.Working, counts.Limited, counts.Unavailable, counts.Unknown, counts.Free,
+		escapeHTML(tracker.SettingsSummary()), refreshAge(a.catalogueFetchedAt()), details,
 	)
 
 	// The marker follows the model this user actually uses, not the
@@ -280,6 +306,39 @@ func (a *app) modelsScreen(conf *config.Config, tracker *user.UsageTracker, prov
 			page*modelsPageSize,
 			modelsPageSize,
 			tracker.IsFavourite,
+		),
+	}
+}
+
+// autoScreen reports what automatic mode will do with the live health data:
+// which model it would start with, and what it is avoiding right now.
+func (a *app) autoScreen(conf *config.Config, tracker *user.UsageTracker) screen {
+	recommendation, err := a.chain.Recommend(tracker.UsageProfile())
+
+	pick := "no usable provider right now — the last working model is retried as they recover"
+	if err == nil && recommendation.Model != "" {
+		pick = fmt.Sprintf("🟢 <code>%s</code> via <b>%s</b>\n%s",
+			escapeHTML(recommendation.Model), escapeHTML(recommendation.Provider),
+			escapeHTML(recommendation.Reason))
+	}
+
+	text := "✨ <b>Automatic mode on</b>\n\n" +
+		"I pick the healthiest model for your usage on every request.\n\n" +
+		"Starting with:\n" + pick + "\n\n" +
+		"Live health: " + a.statusSummary() + "\n" +
+		"🔴 unavailable and recently 🟡 limited models are skipped until they recover."
+
+	return screen{
+		Text: text,
+		Keyboard: tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("📚 Catalogue", ui.Encode(ui.ActionCatalog, "0", "0")),
+				tgbotapi.NewInlineKeyboardButtonData("🔮 Best for me", ui.Encode(ui.ActionRecommend)),
+			),
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("🧠 Providers", ui.Encode(ui.ActionProviders)),
+				tgbotapi.NewInlineKeyboardButtonData("🏠 Menu", ui.Encode(ui.ActionMenu)),
+			),
 		),
 	}
 }
@@ -371,7 +430,12 @@ func (a *app) userProviderModelRefs(record userproviders.Provider, ids []string)
 			ref.ContextLength = model.ContextLength
 			ref.Free = model.Free
 			ref.PriceKnown = model.PriceKnown
+			ref.PromptPrice = model.Pricing.Prompt
+			ref.CompletionPrice = model.Pricing.Completion
+			ref.Vision = model.Vision
+			ref.Reasoning = model.Reasoning
 		}
+		provider.EnrichModel(&ref)
 		refs = append(refs, ref)
 	}
 
